@@ -565,6 +565,11 @@ on_false = 0x213A0
 at = 0x1EE9A5
 call = "AmbientOcclusion"
 
+# src/game/depth_of_field.cpp: after occlusion, while the reload weapon is still deferred
+[[hook]]
+at = 0x1EE9A5
+call = "ReloadDepthOfField"
+
 # src/game/language.cpp
 [[hook]]
 at = 0x1F8120

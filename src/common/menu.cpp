@@ -66,6 +66,8 @@ constexpr uint32_t kMsaaValues[] = {0, 2, 4, 8};
 const char* const kMsaaNames[] = {"OFF", "2x", "4x", "8x"};
 constexpr uint32_t kAoValues[] = {0, 1, 2};
 const char* const kAoNames[] = {"OFF", "SSAO", "GTAO"};
+constexpr uint32_t kReloadBlurModes[] = {0, 1, 2};
+const char* const kReloadBlurNames[] = {"OFF", "ORIGINAL", "MODERN DOF"};
 constexpr uint32_t kFmvScales[] = {0, 1};
 const char* const kFmvScaleNames[] = {"FILL", "4:3"};
 constexpr uint32_t kAudioOutputs[] = {audio::kOutputAuto, audio::kOutputMono, audio::kOutputStereo,
@@ -283,7 +285,6 @@ bool* ToggleFlag(Settings& s, int id) {
         case kVsync: return &s.vsync;
         case kFpsCounter: return &o.fps_counter;
         case kHdrOutput: return &o.hdr_output;
-        case kReloadBlur: return &o.reload_blur;
         case kSmaa: return &o.smaa;
         case kSkipIntros: return &o.skip_intros;
         case kPauseOnFocusLoss: return &o.pause_on_focus_loss;
@@ -437,6 +438,16 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
         case kAmbientOcclusion:
             std::snprintf(text, sizeof(text), "%s", kAoNames[StepTable(kAoValues, o.ambient_occlusion, step)]);
             return true;
+        case kReloadBlur: {
+            uint32_t mode = o.reload_blur ? (o.modern_reload_dof ? 2u : 1u) : 0u;
+            int index = StepTable(kReloadBlurModes, mode, step);
+            if (step) {
+                o.reload_blur = mode != 0;
+                o.modern_reload_dof = mode == 2;
+            }
+            std::snprintf(text, sizeof(text), "%s", kReloadBlurNames[index]);
+            return true;
+        }
         case kDrawDistance:
             std::snprintf(text, sizeof(text), "%s", kDistanceNames[StepTable(kDistances, o.draw_distance, step)]);
             return true;

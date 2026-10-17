@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -11,6 +12,7 @@
 #include "common/menu.h"
 #include "common/options.h"
 #include "core/diag.h"
+#include "d3d/depth_of_field.h"
 #include "d3d/gpu_frame.h"
 #include "d3d/occlusion.h"
 #include "gpu/backend.h"
@@ -299,6 +301,19 @@ void Occlusion(const float* m, bool gtao) {
                                                fog.slope, fog.offset, fog.most, 0};
     const uint8_t* rects = reinterpret_cast<const uint8_t*>(p);
     g_backend->Clear(g_state, gpu::kOcclusionRects, rects, gpu::kClearOcclusion, 0, 0, 0);
+}
+
+bool DepthOfField(const float* m, float strength) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_backend || !m || m[11] != 1.0f || m[15] != 0.0f || !std::isfinite(m[14]) ||
+        !std::isfinite(m[10]) || m[14] >= 0 || !std::isfinite(strength) || strength <= 0 ||
+        !g_state.rt.header || !g_state.zs.header || !g_state.viewport.w || !g_state.viewport.h ||
+        !std::isfinite(g_state.viewport.min_z) || !std::isfinite(g_state.viewport.max_z) ||
+        g_state.viewport.max_z <= g_state.viewport.min_z) return false;
+    const float p[4] = {m[14], m[10], std::clamp(strength, 0.0f, 1.0f), 1.0f};
+    g_backend->Clear(g_state, gpu::kDepthOfFieldRects, reinterpret_cast<const uint8_t*>(p),
+                     gpu::kClearDepthOfField, 0, 0, 0);
+    return true;
 }
 
 }  // namespace d3d

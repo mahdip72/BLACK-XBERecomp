@@ -33,7 +33,7 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 - **Anisotropic Filtering** - Forces the selected anisotropic filtering level on all textures.
 - **Draw Distance** - Increases the level of detail and draw distances past the game's values: 2x, 4x or 8x.
 - **Ambient Occlusion** - Adds screen space ambient occlusion, creating soft contact shadows where surfaces meet. Choose between SSAO and GTAO.
-- **Reload Blur** - Toggles the blur effect while reloading.
+- **Reload Blur** - Off, Original, or Modern DOF. Modern DOF replaces reload blur with depth-aware circular bokeh, preserving the original timing and keeping the weapon and HUD sharp.
 
 ### Input
 - **Mouse and Keyboard** - Full keyboard and mouse support with raw input, adjustable sensitivity, inverted look and rebindable controls.
@@ -85,3 +85,9 @@ Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) and 
 ### 4. Build the Project
 - Run `build.bat`. The first build recompiles the entire game and can take 30 to 90 minutes on weaker systems.
 - When it finishes, run `out\build\release\BLACK.exe`.
+
+### Depth-of-field checks
+- Run `powershell -NoProfile -ExecutionPolicy Bypass -File tools\tests\run_dof_tests.ps1` from the repository root. The focused checks compile the production shader, render synthetic fixtures with the CPU-only D3D11 WARP device, and test the reload hooks. They do not start the game.
+- Results are saved under `out\tests\dof-tests`. These checks do not validate the D3D12 device, gameplay appearance, or frame rate.
+- For visual checking, use F10 > Graphics > Reload Blur to compare Original and Modern DOF while reloading. Check fade-in/out, interrupted and multipart reloads, weapon/HUD sharpness, and nearby silhouettes with MSAA off and on.
+- Modern DOF uses a fixed 1 m focus and a 48-tap circular aperture. Transparent meshes, particles and bloom are drawn afterward. Tiny highlights, transparency, and performance still need gameplay review.

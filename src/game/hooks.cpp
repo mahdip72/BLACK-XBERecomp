@@ -20,6 +20,8 @@ namespace d3d {
 void ViewScale(float xy);
 }
 
+void ReloadAnimationDof(X86Context& ctx, uint8_t* base);
+
 namespace {
 
 constexpr uint32_t kDevice = SYM(D3D_Device);
@@ -350,10 +352,10 @@ X86_FUNC(sub_0017B130) {
     uint32_t ac = R32(ctx.esp + 4);
     uint32_t from = R32(ac + kAnimFrom);
     uint32_t clip = R32(ac + kAnimClip);
-    if (R32(ac + kAnimOwner) != Player() || !clip) return __imp__sub_0017B130(ctx, base);
+    if (R32(ac + kAnimOwner) != Player() || !clip) return ReloadAnimationDof(ctx, base);
     int16_t slot = G<int16_t>(clip + kAnimClipFadeSlot);
     uint32_t fade = clip + kAnimClipFades + slot * kFadeSize;
-    __imp__sub_0017B130(ctx, base);
+    ReloadAnimationDof(ctx, base);
     if (G<int16_t>(clip + kAnimClipFadeSlot) == slot || FrameShare() >= 1) return;
     uint32_t weapon = R32(R32(ac + kAnimOwner) + kPlayerWeapon);
     if (weapon && R32(weapon + kWeaponState) == 1) {

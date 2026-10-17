@@ -34,6 +34,8 @@
 #include "common/options.h"
 #include "core/diag.h"
 #include "core/log.h"
+#include "d3d/depth_of_field.h"
+#include "d3d/depth_of_field_shader.h"
 #include "d3d/occlusion.h"
 #include "d3d/smaa_shader.h"
 #include "d3d/smaa_textures.h"
@@ -921,6 +923,8 @@ private:
     ID3D12PipelineState* EnsureOcclusionPipeline(const AoPass& a);
     void OcclusionViews(uint32_t slot, const AoPass& a);
     bool OcclusionPass(const AoPass& a, float c[kAoConstants], const D3D12_RECT& rect, uint32_t w, uint32_t h);
+    void DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]);
+    ID3D12PipelineState* EnsureDepthOfFieldPipeline(DXGI_FORMAT out, uint32_t samples);
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
     // Draw, in call order, each callee right after its caller
@@ -1760,6 +1764,84 @@ bool D3D12Backend::OcclusionPass(const AoPass& a, float c[kAoConstants], const D
     cl_->RSSetScissorRects(1, &rect);
     DrawFullScreen(pso, cb.gpu, slot);
     return true;
+}
+
+ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(DXGI_FORMAT out, uint32_t samples) {
+    constexpr const char* entry = "depth_of_field";
+    uint64_t bits = uint64_t(out) | uint64_t(samples) << 40;
+    auto [it, added] = blit_psos_.try_emplace(Hash(entry, std::strlen(entry), bits));
+    auto& pso = it->second;
+    // A failed format/sample combination stays disabled rather than retrying a failed pipeline every frame.
+    if (!added) return pso.Get();
+    std::string text;
+    if (samples > 1) text = "#define MS 1\n#define DOF_SAMPLES " + std::to_string(samples) + "\n";
+    text += kDepthOfFieldHlsl;
+    uint64_t hash;
+    ID3DBlob* vs = Compile(text, "vs", "vs_5_0", hash);
+    ID3DBlob* ps = Compile(text, entry, "ps_5_0", hash);
+    if (!vs || !ps) return nullptr;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, out);
+    // Subsequent game effects read the scene alpha; only replace its color.
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED |
+        D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    d.SampleDesc.Count = samples;
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
+    return pso.Get();
+}
+
+// Queued at the opaque-world boundary during reloads, when the game defers the weapon until after its effects.
+// p: projection m14, m10, original reload strength, focus distance. No settings or guest memory are read here.
+void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]) {
+    for (int i = 0; i < 4; i++) if (!std::isfinite(p[i])) return;
+    if (p[0] >= 0 || p[2] <= 0 || p[3] <= 0) return;
+    Target* rt = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    if (!OcclusionFits(rt, ds) || !rt->drawn || !ds->drawn) return;
+    const Viewport& v = s.viewport;
+    if (!std::isfinite(v.min_z) || !std::isfinite(v.max_z) || v.max_z <= v.min_z) return;
+    D3D12_RECT rect = ViewRect(v, *rt);
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
+    float radius = 12.0f * float(rect.bottom - rect.top) / 1080.0f * std::clamp(p[2], 0.0f, 1.0f);
+    if (radius < 0.75f) return;
+    float zr = v.max_z - v.min_z;
+    const float c[8] = {p[0] * zr, v.min_z + p[1] * zr, p[3], radius,
+        float(rect.left), float(rect.top), float(rect.right - rect.left), float(rect.bottom - rect.top)};
+    for (float value : c) if (!std::isfinite(value)) return;
+    uint32_t samples = Ms(*rt);
+    ID3D12PipelineState* pso = EnsureDepthOfFieldPipeline(rt->fmt, samples);
+    if (!pso) return;
+    // Feedback takes a copy even at 1x, so the scene is never read while it is being written. At MSAA it resolves.
+    ID3D12Resource* source = Feedback(*rt);
+    if (!source) return;
+    uint32_t slot = AllocSrvSlots(4);
+    ID3D12Resource* res[4] = {ds->res.Get(), source, nullptr, nullptr};
+    DXGI_FORMAT fmt[4] = {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, rt->fmt, kBgra, kBgra};
+    for (int i = 0; i < 4; i++) {
+        bool ms = i == 0 && samples > 1;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = fmt[i];
+        sv.ViewDimension = ms ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (!ms) sv.Texture2D.MipLevels = 1;
+        dev_->CreateShaderResourceView(res[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    }
+    Alloc cb = Upload(256, 256);
+    std::memcpy(cb.cpu, c, sizeof(c));
+    bound_rt_ = bound_ds_ = nullptr;
+    Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE target = Cpu(rtv_heap_.Get(), rt->view, rtv_inc_);
+    cl_->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    D3D12_VIEWPORT vp{0, 0, float(rt->w), float(rt->h), 0, 1};
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &rect);
+    DrawFullScreen(pso, cb.gpu, slot);
+    // Restore write state, invalidating Feedback's cached depth resolve just as the AO pass does.
+    Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    rt->drawn = true;
+    LOG_FIRST(1, "d3d12: reload depth of field %ux%u, %u samples, focus %.2f, radius %.2f",
+              rt->w, rt->h, samples, p[3], radius);
+    if (cap_) fprintf(cap_, "%04u depth of field rt %08X ds %08X strength %.3f\n", cap_i_++, s.rt.data, s.zs.data, p[2]);
 }
 
 // the pixels the CPU changed since the last Sync, opaque, the rest 0; t.read takes them
@@ -3054,6 +3136,13 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
+    if (flags & kClearDepthOfField) {
+        if (count != kDepthOfFieldRects || !rects) return;
+        float p[4 * kDepthOfFieldRects];
+        std::memcpy(p, rects, sizeof(p));
+        DepthOfField(s, p);
+        return;
+    }
     if (flags & kClearOcclusion) {
         if (count != kOcclusionRects || !rects) return;
         float p[4 * kOcclusionRects];
