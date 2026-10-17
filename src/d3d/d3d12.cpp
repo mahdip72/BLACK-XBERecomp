@@ -2502,6 +2502,33 @@ bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& sta
 }
 
 constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
+constexpr uint8_t kTexGlowSmooth = 8;  // local shader variant; SDK extension flags use bits 0 and 1
+
+// Smooth only the final glow layer. Shared reflection and reload blur shaders stay intact.
+std::string GlowPixelHlsl(const PixelKey& pk) {
+    std::string source = PixelHlsl(pk);
+    if (!(pk.tex[0].flags & kTexGlowSmooth)) return source;
+    constexpr const char* call = "float4 t0 = spreadtap(";
+    size_t at = source.find(call);
+    if (at == std::string::npos || source.find(call, at + 1) != std::string::npos) {
+        LOGE("d3d12: final glow sample not found in translated shader");
+        return {};
+    }
+    source.replace(at, std::strlen(call), "float4 t0 = glowtap(");
+    return R"(
+float4 glowtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
+    float2 dx = ddx(uv), dy = ddy(uv);
+    const float weight[5] = {1, 4, 6, 4, 1};
+    float4 sum = 0;
+    [unroll] for (int y = -2; y <= 2; ++y)
+        [unroll] for (int x = -2; x <= 2; ++x) {
+            float4 v = t.SampleGrad(s, uv + w.xy * float2(x, y), dx, dy);
+            sum += float4(saturate(v.rgb * m), v.a) * weight[x + 2] * weight[y + 2];
+        }
+    return sum / 256;
+}
+)" + source;
+}
 
 // sets sh.ph and sh.ps_code, compiling the shader on a cache miss
 void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
@@ -2512,7 +2539,7 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
         sh.ps_code = blobs_[sh.ph].Get();
         return;
     }
-    sh.ps_code = Compile(PixelHlsl(pk), "main", "ps_5_0", sh.ph);
+    sh.ps_code = Compile(GlowPixelHlsl(pk), "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
 
@@ -2625,6 +2652,12 @@ void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTex
     float k = stages.k[i];
     c.texsize[i][2] = -0.5f / (float(d.width) * k);
     c.texsize[i][3] = -0.5f / (float(d.height) * k);
+    if (stages.info[i].flags & kTexGlowSmooth) {
+        constexpr float kExtraGlowBlur = 2.27f;
+        c.spread[i][0] = kGlowBoxTexels * kExtraGlowBlur / (4 * float(d.width) * k);
+        c.spread[i][1] = kGlowBoxTexels * kExtraGlowBlur / (4 * float(d.height) * k);
+        return;
+    }
     // a 3 console texel box per tap keeps the console chain's glow width and brightness; a blur's taps
     // are 7/6 texel apart, so each covers that much, a sample per host texel
     if (stages.wide[i] > 0) {
@@ -2773,6 +2806,10 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     FillSurfaceConstants(s, size, c);
     FillFogConstants(s, c);
     FillCombinerConstants(s, c);
+    if (stages.align_glow) {
+        // RGB only: preserve the original alpha and the scene underneath the glow.
+        for (int i = 0; i < 3; i++) c.pc[0][i] *= 0.65f;
+    }
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
     FillTextureConstants(s, stages, c);
     if (stages.align_glow) {
@@ -2859,7 +2896,7 @@ void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::stri
 
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
     CaptureShader("vs", sh.vkey, VertexHlsl(s, a, sh));
-    CaptureShader("ps", sh.pkey, PixelHlsl(pk));
+    CaptureShader("ps", sh.pkey, GlowPixelHlsl(pk));
 }
 
 D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
@@ -2999,6 +3036,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         stages.rt[0] && (SimpleState(s, kMPsFinalConstant0) >> 24) == 255 &&
         !s.textures[1] && !s.textures[2] && !s.textures[3] && Describe(s.textures[0], glow) &&
         glow.format == 0x12 && glow.width * 4 == guest_w_ && glow.height * 4 == guest_h_;
+    if (stages.align_glow) {
+        stages.info[0].flags |= kTexWide | kTexGlowSmooth;
+        pk = MakePixelKey(s, stages.info);
+    }
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (!sh.vs_code || !sh.ps_code) return;
