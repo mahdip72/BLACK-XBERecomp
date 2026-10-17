@@ -456,6 +456,9 @@ float4 occlusion_apply(float4 pos : SV_Position) : SV_Target {
 constexpr int kAoTargets = 2;
 constexpr int kAoConstants = 20;  // kAoHlsl's b1
 constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R16G16_FLOAT;
+constexpr uint32_t kDofLevels = 4;
+constexpr uint32_t kDofTargets = 2;
+constexpr DXGI_FORMAT kDofFormats[kDofTargets] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16_FLOAT};
 constexpr float kAoRadius = 0.8f;    // world units, the engine's are metres
 constexpr float kAoMaxSpan = 0.15f;  // of the view's height, the most one pixel's samples may cover
 
@@ -924,7 +927,18 @@ private:
     void OcclusionViews(uint32_t slot, const AoPass& a);
     bool OcclusionPass(const AoPass& a, float c[kAoConstants], const D3D12_RECT& rect, uint32_t w, uint32_t h);
     void DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]);
-    ID3D12PipelineState* EnsureDepthOfFieldPipeline(DXGI_FORMAT out, uint32_t samples);
+    ID3D12PipelineState* EnsureDepthOfFieldPipeline(const char* entry, DXGI_FORMAT out, uint32_t samples,
+                                                  uint32_t input_samples = 1);
+    bool EnsureDepthOfFieldFilter(uint32_t w, uint32_t h);
+    D3D12_CPU_DESCRIPTOR_HANDLE DepthOfFieldView(uint32_t mip, uint32_t target) {
+        return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
+            target * kDofLevels + mip, rtv_inc_);
+    }
+    void SetDepthOfFieldTarget(uint32_t mip, uint32_t w, uint32_t h);
+    void DepthOfFieldViews(uint32_t slot, ID3D12Resource* depth, bool ms, ID3D12Resource* color,
+                           DXGI_FORMAT color_format, uint32_t first_mip = 0, uint32_t mip_count = 0);
+    void DepthOfFieldMipState(uint32_t mip, D3D12_RESOURCE_STATES state);
+    void DepthOfFieldSkipped(uint32_t reason, const char* message);
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
     // Draw, in call order, each callee right after its caller
@@ -1130,6 +1144,11 @@ private:
     D3D12_RESOURCE_STATES ao_state_[kAoTargets] = {};
     uint32_t ao_w_ = 0;
     uint32_t ao_h_ = 0;
+    ComPtr<ID3D12Resource> dof_filter_[kDofTargets];
+    D3D12_RESOURCE_STATES dof_states_[kDofTargets][kDofLevels] = {};
+    uint32_t dof_levels_ = 0;
+    uint32_t dof_skip_reported_ = 0;
+    bool dof_reported_ = false;
     // surfaces locked without a wait: copies in flight, the newest finished one goes to guest memory
     struct Late {
         ComPtr<ID3D12Resource> rb[kFrames];
@@ -1256,9 +1275,9 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
     return dev_->GetDescriptorHandleIncrementSize(t);
 }
 
-// RTVs: the targets' pool, then the back buffers, the occlusion, output and SMAA targets
+// RTVs: the targets' pool, then the back buffers, occlusion, output, SMAA and the DOF filter mips
 void D3D12Backend::CreateHeaps() {
-    constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets;
+    constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets + kDofLevels * kDofTargets;
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvTotal, false, rtv_heap_);
@@ -1766,81 +1785,202 @@ bool D3D12Backend::OcclusionPass(const AoPass& a, float c[kAoConstants], const D
     return true;
 }
 
-ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(DXGI_FORMAT out, uint32_t samples) {
-    constexpr const char* entry = "depth_of_field";
-    uint64_t bits = uint64_t(out) | uint64_t(samples) << 40;
+ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(const char* entry, DXGI_FORMAT out, uint32_t samples,
+                                                           uint32_t input_samples) {
+    uint64_t bits = uint64_t(out) | uint64_t(input_samples) << 32 | uint64_t(samples) << 40;
     auto [it, added] = blit_psos_.try_emplace(Hash(entry, std::strlen(entry), bits));
     auto& pso = it->second;
     // A failed format/sample combination stays disabled rather than retrying a failed pipeline every frame.
     if (!added) return pso.Get();
     std::string text;
-    if (samples > 1) text = "#define MS 1\n#define DOF_SAMPLES " + std::to_string(samples) + "\n";
+    if (input_samples > 1) text = "#define MS 1\n#define DOF_SAMPLES " + std::to_string(input_samples) + "\n";
     text += kDepthOfFieldHlsl;
     uint64_t hash;
     ID3DBlob* vs = Compile(text, "vs", "vs_5_0", hash);
     ID3DBlob* ps = Compile(text, entry, "ps_5_0", hash);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, out);
-    // Subsequent game effects read the scene alpha; only replace its color.
-    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED |
-        D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    // Filter passes write color/coverage and depth. Only the final scene pass preserves destination alpha.
+    if (!std::strcmp(entry, "depth_of_field")) {
+        d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED |
+            D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    } else {
+        d.NumRenderTargets = kDofTargets;
+        d.RTVFormats[1] = kDofFormats[1];
+        d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
     d.SampleDesc.Count = samples;
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
 }
 
+bool D3D12Backend::EnsureDepthOfFieldFilter(uint32_t w, uint32_t h) {
+    if (dof_filter_[0] && dof_filter_[0]->GetDesc().Width == w && dof_filter_[0]->GetDesc().Height == h) return true;
+    uint32_t levels = 1;
+    for (uint32_t extent = std::max(w, h); extent > 1 && levels < kDofLevels; extent >>= 1) levels++;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    ComPtr<ID3D12Resource> filter[kDofTargets];
+    for (uint32_t target = 0; target < kDofTargets; target++) {
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kDofFormats[target], w, h);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        td.MipLevels = UINT16(levels);
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 nullptr, IID_PPV_ARGS(&filter[target])))) return false;
+    }
+    for (uint32_t target = 0; target < kDofTargets; target++) {
+        if (dof_filter_[target]) Release(std::move(dof_filter_[target]));
+        dof_filter_[target] = std::move(filter[target]);
+        for (uint32_t mip = 0; mip < levels; mip++) {
+            dof_states_[target][mip] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            D3D12_RENDER_TARGET_VIEW_DESC rv{};
+            rv.Format = kDofFormats[target];
+            rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            rv.Texture2D.MipSlice = mip;
+            dev_->CreateRenderTargetView(dof_filter_[target].Get(), &rv, DepthOfFieldView(mip, target));
+        }
+    }
+    dof_levels_ = levels;
+    return true;
+}
+
+void D3D12Backend::SetDepthOfFieldTarget(uint32_t mip, uint32_t w, uint32_t h) {
+    D3D12_CPU_DESCRIPTOR_HANDLE views[kDofTargets] = {DepthOfFieldView(mip, 0), DepthOfFieldView(mip, 1)};
+    cl_->OMSetRenderTargets(kDofTargets, views, FALSE, nullptr);
+    bound_rt_ = bound_ds_ = nullptr;
+    SetFullViewport(w, h);
+}
+
+void D3D12Backend::DepthOfFieldViews(uint32_t slot, ID3D12Resource* depth, bool ms, ID3D12Resource* color,
+                                    DXGI_FORMAT color_format, uint32_t first_mip, uint32_t mip_count) {
+    ID3D12Resource* res[4] = {depth, color, mip_count ? dof_filter_[0].Get() : nullptr,
+        mip_count ? dof_filter_[1].Get() : nullptr};
+    DXGI_FORMAT fmt[4] = {depth ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kBgra, color_format, kDofFormats[0], kDofFormats[1]};
+    for (int i = 0; i < 4; i++) {
+        bool multisampled = i < 2 && ms;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = fmt[i];
+        sv.ViewDimension = multisampled ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (!multisampled) {
+            sv.Texture2D.MipLevels = i >= 2 && mip_count ? mip_count : 1;
+            sv.Texture2D.MostDetailedMip = i >= 2 ? first_mip : 0;
+        }
+        dev_->CreateShaderResourceView(res[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    }
+}
+
+void D3D12Backend::DepthOfFieldMipState(uint32_t mip, D3D12_RESOURCE_STATES state) {
+    D3D12_RESOURCE_BARRIER barriers[kDofTargets] = {};
+    uint32_t count = 0;
+    for (uint32_t target = 0; target < kDofTargets; target++) {
+        if (dof_states_[target][mip] == state) continue;
+        auto& barrier = barriers[count++];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = dof_filter_[target].Get();
+        barrier.Transition.Subresource = mip;
+        barrier.Transition.StateBefore = dof_states_[target][mip];
+        barrier.Transition.StateAfter = state;
+        dof_states_[target][mip] = state;
+    }
+    if (count) cl_->ResourceBarrier(count, barriers);
+}
+
+void D3D12Backend::DepthOfFieldSkipped(uint32_t reason, const char* message) {
+    if (dof_skip_reported_ & (1u << reason)) return;
+    dof_skip_reported_ |= 1u << reason;
+    LOGR("Reload DOF skipped: %s", message);
+}
+
 // Queued at the opaque-world boundary during reloads, when the game defers the weapon until after its effects.
 // p: projection m14, m10, original reload strength, focus distance. No settings or guest memory are read here.
 void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]) {
-    for (int i = 0; i < 4; i++) if (!std::isfinite(p[i])) return;
-    if (p[0] >= 0 || p[2] <= 0 || p[3] <= 0) return;
+    for (int i = 0; i < 4; i++) if (!std::isfinite(p[i])) {
+        DepthOfFieldSkipped(0, "non-finite projection, strength or focus");
+        return;
+    }
+    if (p[2] <= 0) return;
+    if (p[0] >= 0 || p[3] <= 0) {
+        DepthOfFieldSkipped(0, "unsupported perspective projection or focus");
+        return;
+    }
     Target* rt = FindTarget(s.rt, false);
     Target* ds = FindTarget(s.zs, true);
-    if (!OcclusionFits(rt, ds) || !rt->drawn || !ds->drawn) return;
+    if (!OcclusionFits(rt, ds) || !rt->drawn || !ds->drawn) {
+        DepthOfFieldSkipped(1, "scene color/depth missing, undrawn, resized or sample counts differ");
+        return;
+    }
     const Viewport& v = s.viewport;
-    if (!std::isfinite(v.min_z) || !std::isfinite(v.max_z) || v.max_z <= v.min_z) return;
+    if (!std::isfinite(v.min_z) || !std::isfinite(v.max_z) || v.max_z <= v.min_z) {
+        DepthOfFieldSkipped(2, "invalid viewport depth range");
+        return;
+    }
     D3D12_RECT rect = ViewRect(v, *rt);
-    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
-    float radius = 12.0f * float(rect.bottom - rect.top) / 1080.0f * std::clamp(p[2], 0.0f, 1.0f);
-    if (radius < 0.75f) return;
+    if (rect.right <= rect.left || rect.bottom <= rect.top) {
+        DepthOfFieldSkipped(2, "empty scene viewport");
+        return;
+    }
+    float radius = 18.0f * float(rect.bottom - rect.top) / 1080.0f * std::clamp(p[2], 0.0f, 1.0f);
     float zr = v.max_z - v.min_z;
     const float c[8] = {p[0] * zr, v.min_z + p[1] * zr, p[3], radius,
         float(rect.left), float(rect.top), float(rect.right - rect.left), float(rect.bottom - rect.top)};
-    for (float value : c) if (!std::isfinite(value)) return;
+    for (float value : c) if (!std::isfinite(value)) {
+        DepthOfFieldSkipped(0, "non-finite derived shader constants");
+        return;
+    }
     uint32_t samples = Ms(*rt);
-    ID3D12PipelineState* pso = EnsureDepthOfFieldPipeline(rt->fmt, samples);
-    if (!pso) return;
+    ID3D12PipelineState* pso = EnsureDepthOfFieldPipeline("depth_of_field", rt->fmt, samples);
+    ID3D12PipelineState* pack_pso = EnsureDepthOfFieldPipeline("depth_of_field_pack", kDofFormats[0], 1, samples);
+    ID3D12PipelineState* downsample_pso = EnsureDepthOfFieldPipeline("depth_of_field_downsample", kDofFormats[0], 1);
+    if (!pso || !pack_pso || !downsample_pso) {
+        DepthOfFieldSkipped(3, "shader compilation or pipeline creation failed");
+        return;
+    }
+    if (!EnsureDepthOfFieldFilter(rt->w, rt->h)) {
+        DepthOfFieldSkipped(4, "color/depth filter target allocation failed");
+        return;
+    }
     // Feedback takes a copy even at 1x, so the scene is never read while it is being written. At MSAA it resolves.
     ID3D12Resource* source = Feedback(*rt);
-    if (!source) return;
-    uint32_t slot = AllocSrvSlots(4);
-    ID3D12Resource* res[4] = {ds->res.Get(), source, nullptr, nullptr};
-    DXGI_FORMAT fmt[4] = {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, rt->fmt, kBgra, kBgra};
-    for (int i = 0; i < 4; i++) {
-        bool ms = i == 0 && samples > 1;
-        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-        sv.Format = fmt[i];
-        sv.ViewDimension = ms ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
-        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (!ms) sv.Texture2D.MipLevels = 1;
-        dev_->CreateShaderResourceView(res[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    if (!source) {
+        DepthOfFieldSkipped(4, "scene color snapshot allocation failed");
+        return;
     }
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, c, sizeof(c));
     bound_rt_ = bound_ds_ = nullptr;
     Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    D3D12_CPU_DESCRIPTOR_HANDLE target = Cpu(rtv_heap_.Get(), rt->view, rtv_inc_);
-    cl_->OMSetRenderTargets(1, &target, FALSE, nullptr);
-    D3D12_VIEWPORT vp{0, 0, float(rt->w), float(rt->h), 0, 1};
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &rect);
-    DrawFullScreen(pso, cb.gpu, slot);
+    if (samples > 1) Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    DepthOfFieldMipState(0, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    uint32_t pack_slot = AllocSrvSlots(4);
+    DepthOfFieldViews(pack_slot, ds->res.Get(), samples > 1, samples > 1 ? rt->res.Get() : source, rt->fmt);
+    // Every scratch pixel is initialized, including zero depth outside a partial scene viewport.
+    SetDepthOfFieldTarget(0, rt->w, rt->h);
+    DrawFullScreen(pack_pso, cb.gpu, pack_slot);
+    DepthOfFieldMipState(0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     // Restore write state, invalidating Feedback's cached depth resolve just as the AO pass does.
     Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    for (uint32_t mip = 1; mip < dof_levels_; mip++) {
+        DepthOfFieldMipState(mip, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        uint32_t mip_slot = AllocSrvSlots(4);
+        // The SRV exposes only the completed source mip; the destination is never simultaneously readable.
+        DepthOfFieldViews(mip_slot, nullptr, false, nullptr, kBgra, mip - 1, 1);
+        SetDepthOfFieldTarget(mip, std::max(1u, rt->w >> mip), std::max(1u, rt->h >> mip));
+        DrawFullScreen(downsample_pso, cb.gpu, mip_slot);
+        DepthOfFieldMipState(mip, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    uint32_t slot = AllocSrvSlots(4);
+    DepthOfFieldViews(slot, nullptr, false, source, rt->fmt, 0, dof_levels_);
+    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    SetBlitTarget(Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h);
+    cl_->RSSetScissorRects(1, &rect);
+    DrawFullScreen(pso, cb.gpu, slot);
     rt->drawn = true;
-    LOG_FIRST(1, "d3d12: reload depth of field %ux%u, %u samples, focus %.2f, radius %.2f",
-              rt->w, rt->h, samples, p[3], radius);
+    if (!dof_reported_) {
+        dof_reported_ = true;
+        LOGR("Reload DOF active: %ux%u, %ux MSAA, focus %.2f world units, radius %.3fpx, strength %.4f, "
+             "z %.6f/(depth-%.6f), 64+32 taps, %u filter mips",
+             rt->w, rt->h, samples, p[3], radius, p[2], c[0], c[1], dof_levels_);
+    }
     if (cap_) fprintf(cap_, "%04u depth of field rt %08X ds %08X strength %.3f\n", cap_i_++, s.rt.data, s.zs.data, p[2]);
 }
 

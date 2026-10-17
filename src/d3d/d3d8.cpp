@@ -310,7 +310,7 @@ bool DepthOfField(const float* m, float strength) {
         !g_state.rt.header || !g_state.zs.header || !g_state.viewport.w || !g_state.viewport.h ||
         !std::isfinite(g_state.viewport.min_z) || !std::isfinite(g_state.viewport.max_z) ||
         g_state.viewport.max_z <= g_state.viewport.min_z) return false;
-    const float p[4] = {m[14], m[10], std::clamp(strength, 0.0f, 1.0f), 1.0f};
+    const float p[4] = {m[14], m[10], std::clamp(strength, 0.0f, 1.0f), 5.0f};
     g_backend->Clear(g_state, gpu::kDepthOfFieldRects, reinterpret_cast<const uint8_t*>(p),
                      gpu::kClearDepthOfField, 0, 0, 0);
     return true;

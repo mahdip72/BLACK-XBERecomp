@@ -16,6 +16,7 @@ using namespace kernel;
 void ReloadAnimationDof(X86Context& ctx, uint8_t* base);
 void ReloadDepthOfField(X86Context& ctx, uint8_t* base);
 void sub_001772E0(X86Context& ctx, uint8_t* base);
+float CinematicDofStrength(float strength);
 
 namespace {
 constexpr uint32_t kEffects = 0x2D1990;
@@ -48,12 +49,12 @@ void Reset(uint32_t initial_type = 0) {
     R32(kEffects) = kManager;
     R32(layout::kGame) = kGameObject;
     R32(layout::kWorld) = 0x500000;
-    R32(kGameObject + layout::kCurrentFilm) = layout::kFilms;
+    R32(kGameObject + layout::kCurrentFilm) = 0;
     R32(kEffect + 0x34) = initial_type;
     R32(kEffect + 0x18) = 20;
-    R32(kEffect + 0x1C) = 5;
-    R32(kEffect + 0x20) = 11;
-    R32(kEffect + 0x24) = 4;
+    G<float>(kEffect + 0x1C) = 0.3f;
+    G<float>(kEffect + 0x20) = 0.4f;
+    G<float>(kEffect + 0x24) = 0.2f;
     G<float>(kEffect + 0x10) = 0.45f;
     G<float>(kProjection) = 1.0f;
     R32(kFrameCount) = 12;
@@ -89,9 +90,14 @@ void Effect(bool skipped) {
 void TestTagAndSkip() {
     Reset();
     StartReload();
+    Check(G<float>(kEffect + 0x1C) == 0.8f &&
+          G<float>(kEffect + 0x24) == 0.9f &&
+          G<float>(kEffect + 0x20) == 0.4f,
+          "Modern reload did not lengthen only ramp/fade");
     RenderFrame();
-    Check(queue_calls == 1 && std::abs(queued_strength - 0.45f) < 1e-6f,
-          "valid reload did not queue its real strength");
+    Check(queue_calls == 1 &&
+          std::abs(queued_strength - CinematicDofStrength(0.45f)) < 1e-6f,
+          "valid reload did not queue eased strength");
     Effect(true);
     R32(kFrameCount)++;
     original_effect_calls = 0;
@@ -125,25 +131,53 @@ void TestUntaggedAndInvalidated() {
     RenderFrame();
     Check(queue_calls == 0, "changed effect type kept reload tag");
 
+    std::puts("PASS scripted effect isolation and type/timing invalidation");
+}
+
+void TestFilmIndicesAndProvenance() {
+    // kCurrentFilm is a retained/requested film index. Gameplay can hold a
+    // valid index here; it is not a flag that disables the reload effect.
+    for (uint32_t film : {0u, 1u, layout::kFilms - 1}) {
+        Reset();
+        R32(kGameObject + layout::kCurrentFilm) = film;
+        StartReload();
+        RenderFrame();
+        Check(queue_calls == 1, "valid retained film index disabled reload DOF");
+        Effect(true);
+    }
     Reset();
     StartReload();
-    R32(kGameObject + layout::kCurrentFilm) = layout::kFilms - 1;
+    R32(layout::kWorld) = 0;
     RenderFrame();
-    Check(queue_calls == 0, "film state did not invalidate reload tag");
-    std::puts("PASS scripted effect isolation and type/timing/film invalidation");
+    Check(queue_calls == 0, "missing world did not invalidate reload tag");
+    Effect(false);
+
+    Reset();
+    StartReload();
+    R32(kEffects) = kManager + 0x1000;
+    RenderFrame();
+    Check(queue_calls == 0, "different effect manager kept reload tag");
+    Effect(false);
+    std::puts("PASS valid film indices and world/manager provenance guards");
 }
 
 void TestFallbacks() {
     Reset();
-    StartReload();
     options.modern_reload_dof = false;
+    StartReload();
+    Check(G<float>(kEffect + 0x1C) == 0.3f &&
+          G<float>(kEffect + 0x24) == 0.2f,
+          "Original mode modified stock durations");
     RenderFrame();
     Check(queue_calls == 0, "Original mode queued modern DOF");
     Effect(false);
 
     Reset();
-    StartReload();
     options.reload_blur = false;
+    StartReload();
+    Check(G<float>(kEffect + 0x1C) == 0.3f &&
+          G<float>(kEffect + 0x24) == 0.2f,
+          "Off mode modified stock durations");
     RenderFrame();
     Check(queue_calls == 0, "Off mode queued modern DOF");
     Effect(false);
@@ -162,6 +196,23 @@ void TestFallbacks() {
     Check(queue_calls == 0, "nonfinite strength reached render queue");
     Effect(false);
     std::puts("PASS Original/Off, queue rejection, and invalid-strength legacy fallback");
+}
+
+void TestEnvelope() {
+    Check(CinematicDofStrength(-1) == 0 && CinematicDofStrength(0) == 0 &&
+          CinematicDofStrength(1) == 1 && CinematicDofStrength(2) == 1 &&
+          CinematicDofStrength(NAN) == 0, "strength envelope did not clamp");
+    Check(std::abs(CinematicDofStrength(0.25f) - 0.103515625f) < 1e-6f &&
+          std::abs(CinematicDofStrength(0.5f) - 0.5f) < 1e-6f &&
+          std::abs(CinematicDofStrength(0.75f) - 0.896484375f) < 1e-6f,
+          "strength envelope is not smooth quintic easing");
+    float previous = 0;
+    for (int i = 1; i <= 100; ++i) {
+        const float current = CinematicDofStrength(i / 100.0f);
+        Check(current >= previous, "strength envelope decreased during ramp");
+        previous = current;
+    }
+    std::puts("PASS production quintic strength envelope and Modern-only durations");
 }
 } // namespace
 
@@ -196,7 +247,9 @@ int main() {
     try {
         TestTagAndSkip();
         TestUntaggedAndInvalidated();
+        TestFilmIndicesAndProvenance();
         TestFallbacks();
+        TestEnvelope();
         std::puts("PASS production reload DOF hook checks");
         return 0;
     } catch (const std::exception& error) {
