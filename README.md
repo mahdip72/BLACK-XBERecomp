@@ -28,6 +28,7 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 - **FMV Scale** - Choose between Fill, which zooms the 4:3 FMVs to fill widescreen displays, and 4:3, which keeps them at their original aspect ratio.
 
 ### Graphics
+- **Optional HD Textures** - Load locally imported scenery, weapon, character and HUD replacements. See [setup and coverage](docs/hd-textures.md); artwork is supplied separately.
 - **Multisample Antialiasing (MSAA)** - Enables 2x, 4x or 8x MSAA to smooth jagged edges while preserving a sharp image.
 - **Subpixel Morphological Antialiasing (SMAA)** - Enables SMAA to smooth jagged edges across the whole frame with a softer image. SMAA also smooths alpha-tested edges such as fences and foliage, and can be combined with MSAA.
 - **Anisotropic Filtering** - Forces the selected anisotropic filtering level on all textures.
