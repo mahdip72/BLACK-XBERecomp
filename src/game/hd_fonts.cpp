@@ -1,9 +1,10 @@
-// Both shared game fonts, including their accented letters and button glyphs: replace only their texels.
+// Optional HD atlases retain the Xbox font layout, metrics and button glyphs.
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -25,69 +26,38 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr uint32_t kScale = 4;
-
-// WIC reads the game's DXT3 blocks as DDS. Filter premultiplied colour so transparent edges do not turn dark.
-bool Enlarge(const gpu::TextureDesc& d, std::vector<uint8_t>& pixels) {
+bool ReadAtlas(const wchar_t* filename, uint32_t w, uint32_t h, std::vector<uint8_t>& pixels) {
+    std::array<wchar_t, 32768> path{};
+    DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+    if (!length || length >= path.size()) return false;
+    std::wstring file(path.data(), length);
+    auto slash = file.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return false;
+    file.resize(slash + 1);
+    file += L"fonts\\";
+    file += filename;
     HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     struct ComScope {
         bool initialized;
         ~ComScope() { if (initialized) CoUninitialize(); }
     } scope{SUCCEEDED(com)};
-    uint32_t size = gpu::TotalSize(d);
-    std::array<uint32_t, 32> header{};
-    header[0] = 0x20534444;  // DDS
-    header[1] = 124;
-    header[2] = 0x81007;
-    header[3] = d.height;
-    header[4] = d.width;
-    header[5] = size;
-    header[19] = 32;
-    header[20] = 4;
-    header[21] = 0x33545844;  // DXT3
-    header[27] = 0x1000;
-    std::vector<uint8_t> dds(sizeof(header) + size);
-    std::memcpy(dds.data(), header.data(), sizeof(header));
-    std::memcpy(dds.data() + sizeof(header), HostPtr(d.data), size);
     ComPtr<IWICImagingFactory> wic;
-    ComPtr<IWICStream> stream;
     ComPtr<IWICBitmapDecoder> decoder;
     ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> premultiplied, straight;
-    ComPtr<IWICBitmapScaler> scaler;
+    ComPtr<IWICFormatConverter> straight;
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
-    if (SUCCEEDED(hr)) hr = wic->CreateStream(&stream);
-    if (SUCCEEDED(hr)) hr = stream->InitializeFromMemory(dds.data(), DWORD(dds.size()));
-    if (SUCCEEDED(hr)) hr = wic->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(hr)) hr = wic->CreateDecoderFromFilename(file.c_str(), nullptr, GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad, &decoder);
     if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
-    if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&premultiplied);
-    if (SUCCEEDED(hr)) hr = premultiplied->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA,
-        WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom);
-    if (SUCCEEDED(hr)) hr = wic->CreateBitmapScaler(&scaler);
-    uint32_t w = d.width * kScale, h = d.height * kScale;
-    if (SUCCEEDED(hr)) hr = scaler->Initialize(premultiplied.Get(), w, h, WICBitmapInterpolationModeCubic);
+    UINT width = 0, height = 0;
+    if (SUCCEEDED(hr)) hr = frame->GetSize(&width, &height);
+    if (FAILED(hr) || width != w || height != h) return false;
     if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&straight);
-    if (SUCCEEDED(hr)) hr = straight->Initialize(scaler.Get(), GUID_WICPixelFormat32bppBGRA,
+    if (SUCCEEDED(hr)) hr = straight->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
         WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom);
     pixels.resize(size_t(w) * h * 4);
     if (SUCCEEDED(hr)) hr = straight->CopyPixels(nullptr, w * 4, UINT(pixels.size()), pixels.data());
-    if (FAILED(hr)) return false;
-    // The game blends straight alpha. Extend edge colours into transparent texels for its bilinear sampler.
-    for (uint32_t y = 0; y < h; y++)
-        for (uint32_t x = 0; x < w; x++) {
-            uint8_t* p = &pixels[(size_t(y) * w + x) * 4];
-            if (p[3]) continue;
-            const uint8_t* edge = p;
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++) {
-                    uint32_t xx = uint32_t(std::clamp(int(x) + dx, 0, int(w) - 1));
-                    uint32_t yy = uint32_t(std::clamp(int(y) + dy, 0, int(h) - 1));
-                    const uint8_t* q = &pixels[(size_t(yy) * w + xx) * 4];
-                    if (q[3] > edge[3]) edge = q;
-                }
-            if (edge != p) std::memcpy(p, edge, 3);
-        }
-    return true;
+    return SUCCEEDED(hr);
 }
 
 uint32_t Deposit(uint32_t value, uint32_t mask) {
@@ -110,12 +80,18 @@ void Upgrade(uint32_t texture) {
     uint64_t key = 14695981039346656037ull ^ (uint64_t(d.width) << 32 | d.height);
     const uint8_t* original = static_cast<const uint8_t*>(HostPtr(d.data));
     for (uint32_t i = 0; i < gpu::TotalSize(d); i++) key = (key ^ original[i]) * 1099511628211ull;
+    // These assets are repacked for the exact original glyph layouts. Unknown fonts keep their own pixels.
+    const wchar_t* filename = nullptr;
+    uint32_t shift = 0;
+    if (key == 0xc64bc320db173a0cull) { filename = L"Big.png"; shift = 2; }
+    if (key == 0xd9489cbe3cdb34f1ull) { filename = L"Small.png"; shift = 3; }
+    if (!filename) return;
     uint32_t& data = cache[key];
-    uint32_t w = d.width * kScale, h = d.height * kScale;
+    uint32_t w = d.width << shift, h = d.height << shift;
     if (!data) {
         std::vector<uint8_t> pixels;
-        if (!Enlarge(d, pixels)) {
-            LOGR("fonts: reconstruction failed, keeping the original %ux%u font", d.width, d.height);
+        if (!ReadAtlas(filename, w, h, pixels)) {
+            LOGR("fonts: HD atlas missing or invalid, keeping the original %ux%u font", d.width, d.height);
             return;
         }
         data = mem::AllocSystem(w * h * 4, 128);
@@ -131,10 +107,10 @@ void Upgrade(uint32_t texture) {
         for (uint32_t y = 0; y < h; y++)
             for (uint32_t x = 0; x < w; x++)
                 std::memcpy(HostPtr(data + (xs[x] | ys[y]) * 4), &pixels[(size_t(y) * w + x) * 4], 4);
-        LOGR("fonts: reconstructed %ux%u -> %ux%u", d.width, d.height, w, h);
+        LOGR("fonts: loaded HD atlas %ux%u -> %ux%u", d.width, d.height, w, h);
     }
     uint32_t format = R32(texture + 12);
-    uint32_t sizes = (((format >> 20) & 15) + 2) | ((((format >> 24) & 15) + 2) << 4);
+    uint32_t sizes = (((format >> 20) & 15) + shift) | ((((format >> 24) & 15) + shift) << 4);
     W32(texture + 4, mem::PhysicalFromVirtual(data));
     W32(texture + 12, (format & ~0x0FF0FF00u) | (sizes << 20) | 0x600);  // swizzled A8R8G8B8
     W32(texture + 0x38, w);
