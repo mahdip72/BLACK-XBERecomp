@@ -29,9 +29,14 @@ std::array<uint32_t, 4> g_timing{};
 uint32_t g_replaced_frame = 0;
 bool g_replaced = false;
 bool g_weapon_pending = false;
+bool g_weapon_preview = false;
 uint32_t g_weapon_frame = 0;
 uint32_t g_weapon_serial = 0;
+uint32_t g_weapon_manager = 0;
+uint32_t g_weapon_display = 0;
 float g_weapon_strength = 0;
+float g_weapon_sharp_depth = 0;
+float g_weapon_transition = 0;
 std::array<float, 16> g_weapon_projection{};
 struct PreviewDraw {
     uint32_t manager = 0;
@@ -39,8 +44,10 @@ struct PreviewDraw {
     uint32_t frame = 0;
     uint32_t serial = 0;
     float strength = 0;
+    float weapon_strength = 0;
 };
 PreviewDraw g_preview;
+PreviewDraw g_preview_weapon;
 uint32_t g_preview_serial = 0;
 float g_preview_phase = 0;
 uint32_t g_preview_tick_frame = 0;
@@ -51,25 +58,54 @@ std::array<uint32_t, 4> Timing(uint32_t effect) {
     return {R32(effect + kPeak), R32(effect + kRamp), R32(effect + kHold), R32(effect + kFade)};
 }
 
-bool WeaponDofEligible() {
-    const auto& options = game::Opt();
-    uint32_t manager = R32(kEffects);
-    return options.reload_blur && options.modern_reload_dof && !options.dof_preview && g_preview_phase == 0 &&
-           !g_preview.serial && options.dof_weapon_blur &&
-           manager && R32(manager + kEffect + kType) == 0 && R32(layout::kGame) && R32(layout::kWorld);
-}
-
-bool PreviewAllowed() {
+bool WeaponDofAllowed() {
     const auto& options = game::Opt();
     uint32_t manager = R32(kEffects);
     return options.reload_blur && options.modern_reload_dof && manager &&
            R32(manager + kEffect + kType) == 0 && R32(layout::kGame) && R32(layout::kWorld) && R32(layout::kDisplay);
 }
 
-bool PreviewDrawPending() {
-    return g_preview.serial && g_preview.frame == R32(kFrameCount) &&
-           g_preview.manager == R32(kEffects) && g_preview.display == R32(layout::kDisplay) &&
-           R32(g_preview.manager + kEffect + kType) == 0;
+bool WeaponDofEligible() {
+    const auto& options = game::Opt();
+    return WeaponDofAllowed() && !options.dof_preview && g_preview_phase == 0 &&
+           !g_preview.serial && options.dof_weapon_blur;
+}
+
+bool PreviewAllowed() { return WeaponDofAllowed(); }
+
+bool PreviewDrawMatches(const PreviewDraw& draw) {
+    return draw.serial && draw.frame == R32(kFrameCount) &&
+           draw.manager == R32(kEffects) && draw.display == R32(layout::kDisplay) &&
+           R32(draw.manager + kEffect + kType) == 0;
+}
+
+bool PreviewDrawPending() { return PreviewDrawMatches(g_preview); }
+
+void BeginWeaponDof(X86Context& ctx, float strength, bool preview) {
+    g_weapon_pending = false;
+    uint32_t display = R32(layout::kDisplay);
+    uint32_t list = display + layout::kDisplayDrawLists + layout::kGunDrawList * layout::kDrawListSize;
+    if (!WeaponDofAllowed() || ctx.esi != list || !R32(list + 8) || strength <= 0) return;
+    g_weapon_frame = R32(kFrameCount);
+    if (++g_weapon_serial == 0) ++g_weapon_serial;
+    g_weapon_manager = R32(kEffects);
+    g_weapon_display = display;
+    g_weapon_preview = preview;
+    g_weapon_strength = strength;
+    g_weapon_sharp_depth = float(game::Opt().dof_weapon_sharp_depth) / 100.0f;
+    g_weapon_transition = float(game::Opt().dof_weapon_transition) / 100.0f;
+    std::copy_n(&G<float>(kProjection), g_weapon_projection.size(), g_weapon_projection.begin());
+    g_weapon_pending = d3d::BeginWeaponDepthOfField(g_weapon_projection.data(), g_weapon_strength, g_weapon_serial,
+                                                  g_weapon_sharp_depth, g_weapon_transition);
+}
+
+void EndWeaponDof(bool preview) {
+    bool pending = g_weapon_pending;
+    g_weapon_pending = false;
+    if (!pending || g_weapon_preview != preview || g_weapon_frame != R32(kFrameCount) ||
+        g_weapon_manager != R32(kEffects) || g_weapon_display != R32(layout::kDisplay) || !WeaponDofAllowed()) return;
+    d3d::EndWeaponDepthOfField(g_weapon_projection.data(), g_weapon_strength, g_weapon_serial,
+                             g_weapon_sharp_depth, g_weapon_transition);
 }
 }  // namespace
 
@@ -96,6 +132,7 @@ void TickDofPreview(float seconds) {
     } else {
         g_preview_phase = 0;
         g_preview = {};
+        g_preview_weapon = {};
     }
     g_preview_tick_frame = R32(kFrameCount);
     g_preview_clock = std::chrono::steady_clock::now();
@@ -105,6 +142,8 @@ void TickDofPreview(float seconds) {
 // These bool hooks bypass only the two render branches. Preview never changes the native effect or its clock.
 bool DeferPreviewWeapon(X86Context&, uint8_t*) {
     g_preview = {};
+    g_preview_weapon = {};
+    g_weapon_pending = false;
     if (!PreviewAllowed() || !g_preview_clock_started || g_preview_tick_frame != R32(kFrameCount)) {
         auto now = std::chrono::steady_clock::now();
         float seconds = g_preview_clock_started ? std::chrono::duration<float>(now - g_preview_clock).count() : 0;
@@ -114,11 +153,14 @@ bool DeferPreviewWeapon(X86Context&, uint8_t*) {
     if (++g_preview_serial == 0) ++g_preview_serial;
     g_preview = {R32(kEffects), R32(layout::kDisplay), R32(kFrameCount), g_preview_serial,
                  CinematicDofStrength(g_preview_phase)};
+    g_preview.weapon_strength = float(std::min(game::Opt().dof_weapon_blur, 100u)) / 100.0f *
+                                (1.0f - g_preview.strength);
     return true;
 }
 
 bool DrawPreviewWeapon(X86Context&, uint8_t*) {
     bool deferred = PreviewDrawPending();
+    g_preview_weapon = deferred ? g_preview : PreviewDraw{};
     g_preview = {};
     // The weapon must still draw if preview was disabled or its world queue failed after the early branch.
     return deferred;
@@ -181,21 +223,26 @@ void ReloadDepthOfField(X86Context&, uint8_t*) {
 // can receive the light blur. The original type-1 branch skips both hooks and draws the reload weapon later.
 void BeginWeaponDepthOfField(X86Context& ctx, uint8_t*) {
     g_weapon_pending = false;
-    uint32_t display = R32(layout::kDisplay);
-    uint32_t list = display + layout::kDisplayDrawLists + layout::kGunDrawList * layout::kDrawListSize;
-    if (!WeaponDofEligible() || !display || ctx.esi != list || !R32(list + 8)) return;
-    g_weapon_frame = R32(kFrameCount);
-    ++g_weapon_serial;
-    g_weapon_strength = float(std::min(game::Opt().dof_weapon_blur, 100u)) / 100.0f;
-    std::copy_n(&G<float>(kProjection), g_weapon_projection.size(), g_weapon_projection.begin());
-    g_weapon_pending = d3d::BeginWeaponDepthOfField(g_weapon_projection.data(), g_weapon_strength, g_weapon_serial);
+    if (!WeaponDofEligible()) return;
+    BeginWeaponDof(ctx, float(std::min(game::Opt().dof_weapon_blur, 100u)) / 100.0f, false);
 }
 
 void EndWeaponDepthOfField(X86Context&, uint8_t*) {
-    bool pending = g_weapon_pending;
+    EndWeaponDof(false);
+}
+
+// Preview uses the same isolated list-5 depth mask after world effects, fading its normal blur inversely
+// to the latched world strength. A native type-1 reload never receives either weapon blur marker.
+void BeginPreviewWeaponDepthOfField(X86Context& ctx, uint8_t*) {
+    const PreviewDraw draw = g_preview_weapon;
+    g_preview_weapon = {};
     g_weapon_pending = false;
-    if (!pending || g_weapon_frame != R32(kFrameCount) || !WeaponDofEligible()) return;
-    d3d::EndWeaponDepthOfField(g_weapon_projection.data(), g_weapon_strength, g_weapon_serial);
+    if (!PreviewDrawMatches(draw)) return;
+    BeginWeaponDof(ctx, draw.weapon_strength, true);
+}
+
+void EndPreviewWeaponDepthOfField(X86Context&, uint8_t*) {
+    EndWeaponDof(true);
 }
 
 X86_EXTERN_FUNC(__imp__sub_001772E0);

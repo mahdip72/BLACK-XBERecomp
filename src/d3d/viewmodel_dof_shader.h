@@ -8,7 +8,8 @@ inline constexpr char kViewmodelDofHlsl[] = R"(
 // zp = projection numerator, projection depth offset, amount [0,1], target height / 1080.
 // The projection numerator uses the renderer's view-depth scale; these depths do not claim physical metres.
 // vp = viewport origin and size. Pack initializes both complete targets, including the viewport exterior.
-cbuffer ViewmodelDof : register(b1) { float4 zp; float4 vp; };
+// focus = sharp depth, transition width, reserved, reserved. Both depths use the reconstructed view scale.
+cbuffer ViewmodelDof : register(b1) { float4 zp; float4 vp; float4 focus; };
 #ifdef MS
 Texture2DMS<float> after_depth : register(t0);
 Texture2DMS<float> before_depth : register(t1);
@@ -102,10 +103,15 @@ float4 viewmodel_dof(float4 pos : SV_Position) : SV_Target {
     float z = gun_depth.Load(int3(p, 0));
     if (zp.z <= 0 || z <= 0 || center.a <= 0 || any(pos.xy < vp.xy) || any(pos.xy >= vp.xy + vp.zw))
         return original;
-    // Six pixels maximum at 1080p; nearer hands soften more than the farther barrel. At amount .25,
-    // representative scaled depths .1 and 1 have radii 1.34 and .85 pixels respectively. The bounded
-    // falloff retains mild softening when a title uses unusual custom first-person projection depths.
-    float radius = 6 * saturate(zp.z) * max(zp.w, 0) * (0.35 + 0.65 / (1 + 2 * z));
+    // Inspect exponent bits so the NaN/Inf guard survives shader optimization without IEEE strictness.
+    if (any((asuint(focus.xy) & 0x7f800000u) == 0x7f800000u)) return original;
+    if (focus.x <= 0 || focus.y <= 0 || focus.y > focus.x || z >= focus.x)
+        return original;
+    // Full strength before the transition, smoothly fading to exact sharpness at the selected depth.
+    // A transition as wide as the sharp depth starts at zero; there is no residual blur floor at the tip.
+    float start = max(focus.x - focus.y, 0);
+    float falloff = 1 - smoothstep(start, focus.x, z);
+    float radius = 6 * saturate(zp.z) * max(zp.w, 0) * falloff;
     if (radius <= 0) return original;
     static const float2 disk[12] = {
         float2(.35, 0), float2(0, .35), float2(-.35, 0), float2(0, -.35),

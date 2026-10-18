@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/options.h"
+#include "d3d/depth_of_field.h"
 #include "game/layout.h"
 #include "xdk/hle.h"
 
@@ -18,6 +19,8 @@ void ReloadAnimationDof(X86Context& ctx, uint8_t* base);
 void ReloadDepthOfField(X86Context& ctx, uint8_t* base);
 void BeginWeaponDepthOfField(X86Context& ctx, uint8_t* base);
 void EndWeaponDepthOfField(X86Context& ctx, uint8_t* base);
+void BeginPreviewWeaponDepthOfField(X86Context& ctx, uint8_t* base);
+void EndPreviewWeaponDepthOfField(X86Context& ctx, uint8_t* base);
 bool DeferPreviewWeapon(X86Context& ctx, uint8_t* base);
 bool DrawPreviewWeapon(X86Context& ctx, uint8_t* base);
 float StepDofPreview(float phase, float seconds, bool enabled);
@@ -49,6 +52,10 @@ int weapon_end_calls = 0;
 bool weapon_begin_accepts = true;
 float weapon_begin_strength = -1;
 float weapon_end_strength = -1;
+float weapon_begin_sharp_depth = -1;
+float weapon_end_sharp_depth = -1;
+float weapon_begin_transition = -1;
+float weapon_end_transition = -1;
 uint32_t weapon_begin_serial = 0;
 uint32_t weapon_end_serial = 0;
 std::array<float, 16> weapon_begin_projection{};
@@ -90,6 +97,8 @@ void Reset(uint32_t initial_type = 0) {
     options.modern_reload_dof = true;
     options.dof_preview = false;
     options.dof_weapon_blur = 25;
+    options.dof_weapon_sharp_depth = 100;
+    options.dof_weapon_transition = 75;
     original_new_type = 1;
     animation_calls = original_effect_calls = queue_calls = 0;
     queue_accepts = true;
@@ -97,6 +106,8 @@ void Reset(uint32_t initial_type = 0) {
     weapon_begin_calls = weapon_end_calls = 0;
     weapon_begin_accepts = true;
     weapon_begin_strength = weapon_end_strength = -1;
+    weapon_begin_sharp_depth = weapon_end_sharp_depth = -1;
+    weapon_begin_transition = weapon_end_transition = -1;
     weapon_begin_serial = weapon_end_serial = 0;
     weapon_begin_projection.fill(0);
     weapon_end_projection.fill(0);
@@ -126,6 +137,20 @@ void SameGuest(const std::vector<uint8_t>& before, const char* message) {
     Check(before.size() == memory.size() &&
           std::equal(before.begin(), before.end(), memory.begin()), message);
 }
+
+void PreviewGunMarker(bool begin) {
+    auto ctx = GunContext();
+    const auto saved = ctx;
+    const auto before = GuestSnapshot();
+    if (begin) BeginPreviewWeaponDepthOfField(ctx, nullptr);
+    else EndPreviewWeaponDepthOfField(ctx, nullptr);
+    SameGuest(before, "preview weapon marker mutated guest memory");
+    Check(std::memcmp(&ctx, &saved, sizeof(ctx)) == 0,
+          "preview weapon marker changed guest registers or flags");
+}
+
+void BeginPreviewGun() { PreviewGunMarker(true); }
+void EndPreviewGun() { PreviewGunMarker(false); }
 
 void TickPreview(float seconds) {
     const auto before = GuestSnapshot();
@@ -475,13 +500,18 @@ void TestWeaponPair() {
           "normal weapon amount was not 25 percent");
     Check(weapon_begin_serial != 0, "weapon pair serial was not assigned");
     const auto saved = weapon_begin_projection;
+    Check(weapon_begin_sharp_depth == 1.0f && weapon_begin_transition == 0.75f,
+          "weapon depth interval was not converted from hundredths");
     G<float>(kProjection + 4) = 999;
-    options.dof_weapon_blur = 50; // still eligible; End must use Begin's snapshot
+    options.dof_weapon_blur = 0; // End must finish Begin's snapshot, even after a UI change.
+    options.dof_weapon_sharp_depth = 200;
+    options.dof_weapon_transition = 150;
+    options.dof_preview = true;
     EndGun();
     Check(weapon_end_calls == 1 && weapon_end_serial == weapon_begin_serial &&
           std::abs(weapon_end_strength - 0.25f) < 1e-6f &&
-          weapon_end_projection == saved,
-          "weapon End did not use Begin's serial, amount, and projection snapshot");
+          weapon_end_projection == saved && weapon_end_sharp_depth == 1.0f && weapon_end_transition == 0.75f,
+          "weapon End did not use Begin's serial, amount, interval, and projection snapshot");
     EndGun();
     Check(weapon_end_calls == 1, "weapon End consumed one pair more than once");
 
@@ -555,6 +585,159 @@ void TestWeaponEligibility() {
           "new invalid Begin did not cancel prior weapon pair");
     std::puts("PASS weapon eligibility, draw-list provenance and stale-pair cancellation");
 }
+
+// Exercise the production routes in native order, including the return to the early draw at phase zero.
+float PreviewWeaponFrame(float seconds, bool enabled, bool expected_deferred) {
+    options.dof_preview = enabled;
+    ++R32(kFrameCount);
+    TickPreview(seconds);
+    const bool deferred = DeferPreview();
+    Check(deferred == expected_deferred, "preview weapon used the wrong early/late draw route");
+    const int begins = weapon_begin_calls;
+    const int ends = weapon_end_calls;
+    const int worlds = queue_calls;
+    if (!deferred) { BeginGun(); EndGun(); }
+    PreviewRenderFrame();
+    if (deferred) {
+        Check(DrawPreview(), "preview lost its late gun route");
+        BeginPreviewGun(); EndPreviewGun();
+    } else {
+        Check(!DrawPreview(), "expired preview forced a late gun route");
+        BeginPreviewGun(); EndPreviewGun();
+    }
+    const float amount = weapon_begin_calls == begins ? 0 : weapon_begin_strength;
+    Check(weapon_end_calls - ends == weapon_begin_calls - begins,
+          "preview weapon markers were not paired");
+    const float world = queue_calls == worlds ? 0 : queued_strength;
+    Check(std::abs(amount - 0.25f * (1 - world)) < 1e-6f,
+          "weapon amount did not complement the same-frame eased world strength");
+    return amount;
+}
+
+void TestPreviewWeaponContinuity() {
+    Reset();
+    float previous = PreviewWeaponFrame(0, true, true);
+    Check(previous == 0.25f, "first preview frame snapped weapon blur off at phase zero");
+    for (int i = 0; i < 8; ++i) {
+        const float amount = PreviewWeaponFrame(0.1f, true, true);
+        Check(amount <= previous, "preview entry increased weapon blur");
+        previous = amount;
+    }
+    Check(previous == 0, "full preview did not make the weapon fully sharp");
+    for (int i = 0; i < 9; ++i) {
+        const float amount = PreviewWeaponFrame(0.1f, false, i < 8);
+        Check(amount >= previous, "preview exit decreased weapon blur");
+        previous = amount;
+    }
+    Check(previous == 0.25f, "preview exit did not return smoothly to normal weapon blur");
+
+    Reset();
+    PreviewWeaponFrame(0.1f, true, true);
+    previous = PreviewWeaponFrame(0.1f, true, true);
+    const float off = PreviewWeaponFrame(0.1f, false, true);
+    Check(off > previous && off < 0.25f, "mid-ramp reversal snapped or failed to restore weapon blur");
+    Check(PreviewWeaponFrame(0, true, true) == off,
+          "zero-time reversal changed the current weapon amount");
+    const float on = PreviewWeaponFrame(0.1f, true, true);
+    Check(on < off && on > 0, "mid-fade reversal snapped or failed to reduce weapon blur");
+    std::puts("PASS preview weapon entry/exit endpoints, inverse easing and continuous reversal");
+}
+
+void PrepareLateWeapon() {
+    AdvancePreview(4, true);
+    Check(DeferPreview(), "partial preview did not defer the weapon");
+    PreviewRenderFrame();
+    Check(DrawPreview(), "partial preview did not transfer its late weapon token");
+}
+
+void TestPreviewWeaponSnapshot() {
+    Reset();
+    AdvancePreview(4, true);
+    Check(DeferPreview(), "preview did not latch its weapon amount");
+    options.dof_preview = false;
+    options.dof_weapon_blur = 100;
+    queue_accepts = false;
+    PreviewRenderFrame();
+    Check(queue_calls == 1 && queued_strength == 0.5f && DrawPreview(),
+          "world queue rejection or UI toggle cancelled the native late gun");
+    options.dof_weapon_sharp_depth = 125;
+    options.dof_weapon_transition = 50;
+    BeginPreviewGun();
+    Check(weapon_begin_calls == 1 && weapon_begin_strength == 0.125f &&
+          weapon_begin_sharp_depth == 1.25f && weapon_begin_transition == 0.5f,
+          "late weapon changed its routed amount or did not sample Begin's depth interval");
+    const auto projection = weapon_begin_projection;
+    options.dof_weapon_blur = 0;
+    options.dof_weapon_sharp_depth = 300;
+    options.dof_weapon_transition = 200;
+    options.dof_preview = true;
+    G<float>(kProjection + 12) = 999;
+    EndPreviewGun();
+    Check(weapon_end_calls == 1 && weapon_end_serial == weapon_begin_serial &&
+          weapon_end_strength == 0.125f && weapon_end_sharp_depth == 1.25f &&
+          weapon_end_transition == 0.5f && weapon_end_projection == projection,
+          "late weapon End did not preserve the complete Begin payload");
+    EndPreviewGun();
+    BeginPreviewGun(); EndPreviewGun();
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 1,
+          "late weapon token or End was consumed more than once");
+
+    Reset(); PrepareLateWeapon();
+    weapon_begin_accepts = false;
+    BeginPreviewGun(); EndPreviewGun();
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 0,
+          "rejected late weapon snapshot still issued an End");
+    Check(!DrawPreview(), "rejected snapshot repeated the native late gun draw");
+    std::puts("PASS preview weapon latched amount/range/projection, queue failure and one-shot markers");
+}
+
+void TestPreviewWeaponGuards() {
+    auto no_pair = [](const char* message) {
+        BeginPreviewGun(); EndPreviewGun();
+        Check(weapon_begin_calls == 0 && weapon_end_calls == 0, message);
+    };
+    Reset(); no_pair("late weapon marker blurred without a routed preview token");
+    Reset(); AdvancePreview(8, true);
+    Check(DeferPreview() && DrawPreview(), "full preview did not retain its native draw");
+    no_pair("full preview still queued weapon blur");
+    Reset(); options.dof_weapon_blur = 0; PrepareLateWeapon();
+    no_pair("zero configured amount queued late weapon blur");
+    Reset(); PrepareLateWeapon(); R32(kFrameCount)++;
+    no_pair("stale late token began weapon blur");
+    Reset(); PrepareLateWeapon(); R32(kEffects) = kManager + 0x1000;
+    no_pair("changed manager retained late weapon token");
+    Reset(); PrepareLateWeapon(); R32(layout::kDisplay) += 0x1000;
+    no_pair("changed display retained late weapon token");
+    Reset(); PrepareLateWeapon(); R32(layout::kWorld) = 0;
+    no_pair("missing world retained late weapon token");
+    Reset(); PrepareLateWeapon(); options.modern_reload_dof = false;
+    no_pair("Original mode blurred a late preview weapon");
+    Reset(); PrepareLateWeapon(); options.reload_blur = false;
+    no_pair("Off mode blurred a late preview weapon");
+    Reset(); PrepareLateWeapon(); R32(kGunList + 8) = 0;
+    no_pair("empty late gun list began weapon blur");
+    Reset(); PrepareLateWeapon();
+    auto wrong_list = Context();
+    BeginPreviewWeaponDepthOfField(wrong_list, nullptr);
+    no_pair("wrong-list Begin failed to consume the late weapon token");
+
+    Reset(); PrepareLateWeapon(); StartReload();
+    no_pair("actual reload weapon was blurred by a pending preview token");
+    Reset(); PrepareLateWeapon(); BeginPreviewGun(); StartReload(); EndPreviewGun();
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 0,
+          "reload beginning between markers did not keep the weapon sharp");
+    for (int changed = 0; changed < 4; ++changed) {
+        Reset(); PrepareLateWeapon(); BeginPreviewGun();
+        if (changed == 0) ++R32(kFrameCount);
+        if (changed == 1) R32(kEffects) = kManager + 0x1000;
+        if (changed == 2) R32(layout::kDisplay) += 0x1000;
+        if (changed == 3) R32(layout::kWorld) = 0;
+        EndPreviewGun();
+        Check(weapon_begin_calls == 1 && weapon_end_calls == 0,
+              "late End accepted changed frame/manager/display/world provenance");
+    }
+    std::puts("PASS preview weapon full-sharp/reload priority, mode and stale-token guards");
+}
 } // namespace
 
 namespace kernel {
@@ -575,17 +758,23 @@ bool DepthOfField(const float* projection, float strength) {
     queued_strength = strength;
     return queue_accepts;
 }
-bool BeginWeaponDepthOfField(const float* projection, float strength, uint32_t serial) {
+bool BeginWeaponDepthOfField(const float* projection, float strength, uint32_t serial,
+                             float sharp_depth, float transition) {
     ++weapon_begin_calls;
     weapon_begin_strength = strength;
     weapon_begin_serial = serial;
+    weapon_begin_sharp_depth = sharp_depth;
+    weapon_begin_transition = transition;
     std::copy_n(projection, weapon_begin_projection.size(), weapon_begin_projection.begin());
     return weapon_begin_accepts;
 }
-bool EndWeaponDepthOfField(const float* projection, float strength, uint32_t serial) {
+bool EndWeaponDepthOfField(const float* projection, float strength, uint32_t serial,
+                           float sharp_depth, float transition) {
     ++weapon_end_calls;
     weapon_end_strength = strength;
     weapon_end_serial = serial;
+    weapon_end_sharp_depth = sharp_depth;
+    weapon_end_transition = transition;
     std::copy_n(projection, weapon_end_projection.size(), weapon_end_projection.begin());
     return true;
 }
@@ -611,6 +800,9 @@ int main() {
         TestPreviewFadeAndCancellation();
         TestWeaponPair();
         TestWeaponEligibility();
+        TestPreviewWeaponContinuity();
+        TestPreviewWeaponSnapshot();
+        TestPreviewWeaponGuards();
         std::puts("PASS production reload DOF hook checks");
         return 0;
     } catch (const std::exception& error) {

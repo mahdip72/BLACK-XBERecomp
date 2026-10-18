@@ -590,6 +590,15 @@ call = "BeginWeaponDepthOfField"
 at = 0x1EE981
 call = "EndWeaponDepthOfField"
 
+# Preview fades weapon blur around the late list-5 draw; actual type-1 reloads remain sharp.
+[[hook]]
+at = 0x1EEB2B
+call = "BeginPreviewWeaponDepthOfField"
+
+[[hook]]
+at = 0x1EEB30
+call = "EndPreviewWeaponDepthOfField"
+
 # src/game/language.cpp
 [[hook]]
 at = 0x1F8120

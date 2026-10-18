@@ -131,7 +131,7 @@ public:
                 O o; o.a = pre.Load(int3(p.xy,0)); o.b = post.Load(int3(p.xy,0));
                 o.c = col.Load(int3(p.xy,0)); return o;
             })", "main");
-        D3D11_BUFFER_DESC cb{}; cb.ByteWidth = 32; cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_BUFFER_DESC cb{}; cb.ByteWidth = 48; cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         Hr(device->CreateBuffer(&cb, nullptr, &constants), "Create constants");
         ID3D11Buffer* buffer = constants.Get(); context->PSSetConstantBuffers(1, 1, &buffer);
         D3D11_BLEND_DESC b{}; b.RenderTarget[0].RenderTargetWriteMask = 7;
@@ -153,7 +153,8 @@ public:
 
     // x=8 is a single covered sample; x=9..23 fully covered. The remaining samples are bright blue world.
     Result Run(unsigned samples, float amount, float z = .1f, bool invalid = false, bool cropped = false,
-               bool constant_color = false, bool unchanged = false) {
+               bool constant_color = false, bool unchanged = false, float focus = 1.0f,
+               float width = .75f, bool depth_ramp = false) {
         CompilePack(samples);
         Texture pre = Make(R, samples), post = Make(R, samples), color = Make(RGBA, samples);
         for (unsigned sample = 0; sample < samples; ++sample) {
@@ -163,7 +164,8 @@ public:
                 size_t i = At(x,y);
                 pixels[i] = {0, .25f, 1, .2f + .05f * sample};
                 if (x >= 8 && x < 24 && y >= 4 && y < 28 && (x > 8 || sample == 0)) {
-                    after[i] = unchanged ? before[i] : Raw(z);
+                    float gun_z = depth_ramp ? (y < 12 ? .1f : y < 20 ? .8f : 1.0f) : z;
+                    after[i] = unchanged ? before[i] : Raw(gun_z);
                     pixels[i] = {constant_color ? .5f : float((x + y) % 2), .125f, 0, pixels[i].a};
                 }
             }
@@ -185,7 +187,9 @@ public:
         else context->CopyResource(scene.tex.Get(), color.tex.Get());
         context->CopyResource(output.tex.Get(), scene.tex.Get());
         Texture packed = Make(DXGI_FORMAT_R16G16B16A16_FLOAT), depth = Make(DXGI_FORMAT_R16_FLOAT);
-        const float cb[8] = {-.01f, 1.001f, amount, 1, cropped ? 10.f : 0.f, 0, cropped ? 12.f : float(W), float(H)};
+        const float cb[12] = {-.01f, 1.001f, amount, 1,
+                              cropped ? 10.f : 0.f, 0, cropped ? 12.f : float(W), float(H),
+                              focus, width, 0, 0};
         context->UpdateSubresource(constants.Get(), 0, nullptr, cb, 0, 0);
         Draw(packs.at(samples).Get(), {packed.rtv.Get(), depth.rtv.Get()},
              {post.srv.Get(), pre.srv.Get(), color.srv.Get()});
@@ -203,11 +207,30 @@ void Invariants(const Result& r) {
         if (r.packed[i].a > 0) Check(std::abs(a.b - b.b) < .00001f, "world blue contaminated gun blur");
     }
 }
-float Detail(const Result& r) {
+float DetailBand(const Result& r, unsigned y0, unsigned y1) {
     float contrast = 0;
-    for (unsigned y = 10; y < 22; ++y) for (unsigned x = 12; x < 20; ++x)
+    for (unsigned y = y0; y < y1; ++y) for (unsigned x = 12; x < 20; ++x)
         contrast += std::abs(r.output[At(x,y)].r - .5f);
     return contrast;
+}
+float Detail(const Result& r) { return DetailBand(r, 10, 22); }
+float ChangeBand(const Result& r, unsigned y0, unsigned y1) {
+    float change = 0;
+    for (unsigned y = y0; y < y1; ++y) for (unsigned x = 12; x < 20; ++x)
+        change += std::abs(r.output[At(x,y)].r - r.original[At(x,y)].r);
+    return change;
+}
+void ExactIdentity(const Result& r, const char* why) {
+    for (size_t i = 0; i < r.output.size(); ++i) {
+        const Pixel& got = r.output[i];
+        const Pixel& want = r.original[i];
+        if (std::memcmp(&got, &want, sizeof(Pixel)) == 0) continue;
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "%s at (%u,%u): got %.6g/%.6g/%.6g/%.6g, expected %.6g/%.6g/%.6g/%.6g",
+                      why, unsigned(i % W), unsigned(i / W), got.r, got.g, got.b, got.a,
+                      want.r, want.g, want.b, want.a);
+        throw std::runtime_error(detail);
+    }
 }
 } // namespace
 
@@ -218,8 +241,7 @@ int main() {
             warp.CompilePack(n); // Compile all production variants even if this WARP adapter cannot execute one.
             if (!warp.Supports(n)) { std::printf("SKIP runtime %ux unsupported by WARP\n", n); continue; }
             auto zero = warp.Run(n, 0);
-            Check(std::memcmp(zero.output.data(), zero.original.data(), W * H * sizeof(Pixel)) == 0,
-                  "zero amount is not exact identity");
+            ExactIdentity(zero, "zero amount is not exact identity");
             auto normal = warp.Run(n, .25f); Invariants(normal);
             Check(normal.packed[At(8,16)].a == 1.f / n, "incorrect single-sample gun coverage");
             Check(normal.packed[At(9,16)].a == 1, "full gun coverage missing");
@@ -228,9 +250,45 @@ int main() {
             Check(normal.output[At(8,16)].r >= 0 && normal.output[At(8,16)].r <= 1.f / n,
                   "partial coverage was not respected by delta composition");
             Check(Detail(normal) < Detail(zero) * .85f, "default amount did not soften gun texture");
+            auto faint = warp.Run(n, .01f); Invariants(faint);
+            Check(ChangeBand(faint, 10, 22) > 0 &&
+                  ChangeBand(faint, 10, 22) < ChangeBand(normal, 10, 22) * .15f,
+                  "amount did not fade continuously from exact zero to normal blur");
             auto farther = warp.Run(n, .25f, 1.5f); Invariants(farther);
+            ExactIdentity(farther, "gun beyond focus did not remain exactly sharp");
             Check(Detail(normal) < Detail(farther), "near hand is not softer than farther gun");
+            auto at_focus = warp.Run(n, 1, 1.0f); Invariants(at_focus);
+            ExactIdentity(at_focus, "gun at focus did not remain exactly sharp");
             auto maximum = warp.Run(n, 1); Invariants(maximum);
+            auto ramp = warp.Run(n, .25f, .1f, false, false, false, false, 1.0f, .75f, true);
+            Invariants(ramp);
+            float near_detail = DetailBand(ramp, 6, 10);
+            float middle_detail = DetailBand(ramp, 14, 18);
+            float focus_detail = DetailBand(ramp, 22, 26);
+            Check(near_detail < middle_detail && middle_detail < focus_detail,
+                  "identically textured depth bands did not soften progressively toward focus");
+            for (unsigned y = 22; y < 26; ++y) for (unsigned x = 12; x < 20; ++x) {
+                const auto& a = ramp.output[At(x, y)];
+                const auto& b = ramp.original[At(x, y)];
+                Check(std::memcmp(&a, &b, sizeof(Pixel)) == 0, "focus band was not exactly sharp");
+            }
+            auto ramp_close_focus = warp.Run(n, .25f, .1f, false, false, false, false, .7f, .7f, true);
+            Invariants(ramp_close_focus);
+            Check(DetailBand(ramp_close_focus, 14, 18) > DetailBand(ramp, 14, 18),
+                  "moving focus toward the same textured depth band did not sharpen it");
+            auto ramp_narrow = warp.Run(n, .25f, .1f, false, false, false, false, 1.0f, .25f, true);
+            Invariants(ramp_narrow);
+            Check(DetailBand(ramp_narrow, 14, 18) < DetailBand(ramp, 14, 18),
+                  "narrowing the focus transition did not soften the same depth band");
+            ExactIdentity(warp.Run(n, 1, .1f, false, false, false, false, 0, .75f),
+                          "nonpositive focus did not fail closed");
+            ExactIdentity(warp.Run(n, 1, .1f, false, false, false, false, 1, 0),
+                          "zero focus width did not fail closed");
+            ExactIdentity(warp.Run(n, 1, .1f, false, false, false, false, 1, 1.25f),
+                          "focus width beyond focus did not fail closed");
+            ExactIdentity(warp.Run(n, 1, .1f, false, false, false, false,
+                                   std::numeric_limits<float>::quiet_NaN(), .75f),
+                          "nonfinite focus did not fail closed");
             auto flat = warp.Run(n, 1, .1f, false, false, true); Invariants(flat);
             for (size_t i = 0; i < flat.output.size(); ++i)
                 Check(std::abs(flat.output[i].r - flat.original[i].r) < .00001f, "constant gun edge developed halo");
@@ -240,7 +298,7 @@ int main() {
             Check(crop.packed[At(9,16)].a == 0 && crop.packed[At(22,16)].a == 0, "viewport exterior packed");
             auto unchanged = warp.Run(n, 1, .1f, false, false, false, true); Invariants(unchanged);
             for (const auto& p : unchanged.packed) Check(p.a == 0, "unchanged world classified as gun");
-            std::printf("PASS viewmodel DOF %ux: identity, alpha, coverage, guarded blur, depth falloff, invalids, viewport\n", n);
+            std::printf("PASS viewmodel DOF %ux: alpha, coverage, guarded blur, focus ramp and identity, amount fade, invalids, viewport\n", n);
         }
         return 0;
     } catch (const std::exception& error) {

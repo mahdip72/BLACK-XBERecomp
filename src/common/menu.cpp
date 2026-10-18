@@ -253,7 +253,8 @@ enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFps
              kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
              kAmbientOcclusion, kAudioOutput, kHdrOutput, kMonitor, kLanguage, kSmaa,
              kPauseOnFocusLoss, kFmvScale, kDofFocusDistance, kDofNearStrength, kDofFarStrength,
-             kDofBokehRadius, kDofWeaponBlur, kResetDofTuning, kDofPreview, kDofQuality };
+             kDofBokehRadius, kDofWeaponBlur, kResetDofTuning, kDofPreview, kDofQuality,
+             kDofWeaponSharpDepth, kDofWeaponTransition };
 
 using rows::Kind;
 using rows::Row;
@@ -286,6 +287,8 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kDofFarStrength, "DISTANT BLUR"},
     {Kind::Value, kDofBokehRadius, "BOKEH SIZE"},
     {Kind::Value, kDofWeaponBlur, "GAMEPLAY WEAPON BLUR"},
+    {Kind::Value, kDofWeaponSharpDepth, "WEAPON SHARP DEPTH"},
+    {Kind::Value, kDofWeaponTransition, "WEAPON FOCUS TRANSITION"},
     {Kind::Value, kResetDofTuning, "RESET DOF TUNING"},
     {Kind::Heading, -1, "GENERAL"},
     {Kind::Value, kSkipIntros, "SKIP INTROS"},
@@ -507,6 +510,20 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
             if (step) o.dof_weapon_blur = uint32_t(StepDofRange(o.dof_weapon_blur, 0, 100, 5, step));
             std::snprintf(text, sizeof(text), "%u%%", o.dof_weapon_blur);
             return true;
+        case kDofWeaponSharpDepth:
+            if (step) {
+                o.dof_weapon_sharp_depth = uint32_t(StepDofRange(o.dof_weapon_sharp_depth, 1, 10000, 5, step));
+                o.dof_weapon_transition = std::min(o.dof_weapon_transition, o.dof_weapon_sharp_depth);
+            }
+            std::snprintf(text, sizeof(text), "%.2f UNITS", double(o.dof_weapon_sharp_depth) / 100.0);
+            return true;
+        case kDofWeaponTransition:
+            if (step) {
+                uint32_t sharp = std::clamp(o.dof_weapon_sharp_depth, 1u, 10000u);
+                o.dof_weapon_transition = uint32_t(StepDofRange(o.dof_weapon_transition, 1, int(sharp), 5, step));
+            }
+            std::snprintf(text, sizeof(text), "%.2f UNITS", double(o.dof_weapon_transition) / 100.0);
+            return true;
         case kResetDofTuning:
             if (step) {
                 const game::Options defaults;
@@ -515,6 +532,8 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
                 o.dof_far_strength = defaults.dof_far_strength;
                 o.dof_bokeh_radius = defaults.dof_bokeh_radius;
                 o.dof_weapon_blur = defaults.dof_weapon_blur;
+                o.dof_weapon_sharp_depth = defaults.dof_weapon_sharp_depth;
+                o.dof_weapon_transition = defaults.dof_weapon_transition;
                 o.dof_cinematic_quality = defaults.dof_cinematic_quality;
             }
             std::snprintf(text, sizeof(text), "DEFAULTS");
@@ -866,12 +885,30 @@ void DofSlider(const char* label, uint32_t& setting, int lo, int hi, const char*
     ImGui::PopID();
 }
 
+void DofViewUnitsSlider(const char* label, uint32_t& setting, uint32_t max_hundredths,
+                        uint32_t* dependent = nullptr) {
+    max_hundredths = std::clamp(max_hundredths, 1u, 10000u);
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(Ui(label, false).c_str());
+    ImGui::SetNextItemWidth(-1);
+    float value = float(std::clamp(setting, 1u, max_hundredths)) / 100.0f;
+    bool changed = ImGui::SliderFloat("##value", &value, 0.01f, float(max_hundredths) / 100.0f,
+                                      "%.2f units", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+    if (changed) {
+        setting = std::clamp(uint32_t(std::lround(value * 100.0f)), 1u, max_hundredths);
+        if (dependent) *dependent = std::min(*dependent, setting);
+        g_dof_dirty = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) SaveDofChanges();
+    ImGui::PopID();
+}
+
 // Keep the scene visible while reload DOF is adjusted live.
 void DrawDofPanel() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     float em = ImGui::GetFontSize();
     float width = std::max(1.0f, std::min(em * 29, vp->WorkSize.x - em * 2));
-    float height = std::max(1.0f, std::min(em * 30, vp->WorkSize.y - em * 2));
+    float height = std::max(1.0f, std::min(em * 36, vp->WorkSize.y - em * 2));
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - em, vp->WorkPos.y + em),
                             ImGuiCond_Always, ImVec2(1, 0));
     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
@@ -935,6 +972,19 @@ void DrawDofPanel() {
         DofSlider("Distant blur", o.dof_far_strength, 0, 150, "%d%%");
         DofSlider("Bokeh size", o.dof_bokeh_radius, 4, 30, "%d px");
         DofSlider("Gameplay weapon blur", o.dof_weapon_blur, 0, 100, "%d%%");
+        ImGui::TextUnformatted(Ui("GAMEPLAY WEAPON FOCUS").c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(Ui("Depth uses camera-view units; metres are not verified.", false).c_str());
+            ImGui::TextUnformatted(Ui("During gameplay, near hands blur and muzzle parts beyond Sharp Depth stay sharp.", false).c_str());
+            ImGui::TextUnformatted(Ui("Transition gradually sharpens the weapon up to Sharp Depth.", false).c_str());
+            ImGui::TextUnformatted(Ui("At full preview strength the gun stays sharp; partial fades may blur it.", false).c_str());
+            ImGui::EndTooltip();
+        }
+        DofViewUnitsSlider("Weapon sharp depth", o.dof_weapon_sharp_depth, 10000, &o.dof_weapon_transition);
+        DofViewUnitsSlider("Weapon focus transition", o.dof_weapon_transition, o.dof_weapon_sharp_depth);
         ImGui::Separator();
         if (ImGui::Button(Ui("Reset DOF tuning", false).c_str())) {
             RowText(kResetDofTuning, 1);

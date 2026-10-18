@@ -327,21 +327,27 @@ bool DepthOfField(const float* m, float strength) {
     return true;
 }
 
-static bool QueueWeaponDepthOfField(const float* m, float strength, uint32_t serial, uint32_t marker) {
+static bool QueueWeaponDepthOfField(const float* m, float strength, uint32_t serial,
+                                    float sharp_depth, float transition, uint32_t marker) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (!DepthOfFieldTarget(m) || !std::isfinite(strength) || strength <= 0) return false;
+    if (!DepthOfFieldTarget(m) || !std::isfinite(strength) || strength <= 0 ||
+        !std::isfinite(sharp_depth) || !std::isfinite(transition) ||
+        sharp_depth <= 0 || transition <= 0 || transition > sharp_depth) return false;
     const float p[4 * gpu::kWeaponDofRects] = {
-        m[14], m[10], std::clamp(strength, 0.0f, 1.0f), std::bit_cast<float>(serial)};
+        m[14], m[10], std::clamp(strength, 0.0f, 1.0f), std::bit_cast<float>(serial),
+        sharp_depth, transition, 0, 0};
     g_backend->Clear(g_state, gpu::kWeaponDofRects, reinterpret_cast<const uint8_t*>(p), marker, 0, 0, 0);
     return true;
 }
 
-bool BeginWeaponDepthOfField(const float* projection, float strength, uint32_t serial) {
-    return QueueWeaponDepthOfField(projection, strength, serial, gpu::kClearWeaponDofBegin);
+bool BeginWeaponDepthOfField(const float* projection, float strength, uint32_t serial,
+                             float sharp_depth, float transition) {
+    return QueueWeaponDepthOfField(projection, strength, serial, sharp_depth, transition, gpu::kClearWeaponDofBegin);
 }
 
-bool EndWeaponDepthOfField(const float* projection, float strength, uint32_t serial) {
-    return QueueWeaponDepthOfField(projection, strength, serial, gpu::kClearWeaponDofEnd);
+bool EndWeaponDepthOfField(const float* projection, float strength, uint32_t serial,
+                           float sharp_depth, float transition) {
+    return QueueWeaponDepthOfField(projection, strength, serial, sharp_depth, transition, gpu::kClearWeaponDofEnd);
 }
 
 }  // namespace d3d

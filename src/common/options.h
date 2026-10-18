@@ -26,6 +26,8 @@ struct Options {
     uint32_t dof_far_strength = 25;  // percent, 0..150
     uint32_t dof_bokeh_radius = 12;  // pixels at nominal 1080p, 4..30
     uint32_t dof_weapon_blur = 25;  // normal gameplay weapon blur, percent, 0..100
+    uint32_t dof_weapon_sharp_depth = 100;  // hundredths of camera view-depth units, 1..10000; not metres
+    uint32_t dof_weapon_transition = 75;  // full-blur to sharp interval in hundredths, 1..sharp depth
     uint32_t ambient_occlusion = 0;  // screen space, from the scene's depth: 0 off, 1 SSAO, 2 GTAO
     uint32_t msaa = 0;  // samples a pixel of the scene, 0 off
     uint32_t draw_distance = 1;  // times the game's LOD and draw distances

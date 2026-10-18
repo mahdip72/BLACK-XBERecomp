@@ -959,7 +959,7 @@ private:
                            DXGI_FORMAT color_format, uint32_t first_mip = 0, uint32_t mip_count = 0);
     void DepthOfFieldMipState(uint32_t mip, D3D12_RESOURCE_STATES state);
     void DepthOfFieldSkipped(uint32_t reason, const char* message);
-    void WeaponDepthOfField(const State& s, const float p[4], bool begin);
+    void WeaponDepthOfField(const State& s, const float p[4 * kWeaponDofRects], bool begin);
     bool EnsureWeaponDofTargets(uint32_t w, uint32_t h);
     D3D12_CPU_DESCRIPTOR_HANDLE WeaponDofView(uint32_t target) {
         return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
@@ -1193,7 +1193,7 @@ private:
         ID3D12Resource* rt = nullptr;
         ID3D12Resource* ds = nullptr;
         Viewport viewport{};
-        float parameters[3] = {};
+        float parameters[4 * kWeaponDofRects] = {};
         uint32_t serial = 0;
         uint64_t frame = 0;
         bool pending = false;
@@ -2278,7 +2278,7 @@ void D3D12Backend::WeaponDofSkipped(uint32_t reason, const char* message) {
     LOGR("Weapon DOF skipped: %s", message);
 }
 
-void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4], bool begin) {
+void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4 * kWeaponDofRects], bool begin) {
     auto& weapon = weapon_dof_;
     bool pending = weapon.pending;
     weapon.pending = false;  // An End consumes a snapshot exactly once, including mismatches and failures.
@@ -2287,6 +2287,11 @@ void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4], bool beg
     uint32_t serial = std::bit_cast<uint32_t>(p[3]);
     if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) || p[0] >= 0) {
         WeaponDofSkipped(0, "invalid projection or amount");
+        return;
+    }
+    if (!std::isfinite(p[4]) || !std::isfinite(p[5]) || !std::isfinite(p[6]) || !std::isfinite(p[7]) ||
+        p[4] <= 0 || p[5] <= 0 || p[5] > p[4]) {
+        WeaponDofSkipped(4, "invalid weapon focus interval");
         return;
     }
     if (p[2] <= 0) return;
@@ -2350,9 +2355,9 @@ void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4], bool beg
         return;
     }
     float zr = v.max_z - v.min_z;
-    const float c[8] = {p[0] * zr, v.min_z + p[1] * zr, std::clamp(p[2], 0.0f, 1.0f),
+    const float c[12] = {p[0] * zr, v.min_z + p[1] * zr, std::clamp(p[2], 0.0f, 1.0f),
         float(rect.bottom - rect.top) / 1080.0f, float(rect.left), float(rect.top),
-        float(rect.right - rect.left), float(rect.bottom - rect.top)};
+        float(rect.right - rect.left), float(rect.bottom - rect.top), p[4], p[5], 0, 0};
     for (float value : c) if (!std::isfinite(value)) return;
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, c, sizeof(c));
@@ -2379,7 +2384,8 @@ void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4], bool beg
     rt->drawn = true;
     if (!weapon.reported) {
         weapon.reported = true;
-        LOGR("Weapon DOF active: %ux%u, %ux MSAA, amount %.3f, paired depth snapshot", rt->w, rt->h, samples, c[2]);
+        LOGR("Weapon DOF active: %ux%u, %ux MSAA, amount %.3f, sharp depth %.2f, transition %.2f, paired depth snapshot",
+             rt->w, rt->h, samples, c[2], c[8], c[9]);
     }
 }
 
@@ -3677,7 +3683,7 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
                          uint32_t stencil) {
     if (flags & (kClearWeaponDofBegin | kClearWeaponDofEnd)) {
         if (count != kWeaponDofRects || !rects) { weapon_dof_.pending = false; return; }
-        float p[4];
+        float p[4 * kWeaponDofRects];
         std::memcpy(p, rects, sizeof(p));
         WeaponDepthOfField(s, p, (flags & kClearWeaponDofBegin) != 0);
         return;
