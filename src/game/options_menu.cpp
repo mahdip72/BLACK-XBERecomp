@@ -1,7 +1,8 @@
-// Recomp settings in the game's own options menus: RECOMP SETTINGS and MOUSE AND KEYBOARD buttons under the stock ones
-// load the page again with the F10 panel's rows in their place. A row is two copies of a stock button clip, its name
-// and its value; the name's copy stands in for the script's button object, so the script moves the focus and the
-// cursor works. The pause menu's options have room for one button, its rows start with the panel's PAGE row.
+// Recomp settings in the game's own options menus: RECOMP SETTINGS, MOUSE AND KEYBOARD and CONTROLLER buttons under
+// the stock ones load the page again with the F10 panel's rows in their place. A row is two copies of a stock button
+// clip, its name and its value; the name's copy stands in for the script's button object, so the script moves the
+// focus and the cursor works. On the pause menu's options our buttons take the prompts' rows: the select prompt goes,
+// copies of the confirm and back prompts sit side by side below.
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -40,7 +41,7 @@ constexpr int kEntries = int(std::size(kCaptions));
 constexpr int kSlots = 8;
 constexpr int kDepth = 100;
 constexpr int kEscape = 0x1B;
-const Row kPageRow{app::rows::Kind::Value, -1, "PAGE"};
+constexpr int kPrompts = 2;
 
 // the selection bar, Main.ButtonSelector: its parts by depth; once shown it stops on frame 10, its data's frame 9
 constexpr int kBarRest = 9;
@@ -74,27 +75,32 @@ struct Host {
     float drop;
     const char* first;         // the first and last button objects of its ring
     const char* last;
-    int entries;               // our buttons; one opens every page
     // the rows, from the stock button
     float pitch;
     float name_x;
     float value_x;
     float scale;
-    const char* hint;          // the string of a prompt our button takes the place of
+    const char* hint;          // the string of a prompt our buttons take the place of
     const char* stock[14];     // what the rows take the place of
     Bar bar;
+    // prompts our buttons push down, copied in a row below them: x of each and y, from the stock clip
+    const char* prompts[kPrompts];
+    float prompt_x[kPrompts];
+    float prompt_y;
 };
 constexpr Host kHosts[] = {
     {"OptionsMenuXbox", "TextAnim", "_level4.Main.TextAnim.ControllerSetup_Text", "Playerprofile_Text", 25.0f,
-     "controllerButton", "Playerprofile", 3, 25.0f, -37.0f, 185.0f, 0.9f, nullptr,
+     "controllerButton", "Playerprofile", 25.0f, -37.0f, 185.0f, 0.9f, nullptr,
      {"ControllerSetup_Text", "SoundSetup_Text", "PictureSetup_Text", "Playerprofile_Text"},
-     {1.0f, 245.0f, 445.0f, -5.0f}},
+     {1.0f, 245.0f, 445.0f, -5.0f}, {}, {}, 0.0f},
     {"PauseMenuOptionXbox", nullptr, "_level4.Main.ToggleCrouch", "ToggleCrouch", 222.0f,
-     "toggleCrouchButton", "musicVolumeButton", 1, 27.0f, 0.0f, 245.0f, 1.0f, "$FE_SELECT",
+     "toggleCrouchButton", "musicVolumeButton", 27.0f, 0.0f, 245.0f, 1.0f, "$FE_SELECT",
      {"ToggleCrouch", "ToggleCrouchOn_Text", "ToggleCrouchOff_Text", "InvertLook", "InvertLookOn_Text",
       "InvertLookOff_Text", "Vibration", "VibrationOn_Text", "VibrationOff_Text", "SFXVolume", "Sound_Volume",
       "MusicVolume", "Music_Volume"},
-     {1.4f, 343.55f, 443.55f, 168.35f}},
+     {1.4f, 343.55f, 443.55f, 168.35f},
+     // stage y 458 under the third button's bar (to 441), the screen ends at 480
+     {"_level4.Main.ConfirmPrompt", "_level4.Main.BackPrompt"}, {-16.0f, 164.0f}, 306.0f},
 };
 
 // a text the page shows from here: its string id, the text, the data of the field showing it
@@ -114,6 +120,7 @@ struct Page {
     uint32_t first = 0;  // our first clip
     uint32_t lead = 0;   // the stock clip ours keep their places from
     uint32_t entry[kEntries] = {};
+    uint32_t prompt[kPrompts] = {};
     uint32_t name[kSlots] = {};
     uint32_t value[kSlots] = {};
     size_t slots = 0;
@@ -158,11 +165,11 @@ void Write(Field& f, const std::string& text) {
     W32(f.data + flash::kFieldFlags, (R32(f.data + flash::kFieldFlags) & ~1u) | 0x204);
 }
 
-// a copy of the stock button beside it, stopped
-uint32_t Copy(X86Context& ctx, uint32_t holder, const char* name, int depth) {
+// a copy of a stock clip beside it, stopped
+uint32_t Copy(X86Context& ctx, uint32_t holder, const char* from, const char* name, int depth) {
     char number[12];
     std::snprintf(number, sizeof(number), "%d", depth);
-    ctx.eax = Text(g_page.host->button);
+    ctx.eax = Text(from);
     CallGuest(ctx, flash::kCall, {Text("duplicateMovieClip"), 0, 2, Text(name), Text(number)});
     uint32_t clip = Member(ctx, holder, name);
     if (flash::Type(clip) != flash::kSprite) return 0;
@@ -185,6 +192,7 @@ void Follow(const Page& p) {
         std::memcpy(HostPtr(clip + flash::kClipColours), HostPtr(p.lead + flash::kClipColours), flash::kColoursSize);
     };
     for (int i = 0; i < kEntries; i++) follow(p.entry[i], 0.0f, h.drop + h.pitch * float(i));
+    for (int i = 0; i < kPrompts; i++) follow(p.prompt[i], h.prompt_x[i], h.prompt_y);
     for (int i = 0; i < kSlots; i++) {
         follow(p.name[i], h.name_x, h.pitch * float(i));
         follow(p.value[i], h.value_x, h.pitch * float(i));
@@ -196,6 +204,20 @@ void Sound(X86Context& ctx) {
     CallGuest(ctx, flash::kCall, {Text("PlayChangeSound"), 0, 0});
 }
 
+// the prompts our buttons push down: each hidden, a copy in its place below
+bool MovePrompts(X86Context& ctx, uint32_t holder) {
+    Page& p = g_page;
+    for (int i = 0; i < kPrompts; i++) {
+        const char* from = p.host->prompts[i];
+        if (!from) continue;
+        char name[16];
+        std::snprintf(name, sizeof(name), "RC_P%d", i);
+        if (!(p.prompt[i] = Copy(ctx, holder, from, name, kDepth + kEntries + i))) return false;
+        Hide(Member(ctx, holder, std::strrchr(from, '.') + 1));
+    }
+    return true;
+}
+
 // our buttons under the stock ones, in their ring
 bool Entries(X86Context& ctx, uint32_t root, uint32_t holder) {
     Page& p = g_page;
@@ -204,16 +226,17 @@ bool Entries(X86Context& ctx, uint32_t root, uint32_t holder) {
     uint32_t above = Member(ctx, root, h.last);
     p.lead = Member(ctx, holder, h.under);
     if (!top || !above || !flash::IsClip(p.lead)) return false;
-    for (int i = 0; i < h.entries; i++) {
+    for (int i = 0; i < kEntries; i++) {
         char name[16];
         std::snprintf(name, sizeof(name), "RC_E%d", i);
-        if (!(p.entry[i] = Copy(ctx, holder, name, kDepth + i))) return false;
+        if (!(p.entry[i] = Copy(ctx, holder, h.button, name, kDepth + i))) return false;
         if (!Show(ctx, kEntry + i, p.entry[i], nullptr, app::Ui(kCaptions[i]).c_str())) return false;
     }
+    if (!MovePrompts(ctx, holder)) return false;
     p.first = p.entry[0];
     Follow(p);
     CallGuest(ctx, flash::kRunActions, {R32(flash::kPlayer)});
-    for (int i = 0; i < h.entries; i++) {
+    for (int i = 0; i < kEntries; i++) {
         if (!Button(ctx, p.entry[i], top)) return false;
         if (!Set(ctx, p.entry[i], "actionSelectPage", String(ctx, h.page))) return false;
         Link(ctx, above, p.entry[i]);
@@ -226,10 +249,9 @@ bool Entries(X86Context& ctx, uint32_t root, uint32_t holder) {
     return true;
 }
 
-// the rows of the page's mode, behind the PAGE row where one button opens both
+// the rows of the page's mode
 void Fill(Page& p) {
     p.rows.clear();
-    if (p.host->entries == 1) p.rows.push_back(&kPageRow);
     size_t count = 0;
     const Row* list = app::rows::Page(p.mode - 1, &count);
     for (size_t i = 0; i < count; i++)
@@ -252,9 +274,9 @@ bool Rows(X86Context& ctx, uint32_t root, uint32_t holder, uint32_t menu) {
     for (size_t i = 0; i < p.slots; i++) {
         char name[16];
         std::snprintf(name, sizeof(name), "RC_N%d", int(i));
-        p.name[i] = Copy(ctx, holder, name, kDepth + int(i));
+        p.name[i] = Copy(ctx, holder, h.button, name, kDepth + int(i));
         name[3] = 'V';
-        p.value[i] = Copy(ctx, holder, name, kDepth + kSlots + int(i));
+        p.value[i] = Copy(ctx, holder, h.button, name, kDepth + kSlots + int(i));
         if (!p.name[i] || !p.value[i]) return false;
         for (uint32_t clip : {p.name[i], p.value[i]}) {
             G<float>(clip + flash::kClipScaleX) = h.scale;
@@ -284,7 +306,6 @@ bool Rows(X86Context& ctx, uint32_t root, uint32_t holder, uint32_t menu) {
 std::string ValueText(const Page& p, size_t i) {
     const Row* row = p.rows[i];
     if ((p.capture == 1 || p.capture == 2) && p.bind == i) return app::Ui("PRESS A KEY");
-    if (row == &kPageRow) return app::Ui(kCaptions[p.mode - 1]);
     if (!row) return " ";
     std::string value = app::rows::Value(*row);
     // key names as they are
@@ -394,7 +415,7 @@ void Build(X86Context& ctx, const Host& host, uint32_t root, uint32_t holder, ui
     p.failed = !(p.mode ? Rows(ctx, root, holder, menu) : Entries(ctx, root, holder));
     const char* shown = p.mode ? kCaptions[p.mode - 1] : "buttons";
     LOGI("options menu: %s, %s%s", host.page, shown, p.failed ? ", failed" : "");
-    if (!p.failed && !p.mode && g_last) Focus(ctx, p.entry[std::min(g_last, host.entries) - 1]);
+    if (!p.failed && !p.mode && g_last) Focus(ctx, p.entry[g_last - 1]);
     g_last = p.mode;
 }
 
@@ -438,17 +459,13 @@ bool UpdateScroll(X86Context& ctx, size_t slot, uint32_t id) {
     return false;
 }
 
-// left, right or confirm on a row: the PAGE row turns the page, a value steps, a binding listens, the last restores
+// left, right or confirm on a row: a value steps, a binding listens, the last restores
 void ApplyRowInput(size_t slot, uint32_t id, bool locked) {
     Page& p = g_page;
     const Row* row = p.rows[p.top + slot];
     bool value = row && row->kind == app::rows::Kind::Value;
     bool changes = id >= kInputLeft && id <= kInputConfirm;
-    if (row == &kPageRow && changes) {
-        int step = id == kInputLeft ? -1 : 1;
-        p.mode = (p.mode - 1 + step + kEntries) % kEntries + 1;
-        Fill(p);
-    } else if (value && changes) {
+    if (value && changes) {
         if (!locked) app::rows::Value(*row, id == kInputLeft ? -1 : 1);
     } else if (id == kInputConfirm && row) {
         p.capture = 1;

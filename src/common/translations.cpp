@@ -24,7 +24,6 @@ constexpr Entry kEntries[] = {
     {"GENERAL", {u"Général", u"Allgemein", u"Generale", u"General"}},
     {"DISPLAY", {u"Affichage", u"Anzeige", u"Video", u"Pantalla"}},
     {"GRAPHICS", {u"Graphismes", u"Grafik", u"Grafica", u"Gráficos"}},
-    {"PAGE", {u"Page", u"Seite", u"Pagina", u"Página"}},
     {"RESTORE DEFAULTS", {u"Rétablir les valeurs par défaut", u"Standard wiederherstellen", u"Ripristina predefiniti", u"Restaurar predeterminados"}},
     {"PRESS A KEY", {u"Appuyez sur une touche", u"Taste drücken", u"Premi un tasto", u"Pulsa una tecla"}},
     {"UNBOUND", {u"Non assigné", u"Nicht belegt", u"Non assegnato", u"Sin asignar"}},
