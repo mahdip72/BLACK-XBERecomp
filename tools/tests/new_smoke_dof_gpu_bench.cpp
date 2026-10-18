@@ -21,6 +21,7 @@
 
 #include "d3d/particle_dof.h"
 #include "d3d/particle_dof_atlas.h"
+#include "d3d/particle_dof_clear.h"
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "gpu/shaders.h"
@@ -244,11 +245,9 @@ public:
                 const auto page_cb = page_dcbs_[page_index]->GetGPUVirtualAddress();
                 timed(prepares, [&] {
                     transition(source_atlas.Get(), source_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                    const float zero[4]{};
                     // Production clears only allocated cells. The filtered pass writes every cell itself.
                     const auto& rectangles = page_rects_[page_index];
-                    list->ClearRenderTargetView(descriptors.source_rtv, zero, UINT(rectangles.size()),
-                                                rectangles.data());
+                    gpu::ClearParticleDofAtlasCells(list.Get(), descriptors.source_rtv, rectangles);
                     list->RSSetViewports(1, &atlas_viewport);
                     list->RSSetScissorRects(1, &atlas_scissor);
                     list->SetGraphicsRootDescriptorTable(0, descriptors.native_srv);

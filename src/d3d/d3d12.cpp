@@ -43,6 +43,7 @@
 #include "d3d/fidelityfx_dof_shader.h"
 #include "d3d/viewmodel_dof_shader.h"
 #include "d3d/particle_dof_geometry.h"
+#include "d3d/particle_dof_clear.h"
 #include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "d3d/occlusion.h"
@@ -4045,7 +4046,6 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     GuestExtent size{};
     SurfaceSize(s.rt, size.w, size.h);
     p.globals.atlas_target[0] = p.globals.atlas_target[1] = float(extent);
-    const float zero[4]{};
     for (const auto& page : pages) {
         p.globals.atlas_target[2] = float(page.first_quad);
         p.globals.atlas_target[3] = float(page.quad_count);
@@ -4061,7 +4061,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         if (!p.atlas_rects.empty()) {
             Transition(p.atlas[0].Get(), p.atlas_states[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
             SetBlitTarget(ParticleDofAtlasView(0), extent, extent);
-            cl_->ClearRenderTargetView(ParticleDofAtlasView(0), zero, UINT(p.atlas_rects.size()), p.atlas_rects.data());
+            ClearParticleDofAtlasCells(cl_.Get(), ParticleDofAtlasView(0), p.atlas_rects);
             cl_->SetPipelineState(source_pso);
             SetTextureViewsAndSamplers(s, stages, clamp);
             cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

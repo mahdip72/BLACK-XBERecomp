@@ -101,6 +101,11 @@ if(BLACK_FIDELITYFX_DOF)
     target_include_directories(new_smoke_dof_gpu_bench PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
     target_link_libraries(new_smoke_dof_gpu_bench PRIVATE d3d12 dxgi dxguid d3dcompiler)
+
+    # Hardware regression for the production atlas clear, including large rectangle lists.
+    add_executable(particle_clear_d3d12 tools/tests/particle_clear_d3d12.cpp)
+    target_include_directories(particle_clear_d3d12 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(particle_clear_d3d12 PRIVATE d3d12 dxgi dxguid)
 endif()
 
 # build_info.h for the version resource, rewritten only when the commit changes
