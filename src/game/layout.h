@@ -22,6 +22,7 @@ constexpr uint32_t kFilmTable = 0x29D9C0;
 constexpr uint32_t kFilmEntry = 12;
 constexpr uint32_t kFilmBehindMenu = 8;  // byte: the film runs behind a menu
 constexpr uint32_t kFilms = 27;
+constexpr uint32_t kLogoFilm = 1;  // LO_, the EA intro
 
 // timer: whole steps and parts of a step over the divisor, the step's dt and the time
 constexpr uint32_t kTimerWholeSteps = 0x0C;
