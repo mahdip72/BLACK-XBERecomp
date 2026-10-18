@@ -187,6 +187,7 @@ public:
 
     void CompileVariant(unsigned samples) {
         GatherShader();
+        ComposeShader();
         PackShader(samples);
         DownsampleShader();
     }
@@ -199,7 +200,10 @@ public:
                               bool varied_output_alpha = false,
                               bool mixed_edge = false,
                               Pixel* packed_probe = nullptr,
-                              std::vector<Pixel>* raw_probe = nullptr) {
+                              std::vector<Pixel>* raw_probe = nullptr,
+                              double* pipeline_ms = nullptr,
+                              float near_scale = 1.0f,
+                              float far_scale = 0.45f) {
         Check(color.size() == kWidth * kHeight, "bad color fixture size");
         Check(raw_depth.size() == kWidth * kHeight, "bad depth fixture size");
         Check(rect.left >= 0 && rect.top >= 0 && rect.right <= LONG(kWidth) &&
@@ -209,9 +213,11 @@ public:
 
         ComPtr<ID3D11Texture2D> scene, depth, output, staging,
                                  filtered_color, filtered_surface,
+                                 layers, foreground_guide,
                                  resolved_output;
         ComPtr<ID3D11ShaderResourceView> scene_srv, output_srv, depth_srv,
-                                         filtered_color_srv, filtered_surface_srv;
+                                         filtered_color_srv, filtered_surface_srv,
+                                         layers_srv, foreground_guide_srv;
         ComPtr<ID3D11RenderTargetView> output_rtv;
         ComPtr<ID3D11Buffer> constants;
 
@@ -250,9 +256,10 @@ public:
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         Hr(device_->CreateTexture2D(&td, nullptr, &staging), "CreateTexture2D(staging)");
 
-        const float cb[8] = {kProjectionX, kProjectionY, focus_units, radius,
+        const float cb[12] = {kProjectionX, kProjectionY, focus_units, radius,
                              float(rect.left), float(rect.top),
-                             float(rect.right - rect.left), float(rect.bottom - rect.top)};
+                             float(rect.right - rect.left), float(rect.bottom - rect.top),
+                             near_scale, far_scale, 0, 0};
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = sizeof(cb);
         bd.Usage = D3D11_USAGE_DEFAULT;
@@ -536,6 +543,7 @@ public:
         scratch.Format = DXGI_FORMAT_R16_FLOAT;
         Hr(device_->CreateTexture2D(&scratch, nullptr, &filtered_surface),
            "CreateTexture2D(filtered depth/coverage mips)");
+        const auto pipeline_started = std::chrono::steady_clock::now();
         for (unsigned mip = 0; mip < 4; ++mip) {
             D3D11_RENDER_TARGET_VIEW_DESC view{};
             view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
@@ -623,10 +631,70 @@ public:
                                              &filtered_surface_srv),
            "CreateShaderResourceView(all depth/coverage mips)");
 
-        ID3D11RenderTargetView* rtv = output_rtv.Get();
-        ID3D11ShaderResourceView* srvs[4] = {
+        // Production performs its costly 96-tap gather at half resolution and
+        // reconstructs the two layers against each full-resolution receiver.
+        const unsigned half_width = (kWidth + 1) / 2;
+        const unsigned half_height = (kHeight + 1) / 2;
+        D3D11_TEXTURE2D_DESC layer_desc{};
+        layer_desc.Width = half_width;
+        layer_desc.Height = half_height;
+        layer_desc.MipLevels = 1;
+        layer_desc.ArraySize = 2;
+        layer_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        layer_desc.SampleDesc.Count = 1;
+        layer_desc.Usage = D3D11_USAGE_DEFAULT;
+        layer_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        Hr(device_->CreateTexture2D(&layer_desc, nullptr, &layers),
+           "CreateTexture2D(half-resolution layers)");
+        D3D11_RENDER_TARGET_VIEW_DESC layer_view{};
+        layer_view.Format = layer_desc.Format;
+        layer_view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        layer_view.Texture2DArray.ArraySize = 1;
+        layer_view.Texture2DArray.MipSlice = 0;
+        ComPtr<ID3D11RenderTargetView> background_view, foreground_view, guide_view;
+        layer_view.Texture2DArray.FirstArraySlice = 0;
+        Hr(device_->CreateRenderTargetView(layers.Get(), &layer_view, &background_view),
+           "CreateRenderTargetView(half background)");
+        layer_view.Texture2DArray.FirstArraySlice = 1;
+        Hr(device_->CreateRenderTargetView(layers.Get(), &layer_view, &foreground_view),
+           "CreateRenderTargetView(half foreground)");
+        layer_desc.ArraySize = 1;
+        layer_desc.Format = DXGI_FORMAT_R16_FLOAT;
+        Hr(device_->CreateTexture2D(&layer_desc, nullptr, &foreground_guide),
+           "CreateTexture2D(half foreground guide)");
+        Hr(device_->CreateRenderTargetView(foreground_guide.Get(), nullptr, &guide_view),
+           "CreateRenderTargetView(half foreground guide)");
+        ID3D11RenderTargetView* gather_targets[3] = {
+            background_view.Get(), foreground_view.Get(), guide_view.Get()};
+        ID3D11ShaderResourceView* gather_srvs[4] = {
             nullptr, scene_srv.Get(), filtered_color_srv.Get(), filtered_surface_srv.Get()};
         ID3D11Buffer* buffer = constants.Get();
+        const D3D11_VIEWPORT half_viewport{0, 0, float(half_width), float(half_height), 0, 1};
+        const D3D11_RECT half_scissor{0, 0, LONG(half_width), LONG(half_height)};
+        context_->OMSetRenderTargets(3, gather_targets, nullptr);
+        context_->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+        context_->RSSetState(raster_.Get());
+        context_->RSSetViewports(1, &half_viewport);
+        context_->RSSetScissorRects(1, &half_scissor);
+        context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->VSSetShader(vs_.Get(), nullptr, 0);
+        context_->PSSetShader(GatherShader(), nullptr, 0);
+        context_->PSSetShaderResources(0, 4, gather_srvs);
+        context_->PSSetConstantBuffers(1, 1, &buffer);
+        context_->Draw(3, 0);
+        ID3D11ShaderResourceView* empty[4] = {};
+        context_->PSSetShaderResources(0, 4, empty);
+        context_->OMSetRenderTargets(0, nullptr, nullptr);
+        Hr(device_->CreateShaderResourceView(layers.Get(), nullptr, &layers_srv),
+           "CreateShaderResourceView(half layers)");
+        Hr(device_->CreateShaderResourceView(foreground_guide.Get(), nullptr,
+                                             &foreground_guide_srv),
+           "CreateShaderResourceView(half foreground guide)");
+
+        ID3D11RenderTargetView* rtv = output_rtv.Get();
+        ID3D11ShaderResourceView* srvs[4] = {
+            filtered_surface_srv.Get(), scene_srv.Get(), layers_srv.Get(),
+            foreground_guide_srv.Get()};
         ID3D11SamplerState* sampler = linear_.Get();
         const float blend_factor[4] = {};
         const D3D11_VIEWPORT viewport{0, 0, float(kWidth), float(kHeight), 0, 1};
@@ -638,12 +706,11 @@ public:
         context_->RSSetScissorRects(1, &scissor);
         context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context_->VSSetShader(vs_.Get(), nullptr, 0);
-        context_->PSSetShader(GatherShader(), nullptr, 0);
+        context_->PSSetShader(ComposeShader(), nullptr, 0);
         context_->PSSetShaderResources(0, 4, srvs);
         context_->PSSetConstantBuffers(1, 1, &buffer);
         context_->PSSetSamplers(0, 1, &sampler);
         context_->Draw(3, 0);
-        ID3D11ShaderResourceView* empty[4] = {};
         context_->PSSetShaderResources(0, 4, empty);
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         if (samples > 1) {
@@ -666,24 +733,32 @@ public:
             for (size_t i = 0; i < result.size(); ++i)
                 Check(result[i].a == original_resolved_alpha[i],
                       "RGB-only DOF changed resolved output alpha");
+        if (pipeline_ms)
+            *pipeline_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - pipeline_started).count();
         return result;
     }
 
 private:
-    ComPtr<ID3DBlob> Compile(const char* entry, const char* profile, unsigned samples) {
+    ComPtr<ID3DBlob> Compile(const char* entry, const char* profile, unsigned samples,
+                            bool compose = false) {
         const std::string sample_count = std::to_string(samples);
         const D3D_SHADER_MACRO defines[] = {{"MS", "1"}, {"DOF_SAMPLES", sample_count.c_str()},
                                             {nullptr, nullptr}};
+        const D3D_SHADER_MACRO compose_defines[] = {{"DOF_COMPOSE", "1"},
+                                                     {nullptr, nullptr}};
         ComPtr<ID3DBlob> binary, errors;
         const auto started = std::chrono::steady_clock::now();
         HRESULT result = D3DCompile(gpu::kDepthOfFieldHlsl,
                                     std::strlen(gpu::kDepthOfFieldHlsl),
                                     "src/d3d/depth_of_field_shader.h",
-                                    samples > 1 ? defines : nullptr, nullptr, entry, profile,
+                                    compose ? compose_defines : (samples > 1 ? defines : nullptr),
+                                    nullptr, entry, profile,
                                     D3DCOMPILE_ENABLE_STRICTNESS, 0, &binary, &errors);
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - started).count();
-        std::printf("COMPILE %s %ux: %.1f ms\n", entry, samples, ms);
+        std::printf("COMPILE %s %ux%s: %.1f ms\n", entry, samples,
+                    compose ? " compose" : "", ms);
         std::fflush(stdout);
         if (FAILED(result)) {
             std::string message = errors
@@ -697,12 +772,22 @@ private:
 
     ID3D11PixelShader* GatherShader() {
         if (!gather_shader_) {
-            auto bytecode = Compile("depth_of_field", "ps_5_0", 1);
+            auto bytecode = Compile("depth_of_field_gather", "ps_5_0", 1);
             Hr(device_->CreatePixelShader(bytecode->GetBufferPointer(),
                                           bytecode->GetBufferSize(), nullptr, &gather_shader_),
-               "CreatePixelShader(depth_of_field)");
+               "CreatePixelShader(depth_of_field_gather)");
         }
         return gather_shader_.Get();
+    }
+
+    ID3D11PixelShader* ComposeShader() {
+        if (!compose_shader_) {
+            auto bytecode = Compile("depth_of_field", "ps_5_0", 1, true);
+            Hr(device_->CreatePixelShader(bytecode->GetBufferPointer(),
+                                          bytecode->GetBufferSize(), nullptr, &compose_shader_),
+               "CreatePixelShader(depth_of_field compose)");
+        }
+        return compose_shader_.Get();
     }
 
     ID3D11PixelShader* PackShader(unsigned samples) {
@@ -734,6 +819,7 @@ private:
     ComPtr<ID3D11BlendState> rgb_only_;
     ComPtr<ID3D11SamplerState> linear_;
     ComPtr<ID3D11PixelShader> gather_shader_;
+    ComPtr<ID3D11PixelShader> compose_shader_;
     ComPtr<ID3D11PixelShader> downsample_shader_;
     std::map<unsigned, ComPtr<ID3D11PixelShader>> pack_shaders_;
 };
@@ -745,6 +831,16 @@ void Near(float actual, float expected, float tolerance, const char* message) {
 void Same(const std::vector<Pixel>& actual, const std::vector<Pixel>& expected,
           float tolerance, const char* message, float alpha_tolerance = 0) {
     for (size_t i = 0; i < actual.size(); ++i) {
+        if (std::abs(actual[i].r - expected[i].r) > tolerance ||
+            std::abs(actual[i].g - expected[i].g) > tolerance ||
+            std::abs(actual[i].b - expected[i].b) > tolerance) {
+            std::printf("METRIC mismatch %s at (%zu,%zu): actual RGB "
+                        "%.6f/%.6f/%.6f expected %.6f/%.6f/%.6f tol %.6f\n",
+                        message, i % kWidth, i / kWidth,
+                        actual[i].r, actual[i].g, actual[i].b,
+                        expected[i].r, expected[i].g, expected[i].b, tolerance);
+            std::fflush(stdout);
+        }
         Near(actual[i].r, expected[i].r, tolerance, message);
         Near(actual[i].g, expected[i].g, tolerance, message);
         Near(actual[i].b, expected[i].b, tolerance, message);
@@ -776,8 +872,9 @@ void TestUniformAndInvalid(Warp& warp) {
     std::vector<Pixel> color(kWidth * kHeight, {0.23f, 0.41f, 0.67f, 0.37f});
     std::vector<float> depth(kWidth * kHeight, RawDepth(4));
     const Rect whole{0, 0, LONG(kWidth), LONG(kHeight)};
-    // RGB travels through RGBA16F packed mips; 0.41 quantizes by about 8.8e-5.
-    Same(warp.Render(color, depth, 8, whole), color, 5e-4f,
+    // RGB crosses two RGBA16F layer writes. At 0.67, their combined measured
+    // roundoff can exceed one 0.000488 half-precision step.
+    Same(warp.Render(color, depth, 8, whole), color, 1e-3f,
          "uniform color lost energy or alpha at image boundary");
 
     color = Pattern();
@@ -846,15 +943,57 @@ void TestViewport(Warp& warp) {
             for (unsigned x = 0; x < kWidth; ++x) {
                 const bool inside = x >= unsigned(rect.left) && x < unsigned(rect.right) &&
                                     y >= unsigned(rect.top) && y < unsigned(rect.bottom);
-                const float tolerance = inside ? 5e-4f : 0.0f;
+                const float tolerance = inside ? 1e-3f : 0.0f;
                 const Pixel& actual = output[At(x, y)];
                 const Pixel& expected = color[At(x, y)];
+                if (std::abs(actual.r - expected.r) > tolerance ||
+                    std::abs(actual.g - expected.g) > tolerance ||
+                    std::abs(actual.b - expected.b) > tolerance)
+                    std::printf("METRIC viewport (%u,%u) rect (%ld,%ld,%ld,%ld) "
+                                "actual RGB %.6f/%.6f/%.6f expected %.6f/%.6f/%.6f\n",
+                                x, y, rect.left, rect.top, rect.right, rect.bottom,
+                                actual.r, actual.g, actual.b,
+                                expected.r, expected.g, expected.b);
                 Near(actual.r, expected.r, tolerance, "viewport changed red or sampled outside");
                 Near(actual.g, expected.g, tolerance, "viewport changed green or sampled outside");
                 Near(actual.b, expected.b, tolerance, "viewport changed blue or sampled outside");
                 Near(actual.a, expected.a, 0, "viewport changed alpha");
             }
     }
+    // A split surface at the last odd-viewport row catches missing near
+    // coverage when packed mips dilute the edge with invalid exterior texels.
+    const Rect odd{7, 9, 55, 58};
+    std::fill(color.begin(), color.end(), Pixel{0.8f, 0.1f, 0.9f, 0.6f});
+    std::fill(depth.begin(), depth.end(), RawDepth(15));
+    for (unsigned y = odd.top; y < unsigned(odd.bottom); ++y)
+        for (unsigned x = odd.left; x < unsigned(odd.right); ++x) {
+            const bool near_surface = x < 31;
+            color[At(x, y)] = near_surface
+                ? Pixel{0.9f, 0.1f, 0.05f, 0.3f}
+                : Pixel{0.05f, 0.1f, 0.9f, 0.7f};
+            depth[At(x, y)] = RawDepth(near_surface ? 3.0f : 15.0f);
+        }
+    const auto split = warp.Render(color, depth, 18, odd, 1, false, 5);
+    WriteBmp("odd-viewport-split-before.bmp", color, kWidth, kHeight);
+    WriteBmp("odd-viewport-split-after.bmp", split, kWidth, kHeight);
+    CheckRangeAndAlpha(split, color);
+    for (unsigned y : {9u, 10u, 56u, 57u}) {
+        const float blue = split[At(15, y)].b;
+        const float red = split[At(47, y)].r;
+        std::printf("METRIC odd viewport edge y%u: near-interior blue %.5f, "
+                    "far-interior red %.5f\n", y, blue, red);
+        Check(blue < 0.15f && red < 0.15f,
+              "odd viewport edge diluted opaque near/far interior");
+    }
+    for (unsigned y = 0; y < kHeight; ++y)
+        for (unsigned x = 0; x < kWidth; ++x)
+            if (x < unsigned(odd.left) || x >= unsigned(odd.right) ||
+                y < unsigned(odd.top) || y >= unsigned(odd.bottom)) {
+                const Pixel& a = split[At(x, y)];
+                const Pixel& b = color[At(x, y)];
+                Check(a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a,
+                      "odd viewport split changed an outside pixel");
+            }
     std::puts("PASS even/odd viewport bounds, inside energy and outside RGB identity");
 }
 
@@ -957,6 +1096,8 @@ void TestMixedMsaaEdge(Warp& warp) {
         for (unsigned y = 4; y < kHeight - 4; ++y) {
             Near(output[At(32, y)].a, scene[At(32, y)].a, 1e-6f,
                  "mixed edge lost per-sample alpha on resolve");
+            // The receiver at z=3 has a 7.5 px near CoC; x=16 is 16 px
+            // inside the foreground and must retain its opaque interior.
             Check(output[At(16, y)].b < 0.15f && output[At(48, y)].r < 0.15f,
                   "mixed MSAA colors entered opaque near or distant far interior");
             Check(output[At(31, y)].b > 0.01f && output[At(33, y)].r > 0.01f,
@@ -1162,6 +1303,168 @@ void TestQualityFixtures(Warp& warp) {
                 mean_step, largest_step);
 }
 
+void TestContinuousDepthTexture(Warp& warp) {
+    constexpr Rect whole{0, 0, LONG(kWidth), LONG(kHeight)};
+    std::vector<Pixel> stone(kWidth * kHeight);
+    for (unsigned y = 0; y < kHeight; ++y)
+        for (unsigned x = 0; x < kWidth; ++x) {
+            unsigned hash = (x * 1973u + y * 9277u + x * y * 26699u) * 1013u;
+            hash ^= hash >> 11;
+            const float grain = float(hash & 255u) / 255.0f;
+            const float low = 0.08f * std::sin(0.28f * x) * std::sin(0.23f * y);
+            const float tone = 0.24f + 0.48f * grain + low;
+            stone[At(x, y)] = {tone, tone * 0.9f, tone * 0.75f, 0.2f + 0.6f * grain};
+        }
+    std::vector<std::vector<Pixel>> sheet;
+    for (const bool near_plane : {true, false})
+        for (const bool curved : {false, true}) {
+            // Inverse view depth is affine across a projected planar surface.
+            // The curved variant adds a smooth quadratic bend, without a depth edge.
+            const float base_inv_z = near_plane ? 1.0f / 2.5f : 1.0f / 15.0f;
+            const float slope_x = near_plane ? 0.0030f : 0.0008f;
+            const float slope_y = near_plane ? 0.0015f : 0.0004f;
+            const float curvature = near_plane ? 0.000020f : 0.000008f;
+            std::vector<float> depth(kWidth * kHeight);
+            for (unsigned y = 0; y < kHeight; ++y)
+                for (unsigned x = 0; x < kWidth; ++x) {
+                    const float dx = float(x) - 31.5f;
+                    const float dy = float(y) - 31.5f;
+                    const float inv_z = base_inv_z + slope_x * dx +
+                        (curved ? slope_y * dy + curvature * (dx * dx - dy * dy) : 0);
+                    Check(inv_z > 0, "continuous-depth fixture has invalid inverse depth");
+                    depth[At(x, y)] = RawDepth(1.0f / inv_z);
+                }
+            auto output = warp.Render(stone, depth, 18, whole, 1, false, 5);
+            const char* plane = near_plane ? "near" : "far";
+            const char* shape = curved ? "curved" : "slope";
+            char before[80], after[80];
+            std::snprintf(before, sizeof(before), "continuous-%s-%s-before.bmp", plane, shape);
+            std::snprintf(after, sizeof(after), "continuous-%s-%s-after.bmp", plane, shape);
+            WriteBmp(before, stone, kWidth, kHeight);
+            WriteBmp(after, output, kWidth, kHeight);
+            CheckRangeAndAlpha(output, stone);
+            sheet.push_back(stone);
+            sheet.push_back(output);
+
+            float worst_ratio = 0;
+            float best_ratio = 1e9f;
+            unsigned unchanged = 0;
+            for (unsigned tile_y = 0; tile_y < 2; ++tile_y)
+                for (unsigned tile_x = 0; tile_x < 2; ++tile_x) {
+                    const unsigned x0 = 16 + 16 * tile_x;
+                    const unsigned y0 = 16 + 16 * tile_y;
+                    float input_highpass = 0, output_highpass = 0;
+                    for (unsigned y = y0; y < y0 + 15; ++y)
+                        for (unsigned x = x0; x < x0 + 15; ++x) {
+                            const size_t i = At(x, y);
+                            input_highpass +=
+                                std::abs(stone[i].r - stone[At(x + 1, y)].r) +
+                                std::abs(stone[i].r - stone[At(x, y + 1)].r);
+                            output_highpass +=
+                                std::abs(output[i].r - output[At(x + 1, y)].r) +
+                                std::abs(output[i].r - output[At(x, y + 1)].r);
+                            if (std::abs(output[i].r - stone[i].r) < 0.005f) ++unchanged;
+                        }
+                    Check(input_highpass > 0, "stone fixture lacks high-frequency texture");
+                    const float ratio = output_highpass / input_highpass;
+                    best_ratio = std::min(best_ratio, ratio);
+                    worst_ratio = std::max(worst_ratio, ratio);
+                }
+            const float unchanged_fraction = float(unchanged) / (4 * 15 * 15);
+            std::printf("METRIC continuous %s %s: highpass tile ratio %.3f..%.3f, "
+                        "unchanged %.3f\n", plane, shape, best_ratio,
+                        worst_ratio, unchanged_fraction);
+            std::fflush(stdout);
+            Check(worst_ratio < 0.55f,
+                  "continuous depth retained sharp textured patch");
+            Check(unchanged_fraction < 0.05f,
+                  "continuous depth fell back to original sharp texture");
+        }
+    WriteContactSheet(sheet, 2, "contact-sheet-continuous-depth.bmp");
+    std::puts("PASS continuous sloped/curved near/far texture blur without sharp patches");
+}
+
+void TestFarStripeParity(Warp& warp) {
+    constexpr Rect whole{0, 0, LONG(kWidth), LONG(kHeight)};
+    std::vector<std::vector<Pixel>> sheet;
+    for (unsigned stripe_x : {32u, 33u}) {
+        std::vector<Pixel> scene(kWidth * kHeight, {0.25f, 0.25f, 0.25f, 0.4f});
+        std::vector<float> depth(kWidth * kHeight, RawDepth(90));
+        for (unsigned y = 0; y < kHeight; ++y) {
+            const float tone = y & 1 ? 0.8f : 0.2f;
+            scene[At(stripe_x, y)] = {tone, tone, tone, 0.7f};
+            depth[At(stripe_x, y)] = RawDepth(10);
+        }
+        auto output = warp.Render(scene, depth, 18, whole, 1, false, 5);
+        char before[72], after[72];
+        std::snprintf(before, sizeof(before), "far-stripe-x%u-before.bmp", stripe_x);
+        std::snprintf(after, sizeof(after), "far-stripe-x%u-after.bmp", stripe_x);
+        WriteBmp(before, scene, kWidth, kHeight);
+        WriteBmp(after, output, kWidth, kHeight);
+        sheet.push_back(scene);
+        sheet.push_back(output);
+        CheckRangeAndAlpha(output, scene);
+        float contrast = 0;
+        unsigned near_original = 0;
+        for (unsigned y = 16; y < 48; ++y) {
+            contrast += std::abs(output[At(stripe_x, y)].r -
+                                 output[At(stripe_x, y + 1)].r);
+            near_original += std::abs(output[At(stripe_x, y)].r -
+                                      scene[At(stripe_x, y)].r) < 0.005f;
+        }
+        contrast /= 32;
+        std::printf("METRIC far textured 1px stripe x%u: vertical contrast %.4f "
+                    "(input 0.6000), unchanged %u/32\n",
+                    stripe_x, contrast, near_original);
+        std::fflush(stdout);
+        Check(contrast < 0.3f,
+              "far textured stripe retained sharp contrast at half-resolution parity");
+        Check(near_original < 4,
+              "far textured stripe kept original sharp pixels at half-resolution parity");
+    }
+    WriteContactSheet(sheet, 2, "contact-sheet-far-stripe-parity.bmp");
+    std::puts("PASS even/odd far textured stripe contrast softened");
+}
+
+void TestLiveTuning(Warp& warp) {
+    constexpr Rect whole{0, 0, LONG(kWidth), LONG(kHeight)};
+    const auto texture = Pattern();
+    std::vector<float> depth(kWidth * kHeight, RawDepth(3));
+    Same(warp.Render(texture, depth, 18, whole, 1, false, 5, false, false,
+                     nullptr, nullptr, nullptr, 0, 0.45f), texture, 0,
+         "zero near tuning changed a uniformly near scene");
+    std::fill(depth.begin(), depth.end(), RawDepth(15));
+    Same(warp.Render(texture, depth, 18, whole, 1, false, 5, false, false,
+                     nullptr, nullptr, nullptr, 1, 0), texture, 0,
+         "zero far tuning changed a uniformly far scene");
+    std::fill(depth.begin(), depth.end(), RawDepth(10));
+    Same(warp.Render(texture, depth, 18, whole, 1, false, 10), texture, 0,
+         "live focus distance did not keep its focus plane sharp");
+
+    std::fill(depth.begin(), depth.end(), RawDepth(15));
+    const auto gentler = warp.Render(texture, depth, 18, whole, 1, false, 5);
+    const auto stronger = warp.Render(texture, depth, 18, whole, 1, false, 5,
+                                      false, false, nullptr, nullptr, nullptr, 1, 1);
+    auto detail = [](const std::vector<Pixel>& image) {
+        float total = 0;
+        for (unsigned y = 16; y < 47; ++y)
+            for (unsigned x = 16; x < 47; ++x)
+                total += std::abs(image[At(x, y)].r - image[At(x + 1, y)].r) +
+                         std::abs(image[At(x, y)].r - image[At(x, y + 1)].r);
+        return total / (31 * 31 * 2);
+    };
+    const float gentle_detail = detail(gentler);
+    const float strong_detail = detail(stronger);
+    std::printf("METRIC far tuning .45 vs 1.00: broadband detail %.4f vs %.4f\n",
+                gentle_detail, strong_detail);
+    std::fflush(stdout);
+    WriteBmp("far-tuning-045.bmp", gentler, kWidth, kHeight);
+    WriteBmp("far-tuning-100.bmp", stronger, kWidth, kHeight);
+    Check(strong_detail < gentle_detail * 0.9f,
+          "far strength control did not soften detail when increased");
+    std::puts("PASS live near/far zero, focus, and far softness tuning");
+}
+
 void TestMaxRadiusDiagnostics(Warp& warp) {
     constexpr Rect whole{0, 0, LONG(kWidth), LONG(kHeight)};
     constexpr float focus = 5.0f;
@@ -1351,6 +1654,27 @@ void TestMaxRadiusDiagnostics(Warp& warp) {
     std::puts("PASS max-radius finite/alpha diagnostics; BMP contact sheet saved");
 }
 
+void TestWarpTiming(Warp& warp) {
+    constexpr Rect whole{0, 0, LONG(kWidth), LONG(kHeight)};
+    const auto color = Pattern();
+    std::vector<float> depth(kWidth * kHeight);
+    for (const float world_depth : {15.0f, 5.0f}) {
+        std::fill(depth.begin(), depth.end(), RawDepth(world_depth));
+        double warmup = 0;
+        warp.Render(color, depth, 18, whole, 1, false, 5, false, false,
+                    nullptr, nullptr, &warmup);
+        std::array<double, 3> samples{};
+        for (double& ms : samples)
+            warp.Render(color, depth, 18, whole, 1, false, 5, false, false,
+                        nullptr, nullptr, &ms);
+        std::sort(samples.begin(), samples.end());
+        std::printf("METRIC WARP64 full pipeline depth %.0f radius 18 "
+                    "warmed median %.3f ms (samples %.3f, %.3f, %.3f)\n",
+                    world_depth, samples[1], samples[0], samples[1], samples[2]);
+        std::fflush(stdout);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1372,6 +1696,14 @@ int main() {
         TestMaxRadiusDiagnostics(warp);
         std::puts("RUN quality fixtures"); std::fflush(stdout);
         TestQualityFixtures(warp);
+        std::puts("RUN continuous-depth stone texture"); std::fflush(stdout);
+        TestContinuousDepthTexture(warp);
+        std::puts("RUN even/odd far textured stripe"); std::fflush(stdout);
+        TestFarStripeParity(warp);
+        std::puts("RUN live near/far/focus tuning"); std::fflush(stdout);
+        TestLiveTuning(warp);
+        std::puts("RUN WARP pipeline timing (software, not game FPS)"); std::fflush(stdout);
+        TestWarpTiming(warp);
         std::puts("PASS depth-of-field WARP checks");
         return 0;
     } catch (const std::exception& error) {

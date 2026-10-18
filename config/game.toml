@@ -565,10 +565,30 @@ on_false = 0x213A0
 at = 0x1EE9A5
 call = "AmbientOcclusion"
 
-# src/game/depth_of_field.cpp: after occlusion, while the reload weapon is still deferred
+# src/game/depth_of_field.cpp: after world geometry, before post-effect capture and the deferred reload weapon
 [[hook]]
-at = 0x1EE9A5
+at = 0x178CB7
 call = "ReloadDepthOfField"
+
+# Preview routes an idle weapon through the native late draw without changing the screen-effect manager.
+[[hook]]
+at = 0x1EE95C
+call = "DeferPreviewWeapon"
+on_true = 0x1EE988
+
+[[hook]]
+at = 0x1EEB0C
+call = "DrawPreviewWeapon"
+on_true = 0x1EEB0E
+
+# The early list-5 draw runs during normal gameplay; type-1 reloads bypass both markers.
+[[hook]]
+at = 0x1EE97C
+call = "BeginWeaponDepthOfField"
+
+[[hook]]
+at = 0x1EE981
+call = "EndWeaponDepthOfField"
 
 # src/game/language.cpp
 [[hook]]

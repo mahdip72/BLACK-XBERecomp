@@ -115,6 +115,12 @@ void Load(const void* table) {
 
 // after the settings load, before boot
 void Init() {
+    Options& o = Opt();
+    o.dof_focus_distance = std::clamp(o.dof_focus_distance, 1u, 30u);
+    o.dof_near_strength = std::min(o.dof_near_strength, 150u);
+    o.dof_far_strength = std::min(o.dof_far_strength, 150u);
+    o.dof_bokeh_radius = std::clamp(o.dof_bokeh_radius, 4u, 30u);
+    o.dof_weapon_blur = std::min(o.dof_weapon_blur, 100u);
     BootLanguage();  // latched before the panel can change the setting
     input::LoadBindings();
     audio::SetOutputMode(Opt().audio_output);
@@ -159,6 +165,11 @@ const app::GameInfo app::kGame = {
                 {"fps_counter", &game::Opt().fps_counter, nullptr},
                 {"reload_blur", &game::Opt().reload_blur, nullptr},
                 {"modern_reload_dof", &game::Opt().modern_reload_dof, nullptr},
+                {"dof_focus_distance", nullptr, &game::Opt().dof_focus_distance},
+                {"dof_near_strength", nullptr, &game::Opt().dof_near_strength},
+                {"dof_far_strength", nullptr, &game::Opt().dof_far_strength},
+                {"dof_bokeh_radius", nullptr, &game::Opt().dof_bokeh_radius},
+                {"dof_weapon_blur", nullptr, &game::Opt().dof_weapon_blur},
                 {"fmv_scale", nullptr, &game::Opt().fmv_scale},
                 {"hdr_output", &game::Opt().hdr_output, nullptr},
                 {"invert_mouse", &game::Opt().invert_mouse, nullptr},

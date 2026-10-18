@@ -112,6 +112,12 @@ int StepRange(int value, int lo, int hi, int inc, int step) {
     return lo + inc * StepIndex((std::clamp(value, lo, hi) - lo) / inc, step, count);
 }
 
+// DOF tuning stops at its endpoints instead of wrapping to the opposite extreme
+int StepDofRange(uint32_t value, int lo, int hi, int inc, int step) {
+    int current = int(std::clamp(value, uint32_t(lo), uint32_t(hi)));
+    return std::clamp(current + step * inc, lo, hi);
+}
+
 // the monitor's modes smallest first, so Left steps down; the primary's for empty
 std::vector<Mode> Modes(const std::string& monitor) {
     std::vector<Mode> modes;
@@ -230,7 +236,8 @@ void Changed(bool display) {
 enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFpsCounter, kAniso, kReloadBlur,
              kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
              kAmbientOcclusion, kAudioOutput, kHdrOutput, kMonitor, kLanguage, kSmaa,
-             kPauseOnFocusLoss, kFmvScale };
+             kPauseOnFocusLoss, kFmvScale, kDofFocusDistance, kDofNearStrength, kDofFarStrength,
+             kDofBokehRadius, kDofWeaponBlur, kResetDofTuning, kDofPreview };
 
 using rows::Kind;
 using rows::Row;
@@ -255,6 +262,14 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kDrawDistance, "DRAW DISTANCE"},
     {Kind::Value, kAmbientOcclusion, "AMBIENT OCCLUSION"},
     {Kind::Value, kReloadBlur, "RELOAD BLUR"},
+    {Kind::Heading, -1, "MODERN DOF"},
+    {Kind::Value, kDofPreview, "PREVIEW RELOAD DOF"},
+    {Kind::Value, kDofFocusDistance, "FOCUS DISTANCE"},
+    {Kind::Value, kDofNearStrength, "NEAR BLUR"},
+    {Kind::Value, kDofFarStrength, "DISTANT BLUR"},
+    {Kind::Value, kDofBokehRadius, "BOKEH SIZE"},
+    {Kind::Value, kDofWeaponBlur, "GAMEPLAY WEAPON BLUR"},
+    {Kind::Value, kResetDofTuning, "RESET DOF TUNING"},
     {Kind::Heading, -1, "GENERAL"},
     {Kind::Value, kSkipIntros, "SKIP INTROS"},
     {Kind::Value, kPauseOnFocusLoss, "PAUSE ON FOCUS LOSS"},
@@ -286,6 +301,7 @@ bool* ToggleFlag(Settings& s, int id) {
         case kFpsCounter: return &o.fps_counter;
         case kHdrOutput: return &o.hdr_output;
         case kSmaa: return &o.smaa;
+        case kDofPreview: return &o.dof_preview;
         case kSkipIntros: return &o.skip_intros;
         case kPauseOnFocusLoss: return &o.pause_on_focus_loss;
         case kInvertMouse: return &o.invert_mouse;
@@ -296,8 +312,12 @@ bool* ToggleFlag(Settings& s, int id) {
 
 bool DisplayRow(int id) { return id == kMonitor || id == kDisplayMode || id == kResolution; }
 
-// shown dimmed and left as it is: HDR output without an HDR display
-bool Greyed(int id) { return id == kHdrOutput && !game::g_hdr_display; }
+// shown dimmed and left as it is: unsupported HDR or preview without Modern DOF
+bool Greyed(int id) {
+    if (id == kHdrOutput) return !game::g_hdr_display;
+    if (id == kDofPreview) return !game::Opt().reload_blur || !game::Opt().modern_reload_dof;
+    return false;
+}
 
 std::string g_display_monitor;  // the held monitor, beside the held display settings
 
@@ -444,10 +464,42 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
             if (step) {
                 o.reload_blur = mode != 0;
                 o.modern_reload_dof = mode == 2;
+                if (mode != 2) o.dof_preview = false;
             }
             std::snprintf(text, sizeof(text), "%s", kReloadBlurNames[index]);
             return true;
         }
+        case kDofFocusDistance:
+            if (step) o.dof_focus_distance = uint32_t(StepDofRange(o.dof_focus_distance, 1, 30, 1, step));
+            std::snprintf(text, sizeof(text), "%u UNITS", o.dof_focus_distance);
+            return true;
+        case kDofNearStrength:
+            if (step) o.dof_near_strength = uint32_t(StepDofRange(o.dof_near_strength, 0, 150, 5, step));
+            std::snprintf(text, sizeof(text), "%u%%", o.dof_near_strength);
+            return true;
+        case kDofFarStrength:
+            if (step) o.dof_far_strength = uint32_t(StepDofRange(o.dof_far_strength, 0, 150, 5, step));
+            std::snprintf(text, sizeof(text), "%u%%", o.dof_far_strength);
+            return true;
+        case kDofBokehRadius:
+            if (step) o.dof_bokeh_radius = uint32_t(StepDofRange(o.dof_bokeh_radius, 4, 30, 1, step));
+            std::snprintf(text, sizeof(text), "%u PX", o.dof_bokeh_radius);
+            return true;
+        case kDofWeaponBlur:
+            if (step) o.dof_weapon_blur = uint32_t(StepDofRange(o.dof_weapon_blur, 0, 100, 5, step));
+            std::snprintf(text, sizeof(text), "%u%%", o.dof_weapon_blur);
+            return true;
+        case kResetDofTuning:
+            if (step) {
+                const game::Options defaults;
+                o.dof_focus_distance = defaults.dof_focus_distance;
+                o.dof_near_strength = defaults.dof_near_strength;
+                o.dof_far_strength = defaults.dof_far_strength;
+                o.dof_bokeh_radius = defaults.dof_bokeh_radius;
+                o.dof_weapon_blur = defaults.dof_weapon_blur;
+            }
+            std::snprintf(text, sizeof(text), "BALANCED");
+            return true;
         case kDrawDistance:
             std::snprintf(text, sizeof(text), "%s", kDistanceNames[StepTable(kDistances, o.draw_distance, step)]);
             return true;
@@ -493,7 +545,10 @@ void StepInputRow(int id, int step, char (&text)[64]) {
 
 // steps the value first when step is not zero
 std::string RowText(int id, int step, Settings& s = Get()) {
-    if (Greyed(id)) return "NOT SUPPORTED";
+    if (Greyed(id)) {
+        if (id != kDofPreview) return "NOT SUPPORTED";
+        step = 0;  // the disabled preview still shows OFF, but cannot toggle
+    }
     char text[64] = "";
     if (bool* on = ToggleFlag(s, id)) {
         Flip(*on, step);

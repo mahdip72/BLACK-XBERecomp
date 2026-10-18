@@ -13,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -36,6 +37,7 @@
 #include "core/log.h"
 #include "d3d/depth_of_field.h"
 #include "d3d/depth_of_field_shader.h"
+#include "d3d/viewmodel_dof_shader.h"
 #include "d3d/occlusion.h"
 #include "d3d/smaa_shader.h"
 #include "d3d/smaa_textures.h"
@@ -458,6 +460,7 @@ constexpr int kAoConstants = 20;  // kAoHlsl's b1
 constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R16G16_FLOAT;
 constexpr uint32_t kDofLevels = 4;
 constexpr uint32_t kDofTargets = 2;
+constexpr uint32_t kDofLayerViews = 3;
 constexpr DXGI_FORMAT kDofFormats[kDofTargets] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16_FLOAT};
 constexpr float kAoRadius = 0.8f;    // world units, the engine's are metres
 constexpr float kAoMaxSpan = 0.15f;  // of the view's height, the most one pixel's samples may cover
@@ -930,15 +933,30 @@ private:
     ID3D12PipelineState* EnsureDepthOfFieldPipeline(const char* entry, DXGI_FORMAT out, uint32_t samples,
                                                   uint32_t input_samples = 1);
     bool EnsureDepthOfFieldFilter(uint32_t w, uint32_t h);
+    bool EnsureDepthOfFieldLayers(uint32_t w, uint32_t h);
     D3D12_CPU_DESCRIPTOR_HANDLE DepthOfFieldView(uint32_t mip, uint32_t target) {
         return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
             target * kDofLevels + mip, rtv_inc_);
     }
     void SetDepthOfFieldTarget(uint32_t mip, uint32_t w, uint32_t h);
+    D3D12_CPU_DESCRIPTOR_HANDLE DepthOfFieldLayerView(uint32_t view) {
+        return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
+            kDofLevels * kDofTargets + view, rtv_inc_);
+    }
+    void DepthOfFieldComposeViews(uint32_t slot, ID3D12Resource* scene, DXGI_FORMAT format);
     void DepthOfFieldViews(uint32_t slot, ID3D12Resource* depth, bool ms, ID3D12Resource* color,
                            DXGI_FORMAT color_format, uint32_t first_mip = 0, uint32_t mip_count = 0);
     void DepthOfFieldMipState(uint32_t mip, D3D12_RESOURCE_STATES state);
     void DepthOfFieldSkipped(uint32_t reason, const char* message);
+    void WeaponDepthOfField(const State& s, const float p[4], bool begin);
+    bool EnsureWeaponDofTargets(uint32_t w, uint32_t h);
+    D3D12_CPU_DESCRIPTOR_HANDLE WeaponDofView(uint32_t target) {
+        return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
+            kDofLevels * kDofTargets + kDofLayerViews + target, rtv_inc_);
+    }
+    void WeaponDofViews(uint32_t slot, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* color,
+                        DXGI_FORMAT format, bool pack, bool ms);
+    void WeaponDofSkipped(uint32_t reason, const char* message);
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
     // Draw, in call order, each callee right after its caller
@@ -1147,8 +1165,25 @@ private:
     ComPtr<ID3D12Resource> dof_filter_[kDofTargets];
     D3D12_RESOURCE_STATES dof_states_[kDofTargets][kDofLevels] = {};
     uint32_t dof_levels_ = 0;
+    ComPtr<ID3D12Resource> dof_layers_[kDofTargets];
+    D3D12_RESOURCE_STATES dof_layer_states_[kDofTargets] = {};
     uint32_t dof_skip_reported_ = 0;
     bool dof_reported_ = false;
+    struct WeaponDof {
+        ComPtr<ID3D12Resource> before;
+        D3D12_RESOURCE_STATES before_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        ComPtr<ID3D12Resource> packed[kDofTargets];
+        D3D12_RESOURCE_STATES packed_state[kDofTargets] = {};
+        ID3D12Resource* rt = nullptr;
+        ID3D12Resource* ds = nullptr;
+        Viewport viewport{};
+        float parameters[3] = {};
+        uint32_t serial = 0;
+        uint64_t frame = 0;
+        bool pending = false;
+        uint32_t skipped = 0;
+        bool reported = false;
+    } weapon_dof_;
     // surfaces locked without a wait: copies in flight, the newest finished one goes to guest memory
     struct Late {
         ComPtr<ID3D12Resource> rb[kFrames];
@@ -1277,7 +1312,8 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
 
 // RTVs: the targets' pool, then the back buffers, occlusion, output, SMAA and the DOF filter mips
 void D3D12Backend::CreateHeaps() {
-    constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets + kDofLevels * kDofTargets;
+    constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
+        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets;
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvTotal, false, rtv_heap_);
@@ -1794,16 +1830,23 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(const char* entry,
     if (!added) return pso.Get();
     std::string text;
     if (input_samples > 1) text = "#define MS 1\n#define DOF_SAMPLES " + std::to_string(input_samples) + "\n";
-    text += kDepthOfFieldHlsl;
+    if (!std::strcmp(entry, "depth_of_field")) text += "#define DOF_COMPOSE 1\n";
+    text += !std::strncmp(entry, "viewmodel_", 10) ? kViewmodelDofHlsl : kDepthOfFieldHlsl;
     uint64_t hash;
     ID3DBlob* vs = Compile(text, "vs", "vs_5_0", hash);
     ID3DBlob* ps = Compile(text, entry, "ps_5_0", hash);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, out);
     // Filter passes write color/coverage and depth. Only the final scene pass preserves destination alpha.
-    if (!std::strcmp(entry, "depth_of_field")) {
+    if (!std::strcmp(entry, "depth_of_field") || !std::strcmp(entry, "viewmodel_dof")) {
         d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED |
             D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    } else if (!std::strcmp(entry, "depth_of_field_gather")) {
+        d.NumRenderTargets = kDofLayerViews;
+        d.RTVFormats[1] = kDofFormats[0];
+        d.RTVFormats[2] = kDofFormats[1];
+        d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        d.BlendState.RenderTarget[2].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     } else {
         d.NumRenderTargets = kDofTargets;
         d.RTVFormats[1] = kDofFormats[1];
@@ -1841,6 +1884,56 @@ bool D3D12Backend::EnsureDepthOfFieldFilter(uint32_t w, uint32_t h) {
     }
     dof_levels_ = levels;
     return true;
+}
+
+bool D3D12Backend::EnsureDepthOfFieldLayers(uint32_t w, uint32_t h) {
+    if (dof_layers_[0] && dof_layers_[0]->GetDesc().Width == w && dof_layers_[0]->GetDesc().Height == h) return true;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    ComPtr<ID3D12Resource> layers[kDofTargets];
+    for (uint32_t target = 0; target < kDofTargets; target++) {
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kDofFormats[target], w, h);
+        td.DepthOrArraySize = target == 0 ? 2 : 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 nullptr, IID_PPV_ARGS(&layers[target])))) return false;
+    }
+    for (uint32_t target = 0; target < kDofTargets; target++) {
+        if (dof_layers_[target]) Release(std::move(dof_layers_[target]));
+        dof_layers_[target] = std::move(layers[target]);
+        dof_layer_states_[target] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    for (uint32_t view = 0; view < kDofLayerViews; view++) {
+        D3D12_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = kDofFormats[view < 2 ? 0 : 1];
+        if (view < 2) {
+            rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            rv.Texture2DArray.FirstArraySlice = view;
+            rv.Texture2DArray.ArraySize = 1;
+        } else {
+            rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        }
+        dev_->CreateRenderTargetView(dof_layers_[view < 2 ? 0 : 1].Get(), &rv, DepthOfFieldLayerView(view));
+    }
+    return true;
+}
+
+void D3D12Backend::DepthOfFieldComposeViews(uint32_t slot, ID3D12Resource* scene, DXGI_FORMAT format) {
+    ID3D12Resource* resources[4] = {dof_filter_[1].Get(), scene, dof_layers_[0].Get(), dof_layers_[1].Get()};
+    DXGI_FORMAT formats[4] = {kDofFormats[1], format, kDofFormats[0], kDofFormats[1]};
+    for (uint32_t i = 0; i < 4; i++) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = formats[i];
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (i == 2) {
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            sv.Texture2DArray.MipLevels = 1;
+            sv.Texture2DArray.ArraySize = 2;
+        } else {
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Texture2D.MipLevels = 1;
+        }
+        dev_->CreateShaderResourceView(resources[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    }
 }
 
 void D3D12Backend::SetDepthOfFieldTarget(uint32_t mip, uint32_t w, uint32_t h) {
@@ -1891,15 +1984,18 @@ void D3D12Backend::DepthOfFieldSkipped(uint32_t reason, const char* message) {
     LOGR("Reload DOF skipped: %s", message);
 }
 
-// Queued at the opaque-world boundary during reloads, when the game defers the weapon until after its effects.
-// p: projection m14, m10, original reload strength, focus distance. No settings or guest memory are read here.
+// Queued after world rendering during reloads, when the game defers the weapon until after its effects.
+// p: projection m14/m10, eased strength, focus, near/far scales, radius at 1080p, reserved.
 void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]) {
-    for (int i = 0; i < 4; i++) if (!std::isfinite(p[i])) {
+    for (int i = 0; i < 4 * kDepthOfFieldRects; i++) if (!std::isfinite(p[i])) {
         DepthOfFieldSkipped(0, "non-finite projection, strength or focus");
         return;
     }
     if (p[2] <= 0) return;
-    if (p[0] >= 0 || p[3] <= 0) {
+    float near_scale = std::clamp(p[4], 0.0f, 1.5f);
+    float far_scale = std::clamp(p[5], 0.0f, 1.5f);
+    if (near_scale == 0 && far_scale == 0) return;
+    if (p[0] >= 0 || p[3] <= 0 || p[6] <= 0) {
         DepthOfFieldSkipped(0, "unsupported perspective projection or focus");
         return;
     }
@@ -1919,23 +2015,26 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
         DepthOfFieldSkipped(2, "empty scene viewport");
         return;
     }
-    float radius = 18.0f * float(rect.bottom - rect.top) / 1080.0f * std::clamp(p[2], 0.0f, 1.0f);
+    float radius = std::clamp(p[6], 4.0f, 30.0f) * float(rect.bottom - rect.top) / 1080.0f * std::clamp(p[2], 0.0f, 1.0f);
     float zr = v.max_z - v.min_z;
-    const float c[8] = {p[0] * zr, v.min_z + p[1] * zr, p[3], radius,
-        float(rect.left), float(rect.top), float(rect.right - rect.left), float(rect.bottom - rect.top)};
+    const float c[12] = {p[0] * zr, v.min_z + p[1] * zr, std::clamp(p[3], 1.0f, 30.0f), radius,
+        float(rect.left), float(rect.top), float(rect.right - rect.left), float(rect.bottom - rect.top),
+        near_scale, far_scale, 0, 0};
     for (float value : c) if (!std::isfinite(value)) {
         DepthOfFieldSkipped(0, "non-finite derived shader constants");
         return;
     }
     uint32_t samples = Ms(*rt);
     ID3D12PipelineState* pso = EnsureDepthOfFieldPipeline("depth_of_field", rt->fmt, samples);
+    ID3D12PipelineState* gather_pso = EnsureDepthOfFieldPipeline("depth_of_field_gather", kDofFormats[0], 1);
     ID3D12PipelineState* pack_pso = EnsureDepthOfFieldPipeline("depth_of_field_pack", kDofFormats[0], 1, samples);
     ID3D12PipelineState* downsample_pso = EnsureDepthOfFieldPipeline("depth_of_field_downsample", kDofFormats[0], 1);
-    if (!pso || !pack_pso || !downsample_pso) {
+    if (!pso || !gather_pso || !pack_pso || !downsample_pso) {
         DepthOfFieldSkipped(3, "shader compilation or pipeline creation failed");
         return;
     }
-    if (!EnsureDepthOfFieldFilter(rt->w, rt->h)) {
+    uint32_t half_w = (rt->w + 1) / 2, half_h = (rt->h + 1) / 2;
+    if (!EnsureDepthOfFieldFilter(rt->w, rt->h) || !EnsureDepthOfFieldLayers(half_w, half_h)) {
         DepthOfFieldSkipped(4, "color/depth filter target allocation failed");
         return;
     }
@@ -1953,7 +2052,7 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
     DepthOfFieldMipState(0, D3D12_RESOURCE_STATE_RENDER_TARGET);
     uint32_t pack_slot = AllocSrvSlots(4);
     DepthOfFieldViews(pack_slot, ds->res.Get(), samples > 1, samples > 1 ? rt->res.Get() : source, rt->fmt);
-    // Every scratch pixel is initialized, including zero depth outside a partial scene viewport.
+    // Every scratch pixel is initialized with the viewport edge extended through the filter footprint.
     SetDepthOfFieldTarget(0, rt->w, rt->h);
     DrawFullScreen(pack_pso, cb.gpu, pack_slot);
     DepthOfFieldMipState(0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1968,8 +2067,19 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
         DrawFullScreen(downsample_pso, cb.gpu, mip_slot);
         DepthOfFieldMipState(mip, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+    uint32_t gather_slot = AllocSrvSlots(4);
+    DepthOfFieldViews(gather_slot, nullptr, false, source, rt->fmt, 0, dof_levels_);
+    for (uint32_t target = 0; target < kDofTargets; target++)
+        Transition(dof_layers_[target].Get(), dof_layer_states_[target], D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE layer_views[kDofLayerViews] = {
+        DepthOfFieldLayerView(0), DepthOfFieldLayerView(1), DepthOfFieldLayerView(2)};
+    cl_->OMSetRenderTargets(kDofLayerViews, layer_views, FALSE, nullptr);
+    SetFullViewport(half_w, half_h);
+    DrawFullScreen(gather_pso, cb.gpu, gather_slot);
+    for (uint32_t target = 0; target < kDofTargets; target++)
+        Transition(dof_layers_[target].Get(), dof_layer_states_[target], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     uint32_t slot = AllocSrvSlots(4);
-    DepthOfFieldViews(slot, nullptr, false, source, rt->fmt, 0, dof_levels_);
+    DepthOfFieldComposeViews(slot, source, rt->fmt);
     Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     SetBlitTarget(Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h);
     cl_->RSSetScissorRects(1, &rect);
@@ -1978,10 +2088,157 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
     if (!dof_reported_) {
         dof_reported_ = true;
         LOGR("Reload DOF active: %ux%u, %ux MSAA, focus %.2f world units, radius %.3fpx, strength %.4f, "
-             "z %.6f/(depth-%.6f), 64+32 taps, %u filter mips",
-             rt->w, rt->h, samples, p[3], radius, p[2], c[0], c[1], dof_levels_);
+             "z %.6f/(depth-%.6f), near %.2f far %.2f, %ux%u gather 64+32 taps, %u filter mips",
+             rt->w, rt->h, samples, c[2], radius, p[2], c[0], c[1], near_scale, far_scale, half_w, half_h, dof_levels_);
     }
     if (cap_) fprintf(cap_, "%04u depth of field rt %08X ds %08X strength %.3f\n", cap_i_++, s.rt.data, s.zs.data, p[2]);
+}
+
+bool D3D12Backend::EnsureWeaponDofTargets(uint32_t w, uint32_t h) {
+    auto& weapon = weapon_dof_;
+    if (weapon.packed[0] && weapon.packed[0]->GetDesc().Width == w && weapon.packed[0]->GetDesc().Height == h) return true;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    ComPtr<ID3D12Resource> targets[kDofTargets];
+    for (uint32_t i = 0; i < kDofTargets; i++) {
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kDofFormats[i], w, h);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 nullptr, IID_PPV_ARGS(&targets[i])))) return false;
+    }
+    for (uint32_t i = 0; i < kDofTargets; i++) {
+        if (weapon.packed[i]) Release(std::move(weapon.packed[i]));
+        weapon.packed[i] = std::move(targets[i]);
+        weapon.packed_state[i] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        dev_->CreateRenderTargetView(weapon.packed[i].Get(), nullptr, WeaponDofView(i));
+    }
+    return true;
+}
+
+void D3D12Backend::WeaponDofViews(uint32_t slot, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* color,
+                                DXGI_FORMAT format, bool pack, bool ms) {
+    ID3D12Resource* resources[4] = {a, b, color, nullptr};
+    DXGI_FORMAT formats[4] = {pack ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kDofFormats[0],
+        pack ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kDofFormats[1], format, kBgra};
+    for (uint32_t i = 0; i < 4; i++) {
+        bool multisampled = pack && ms && i < 3;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = formats[i];
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.ViewDimension = multisampled ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+        if (!multisampled) sv.Texture2D.MipLevels = 1;
+        dev_->CreateShaderResourceView(resources[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    }
+}
+
+void D3D12Backend::WeaponDofSkipped(uint32_t reason, const char* message) {
+    if (weapon_dof_.skipped & (1u << reason)) return;
+    weapon_dof_.skipped |= 1u << reason;
+    LOGR("Weapon DOF skipped: %s", message);
+}
+
+void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4], bool begin) {
+    auto& weapon = weapon_dof_;
+    bool pending = weapon.pending;
+    weapon.pending = false;  // An End consumes a snapshot exactly once, including mismatches and failures.
+    if (!begin && !pending) return;
+    // The serial is an opaque bit pattern; some valid serials encode NaN/Inf as a float.
+    uint32_t serial = std::bit_cast<uint32_t>(p[3]);
+    if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) || p[0] >= 0) {
+        WeaponDofSkipped(0, "invalid projection or amount");
+        return;
+    }
+    if (p[2] <= 0) return;
+    Target* rt = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    if (!OcclusionFits(rt, ds) || !rt->drawn || !ds->drawn) {
+        WeaponDofSkipped(1, "scene targets unavailable or incompatible");
+        return;
+    }
+    const Viewport& v = s.viewport;
+    if (!std::isfinite(v.min_z) || !std::isfinite(v.max_z) || v.max_z <= v.min_z) return;
+    D3D12_RECT rect = ViewRect(v, *rt);
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
+    if (begin) {
+        const auto desc = ds->res->GetDesc();
+        if (!weapon.before || weapon.before->GetDesc().Width != desc.Width || weapon.before->GetDesc().Height != desc.Height ||
+            weapon.before->GetDesc().Format != desc.Format || weapon.before->GetDesc().SampleDesc.Count != desc.SampleDesc.Count ||
+            weapon.before->GetDesc().SampleDesc.Quality != desc.SampleDesc.Quality) {
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            ComPtr<ID3D12Resource> before;
+            if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                     nullptr, IID_PPV_ARGS(&before)))) {
+                WeaponDofSkipped(2, "depth snapshot allocation failed");
+                return;
+            }
+            if (weapon.before) Release(std::move(weapon.before));
+            weapon.before = std::move(before);
+            weapon.before_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+        Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(weapon.before.Get(), weapon.before_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl_->CopyResource(weapon.before.Get(), ds->res.Get());
+        Transition(weapon.before.Get(), weapon.before_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        weapon.rt = rt->res.Get();
+        weapon.ds = ds->res.Get();
+        weapon.viewport = v;
+        std::memcpy(weapon.parameters, p, sizeof(weapon.parameters));
+        weapon.serial = serial;
+        weapon.frame = frame_;
+        weapon.pending = true;
+        return;
+    }
+    const Viewport& saved = weapon.viewport;
+    if (weapon.serial != serial || weapon.frame != frame_ || weapon.rt != rt->res.Get() || weapon.ds != ds->res.Get() ||
+        saved.x != v.x || saved.y != v.y || saved.w != v.w || saved.h != v.h || saved.min_z != v.min_z || saved.max_z != v.max_z ||
+        std::memcmp(weapon.parameters, p, sizeof(weapon.parameters))) {
+        WeaponDofSkipped(3, "unmatched snapshot serial, frame, viewport or targets");
+        return;
+    }
+    uint32_t samples = Ms(*rt);
+    auto* pack = EnsureDepthOfFieldPipeline("viewmodel_dof_pack", kDofFormats[0], 1, samples);
+    auto* compose = EnsureDepthOfFieldPipeline("viewmodel_dof", rt->fmt, samples);
+    if (!pack || !compose || !EnsureWeaponDofTargets(rt->w, rt->h)) {
+        WeaponDofSkipped(2, "pipeline or packed target creation failed");
+        return;
+    }
+    ID3D12Resource* scene = Feedback(*rt);
+    if (!scene) {
+        WeaponDofSkipped(2, "scene snapshot allocation failed");
+        return;
+    }
+    float zr = v.max_z - v.min_z;
+    const float c[8] = {p[0] * zr, v.min_z + p[1] * zr, std::clamp(p[2], 0.0f, 1.0f),
+        float(rect.bottom - rect.top) / 1080.0f, float(rect.left), float(rect.top),
+        float(rect.right - rect.left), float(rect.bottom - rect.top)};
+    for (float value : c) if (!std::isfinite(value)) return;
+    Alloc cb = Upload(256, 256);
+    std::memcpy(cb.cpu, c, sizeof(c));
+    bound_rt_ = bound_ds_ = nullptr;
+    Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    for (uint32_t i = 0; i < kDofTargets; i++)
+        Transition(weapon.packed[i].Get(), weapon.packed_state[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
+    uint32_t pack_slot = AllocSrvSlots(4);
+    WeaponDofViews(pack_slot, ds->res.Get(), weapon.before.Get(), rt->res.Get(), rt->fmt, true, samples > 1);
+    D3D12_CPU_DESCRIPTOR_HANDLE views[kDofTargets] = {WeaponDofView(0), WeaponDofView(1)};
+    cl_->OMSetRenderTargets(kDofTargets, views, FALSE, nullptr);
+    SetFullViewport(rt->w, rt->h);
+    DrawFullScreen(pack, cb.gpu, pack_slot);
+    for (uint32_t i = 0; i < kDofTargets; i++)
+        Transition(weapon.packed[i].Get(), weapon.packed_state[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    uint32_t compose_slot = AllocSrvSlots(4);
+    WeaponDofViews(compose_slot, weapon.packed[0].Get(), weapon.packed[1].Get(), scene, rt->fmt, false, false);
+    SetBlitTarget(Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h);
+    cl_->RSSetScissorRects(1, &rect);
+    DrawFullScreen(compose, cb.gpu, compose_slot);
+    rt->drawn = true;
+    if (!weapon.reported) {
+        weapon.reported = true;
+        LOGR("Weapon DOF active: %ux%u, %ux MSAA, amount %.3f, paired depth snapshot", rt->w, rt->h, samples, c[2]);
+    }
 }
 
 // the pixels the CPU changed since the last Sync, opaque, the rest 0; t.read takes them
@@ -3276,6 +3533,13 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
+    if (flags & (kClearWeaponDofBegin | kClearWeaponDofEnd)) {
+        if (count != kWeaponDofRects || !rects) { weapon_dof_.pending = false; return; }
+        float p[4];
+        std::memcpy(p, rects, sizeof(p));
+        WeaponDepthOfField(s, p, (flags & kClearWeaponDofBegin) != 0);
+        return;
+    }
     if (flags & kClearDepthOfField) {
         if (count != kDepthOfFieldRects || !rects) return;
         float p[4 * kDepthOfFieldRects];
@@ -3899,6 +4163,7 @@ void LogPerf() {
 }
 
 void D3D12Backend::Present(const Surface& front) {
+    weapon_dof_.pending = false;
     PerfScope perf_present{g_perf.present};
     if (cap_) {
         FinishCapture(front);

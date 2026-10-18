@@ -2,6 +2,7 @@
 // Resource creation, locking and the XG helpers stay recompiled: they only manage memory.
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -303,17 +304,43 @@ void Occlusion(const float* m, bool gtao) {
     g_backend->Clear(g_state, gpu::kOcclusionRects, rects, gpu::kClearOcclusion, 0, 0, 0);
 }
 
+static bool DepthOfFieldTarget(const float* m) {
+    return g_backend && m && m[11] == 1.0f && m[15] == 0.0f && std::isfinite(m[14]) &&
+           std::isfinite(m[10]) && m[14] < 0 && g_state.rt.header && g_state.zs.header &&
+           g_state.viewport.w && g_state.viewport.h && std::isfinite(g_state.viewport.min_z) &&
+           std::isfinite(g_state.viewport.max_z) && g_state.viewport.max_z > g_state.viewport.min_z;
+}
+
 bool DepthOfField(const float* m, float strength) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (!g_backend || !m || m[11] != 1.0f || m[15] != 0.0f || !std::isfinite(m[14]) ||
-        !std::isfinite(m[10]) || m[14] >= 0 || !std::isfinite(strength) || strength <= 0 ||
-        !g_state.rt.header || !g_state.zs.header || !g_state.viewport.w || !g_state.viewport.h ||
-        !std::isfinite(g_state.viewport.min_z) || !std::isfinite(g_state.viewport.max_z) ||
-        g_state.viewport.max_z <= g_state.viewport.min_z) return false;
-    const float p[4] = {m[14], m[10], std::clamp(strength, 0.0f, 1.0f), 5.0f};
+    if (!DepthOfFieldTarget(m) || !std::isfinite(strength) || strength <= 0) return false;
+    const auto& options = game::Opt();
+    const float p[4 * gpu::kDepthOfFieldRects] = {
+        m[14], m[10], std::clamp(strength, 0.0f, 1.0f),
+        float(std::clamp(options.dof_focus_distance, 1u, 30u)),
+        float(std::min(options.dof_near_strength, 150u)) / 100.0f,
+        float(std::min(options.dof_far_strength, 150u)) / 100.0f,
+        float(std::clamp(options.dof_bokeh_radius, 4u, 30u)), 0.0f};
     g_backend->Clear(g_state, gpu::kDepthOfFieldRects, reinterpret_cast<const uint8_t*>(p),
                      gpu::kClearDepthOfField, 0, 0, 0);
     return true;
+}
+
+static bool QueueWeaponDepthOfField(const float* m, float strength, uint32_t serial, uint32_t marker) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!DepthOfFieldTarget(m) || !std::isfinite(strength) || strength <= 0) return false;
+    const float p[4 * gpu::kWeaponDofRects] = {
+        m[14], m[10], std::clamp(strength, 0.0f, 1.0f), std::bit_cast<float>(serial)};
+    g_backend->Clear(g_state, gpu::kWeaponDofRects, reinterpret_cast<const uint8_t*>(p), marker, 0, 0, 0);
+    return true;
+}
+
+bool BeginWeaponDepthOfField(const float* projection, float strength, uint32_t serial) {
+    return QueueWeaponDepthOfField(projection, strength, serial, gpu::kClearWeaponDofBegin);
+}
+
+bool EndWeaponDepthOfField(const float* projection, float strength, uint32_t serial) {
+    return QueueWeaponDepthOfField(projection, strength, serial, gpu::kClearWeaponDofEnd);
 }
 
 }  // namespace d3d
