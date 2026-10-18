@@ -122,23 +122,15 @@ def native_texture(disc, entry):
     return Image.open(io.BytesIO(dds + pixels)).convert('RGBA')
 
 
-def write_dds(image, alpha, destination, opacity=False):
+def write_dds(image, alpha, destination):
     """Encode BC3 with complete mips; opacity/specular values retain Xbox semantics."""
     w, h = image.size
     chunks = []
     header = None
     rgb = image.convert('RGB')
-    if opacity:
-        rgba = rgb.convert('RGBA')
-        rgba.putalpha(alpha.resize(image.size, Image.Resampling.LANCZOS))
     while True:
-        if opacity:
-            # Filter in premultiplied space so hidden white pixels do not
-            # bleed into the visible edges of transparent menu artwork.
-            level = rgba.resize((w, h), Image.Resampling.LANCZOS)
-        else:
-            level = rgb.resize((w, h), Image.Resampling.LANCZOS).convert('RGBA')
-            level.putalpha(alpha.resize((w, h), Image.Resampling.LANCZOS))
+        level = rgb.resize((w, h), Image.Resampling.LANCZOS).convert('RGBA')
+        level.putalpha(alpha.resize((w, h), Image.Resampling.LANCZOS))
         data = io.BytesIO()
         level.save(data, format='DDS', pixel_format='DXT5')
         block = data.getvalue()
@@ -178,25 +170,8 @@ def main():
                 raise ValueError('Replacement path outside the mod directory')
             with Image.open(mod_path) as replacement:
                 replacement = replacement.convert('RGBA')
-                if 'patches' in entry:
-                    # Logos share pages with Xbox-specific UI. Replace only
-                    # reviewed rectangles and preserve the rest of that page.
-                    canvas = original.resize(tuple(entry['output_size']), Image.Resampling.LANCZOS)
-                    sx, sy = canvas.width / original.width, canvas.height / original.height
-                    for patch in entry['patches']:
-                        target = tuple(round(v * (sx if i % 2 == 0 else sy))
-                                       for i, v in enumerate(patch['target']))
-                        part = replacement.crop(tuple(patch['source'])).resize(
-                            (target[2] - target[0], target[3] - target[1]), Image.Resampling.LANCZOS)
-                        canvas.paste(part, target[:2])
-                    replacement = canvas
-                opacity = entry.get('alpha') == 'mod'
-                alpha = replacement.getchannel('A') if opacity else original.getchannel('A')
-                if opacity and alpha.getextrema()[1] <= 128:
-                    # PS2 opacity is commonly stored in the 0..128 range.
-                    alpha = alpha.point(lambda value: min(255, value * 2))
-                write_dds(replacement, alpha, destination, opacity)
-            imported.append({k:entry[k] for k in ('key', 'name', 'mod', 'alpha', 'patches') if k in entry})
+                write_dds(replacement, original.getchannel('A'), destination)
+            imported.append({k:entry[k] for k in ('key', 'name', 'mod', 'alpha') if k in entry})
         except Exception as error:
             failed.append({'key':entry['key'], 'name':entry['name'], 'error':str(error)})
         if i % 25 == 0 or i+1 == len(entries):

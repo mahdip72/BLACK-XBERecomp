@@ -1,9 +1,9 @@
 {
-  "scope": "Fonts, menu map/loading graphics and BLACK logos only",
-  "menu_texture_variants": 14,
+  "scope": "Fonts and menu map/loading graphics only; original BLACK logos",
+  "menu_texture_variants": 11,
   "font_atlases": 2,
   "world_weapon_character_effect_replacements": false,
-  "visual_test_after_scope_change": false,
+  "visual_test_after_scope_change": true,
   "assets": [
     {
       "key": "d68ec420ac0233fc",
@@ -81,32 +81,12 @@
       "mod": "7ae0ba6542e4fa9-5a84d517a8ffbd6e-000061d3.dds",
       "source": "export/frontend/Loading.bin",
       "mode": "menu page"
-    },
-    {
-      "key": "6162eed11cd6e0cc",
-      "name": "BLACK logo - FEMain.bin",
-      "mod": "25598a6f713340d5-70e6c84b822c5231-00002213.dds",
-      "source": "export/frontend/FEMain.bin",
-      "mode": "logo region patches"
-    },
-    {
-      "key": "78056dd5fcb8f533",
-      "name": "BLACK logo - Common.bin",
-      "mod": "42c4e9f8d51e56c7-559b3d2a3362506a-00006213.dds",
-      "source": "export/frontend/Common.bin",
-      "mode": "logo region patches"
-    },
-    {
-      "key": "2eecbbe36583a13c",
-      "name": "BLACK logo - Core.bin",
-      "mod": "42c4e9f8d51e56c7-559b3d2a3362506a-00006213.dds",
-      "source": "export/frontend/Core.bin",
-      "mode": "logo region patches"
     }
   ],
   "fonts": [
     "90e4dbc2b70dbdb0-94742894391acc0a-00002213.dds",
     "69d81114d84a8ba9-5f8f8c1f98775ed7-000021d3.dds"
   ],
-  "note": "Unchanged menu icons and Xbox button diagrams retain original artwork. Mod branding and social-media graphics are outside the selected logo regions."
+  "note": "Fonts and menu graphics were accepted in visual testing. Logo replacements were removed after review. Other menu icons and Xbox button diagrams retain original artwork.",
+  "original_black_logos": true
 }
