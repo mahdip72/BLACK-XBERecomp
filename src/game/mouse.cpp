@@ -107,10 +107,17 @@ void StickLook(X86Context& ctx, uint8_t*) {
     ctx.xmm[0].f[0] *= game::Opt().controller_sensitivity;
 }
 
-// ebx the player's controller past the game's toggle aim, scopes and all
+// the game drops the aim of a weapon whose zoom is 1 each frame (0x1BB143)
+static bool CanAim(uint32_t weapon) {
+    uint32_t data = R32(weapon + kWeaponData);
+    return data && G<float>(data + kDataAimZoom) != 1.0f;
+}
+
+// ebx the player's controller past the game's toggle aim, scopes and all, [esp+0x18] the weapon.
+// A toggle on a weapon that cannot aim would stay on and aim the next weapon.
 void HoldAim(X86Context& ctx, uint8_t*) {
     bool hold = input::KeyboardActive() ? game::Opt().hold_aim : game::Opt().controller_hold_aim;
-    if (!hold) return;
+    if (!hold && CanAim(R32(ctx.esp + 0x18))) return;
     G<uint8_t>(ctx.ebx + kControllerAimWanted) = G<uint8_t>(ctx.ebx + kControllerAimHeld);
 }
 

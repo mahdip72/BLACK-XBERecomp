@@ -150,10 +150,8 @@ void MenuTick(X86Context& ctx, uint8_t*) {
 // what a step made once a frame at 30 becomes over the real frame: factor to the power of this
 static float FrameShare() { return FrameTime() / G<float>(kGameFrameTime); }
 
-// weapon and its data
-constexpr uint32_t kWeaponData = 0xEC;
+// weapon
 constexpr uint32_t kWeaponOwner = 0xF0;
-constexpr uint32_t kDataAimZoom = 0xB4;
 // player
 constexpr uint32_t kPlayerForward = 0xF0;
 constexpr uint32_t kPlayerEye = 0x100;
