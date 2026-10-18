@@ -547,9 +547,9 @@ call = "OptionsMenu"
 at = 0x124374
 call = "ExitMenu"
 
-# src/game/exit_menu.cpp, a page loaded, before its Prepare
+# src/game/exit_menu.cpp, the Flash sound callback
 [[hook]]
-at = 0x12466D
+at = 0x11A610
 call = "ExitMenuSounds"
 
 [[hook]]
