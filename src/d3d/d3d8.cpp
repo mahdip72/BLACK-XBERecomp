@@ -14,6 +14,7 @@
 #include "common/options.h"
 #include "core/diag.h"
 #include "d3d/depth_of_field.h"
+#include "d3d/dof_loading.h"
 #include "d3d/gpu_frame.h"
 #include "d3d/occlusion.h"
 #include "d3d/particle_dof.h"
@@ -349,6 +350,39 @@ bool BeginWeaponDepthOfField(const float* projection, float strength, uint32_t s
 bool EndWeaponDepthOfField(const float* projection, float strength, uint32_t serial,
                            float sharp_depth, float transition) {
     return QueueWeaponDepthOfField(projection, strength, serial, sharp_depth, transition, gpu::kClearWeaponDofEnd);
+}
+
+uint64_t BeginMissionDofPreparation() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    static uint64_t next_generation = 0;
+    if (!g_backend || next_generation == UINT64_MAX) return 0;
+    const uint64_t generation = ++next_generation;
+    gpu::g_dof_loading_requested_generation.store(generation, std::memory_order_release);
+    const gpu::DofLoadingMarker marker{generation, 1, 0};
+    try {
+        g_backend->Clear(g_state, 1, reinterpret_cast<const uint8_t*>(&marker),
+                         gpu::kClearDofLoading, 0, 0, 0);
+    } catch (...) {
+        gpu::g_dof_loading_requested_generation.store(0, std::memory_order_release);
+        return 0;
+    }
+    return generation;
+}
+
+void EndMissionDofPreparation(uint64_t generation) {
+    if (!generation) return;
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint64_t expected = generation;
+    if (!gpu::g_dof_loading_requested_generation.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel)) return;
+    if (!g_backend) return;
+    const gpu::DofLoadingMarker marker{generation, 0, 0};
+    try {
+        g_backend->Clear(g_state, 1, reinterpret_cast<const uint8_t*>(&marker),
+                         gpu::kClearDofLoading, 0, 0, 0);
+    } catch (...) {
+        // The atomic cancellation also rejects a queued begin if its end could not be recorded.
+    }
 }
 
 }  // namespace d3d

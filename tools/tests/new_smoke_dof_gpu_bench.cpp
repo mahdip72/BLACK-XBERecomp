@@ -10,10 +10,14 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -23,6 +27,7 @@
 #include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_clear.h"
 #include "d3d/particle_dof_geometry.h"
+#include "d3d/particle_dof_small_radius.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "gpu/shaders.h"
 namespace smoke_v25 {
@@ -37,10 +42,16 @@ using ::gpu::kTexWide;
 #include "reference/v25d4110/particle_dof_wrapper.h"
 #undef ParticleDofNativePixelKey
 }
+namespace smoke_f543 {
+#include "reference/f543f54/particle_dof_shader.h"
+}
 using Microsoft::WRL::ComPtr;
 
 namespace {
-constexpr uint32_t W = 1280, H = 720, Samples = 8, Quads = 12, Batches = 4, AtlasExtent = 2048;
+uint32_t W = 1280, H = 720, AtlasExtent = 2048;
+float TargetRadius = 4.0f;
+UINT CandidateOptimization=D3DCOMPILE_OPTIMIZATION_LEVEL1;
+constexpr uint32_t Samples = 8, Quads = 12, Batches = 4;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
 void Hr(HRESULT value, const char* what) {
     if (FAILED(value)) {
@@ -50,11 +61,13 @@ void Hr(HRESULT value, const char* what) {
         throw std::runtime_error(message);
     }
 }
-ComPtr<ID3DBlob> Compile(const std::string& source, const char* entry, const char* profile) {
+ComPtr<ID3DBlob> Compile(const std::string& source, const char* entry, const char* profile,
+                        UINT optimization=D3DCOMPILE_OPTIMIZATION_LEVEL1) {
     Require(!source.empty(), "native smoke wrapper rejected production source");
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "particle GPU benchmark",
-        nullptr, nullptr, entry, profile, D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &errors);
+        nullptr, nullptr, entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | optimization,
+        0, &code, &errors);
     if (FAILED(hr) && errors)
         std::fprintf(stderr, "%s/%s: %s\n", entry, profile,
             static_cast<const char*>(errors->GetBufferPointer()));
@@ -81,7 +94,10 @@ D3D12_RESOURCE_DESC TextureDesc(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; d.Flags = flags;
     return d;
 }
-enum class Mode { Native, V25, Atlas };
+enum class Mode { Native, V25, Atlas, Candidate };
+bool UsesAtlas(Mode mode) {
+    return mode==Mode::Atlas || mode==Mode::Candidate;
+}
 struct Intervals { double copy = 0, range = 0, prepare = 0, filter = 0,
                    composite = 0, total = 0; };
 struct Result { Intervals ms; std::vector<uint16_t> rgba; };
@@ -101,7 +117,7 @@ public:
                 SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0,
                                             __uuidof(ID3D12Device), nullptr))) {
                 adapter_ = candidate;
-                std::wprintf(L"GPU: %ls; vendor %04X device %04X LUID %08lX:%08lX\n",
+                std::printf("GPU: %ls; vendor %04X device %04X LUID %08lX:%08lX\n",
                              desc.Description,desc.VendorId,desc.DeviceId,
                              DWORD(desc.AdapterLuid.HighPart),desc.AdapterLuid.LowPart);
                 break;
@@ -119,6 +135,8 @@ public:
         queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         Hr(device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue_)), "CreateCommandQueue");
         Hr(queue_->GetTimestampFrequency(&frequency_), "GetTimestampFrequency");
+        std::printf("D3D12 direct-queue timestamp frequency %llu Hz\n",
+                    static_cast<unsigned long long>(frequency_));
         Hr(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
         event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         Require(event_ != nullptr, "CreateEvent failed");
@@ -145,7 +163,7 @@ public:
         auto target = MakeTexture(TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
         ComPtr<ID3D12Resource> source_atlas, filtered_atlas;
-        if (mode == Mode::Atlas) {
+        if (UsesAtlas(mode)) {
             const auto desc = TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 1, AtlasExtent, AtlasExtent);
             source_atlas = MakeTexture(desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -232,7 +250,7 @@ public:
             list->ResourceBarrier(1, &barrier); state = next;
         };
         for (uint32_t batch = 0; batch < Batches; ++batch) {
-            if (mode != Mode::Atlas) {
+            if (!UsesAtlas(mode)) {
                 timed(composites, [&] {
                     list->SetPipelineState(mode == Mode::Native ? native_pso_.Get() : old_pso_.Get());
                     list->OMSetRenderTargets(1, &descriptors.target_rtv, FALSE, nullptr);
@@ -259,14 +277,17 @@ public:
                     transition(source_atlas.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 });
                 timed(filters, [&] {
-                    transition(filtered_atlas.Get(), filtered_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    transition(filtered_atlas.Get(), filtered_state,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
                     list->SetGraphicsRootDescriptorTable(0, descriptors.filter_srv);
                     list->SetGraphicsRootConstantBufferView(1, radii_cb_->GetGPUVirtualAddress());
                     list->SetGraphicsRootConstantBufferView(2, page_cb);
-                    list->SetPipelineState(filter_pso_.Get());
+                    list->SetPipelineState(mode==Mode::Candidate ? candidate_pso_.Get() :
+                                           filter_pso_.Get());
                     list->OMSetRenderTargets(1, &descriptors.filtered_rtv, FALSE, nullptr);
                     list->DrawInstanced(6, page.quad_count, 0, 0);
-                    transition(filtered_atlas.Get(), filtered_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    transition(filtered_atlas.Get(), filtered_state,
+                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 });
                 timed(composites, [&] {
                     list->RSSetViewports(1, &viewport);
@@ -443,18 +464,26 @@ private:
                                 gpu::kParticleDofDepthRangeHlsl;
         const auto range_vs=Compile(range_source,"vs","vs_5_0");
         const auto range_ps=Compile(range_source,"range_ps","ps_5_0");
-        const auto filter_vs=Compile(gpu::kParticleDofAtlasFilterHlsl,"vs","vs_5_0");
-        const auto filter_ps=Compile(gpu::kParticleDofAtlasFilterHlsl,"filter_ps","ps_5_0");
+        const auto filter_vs=Compile(smoke_f543::gpu::kParticleDofAtlasFilterHlsl,"vs","vs_5_0");
+        const auto filter_ps=Compile(smoke_f543::gpu::kParticleDofAtlasFilterHlsl,
+                                     "filter_ps","ps_5_0");
+        const auto candidate_ps=Compile(gpu::ParticleDofAtlasFilterSource(true,true),
+                                        "filter_ps","ps_5_0",CandidateOptimization);
         native_pso_=Pipeline(native_vertex.Get(),native_pixel.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
         old_pso_=Pipeline(old_vs.Get(),old_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
         source_pso_=Pipeline(source_vs.Get(),source_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,false,true);
         filter_pso_=Pipeline(filter_vs.Get(),filter_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,false,false);
+        candidate_pso_=Pipeline(filter_vs.Get(),candidate_ps.Get(),
+                                DXGI_FORMAT_R16G16B16A16_FLOAT,false,false);
         composite_pso_=Pipeline(composite_vs.Get(),composite_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
         range_pso_=Pipeline(range_vs.Get(),range_ps.Get(),DXGI_FORMAT_R32G32_FLOAT,false,false);
     }
     void MakeFixture() {
         gpu::ParticleDofGeometryParams p{};
-        p.globals.optics[0]=5;p.globals.optics[1]=16;
+        p.globals.optics[0]=5;
+        // For the fixture's z=3 plane, the production radius formula is
+        // (abs(3-5)-0.15*5)/3 = 5/12 times the base radius.
+        p.globals.optics[1]=TargetRadius*2.4f;
         p.globals.optics[2]=1;p.globals.optics[3]=.45f;
         p.globals.viewport[2]=p.globals.target[0]=p.guest_size[0]=float(W);
         p.globals.viewport[3]=p.globals.target[1]=p.guest_size[1]=float(H);
@@ -462,13 +491,16 @@ private:
         p.c97[2]=1;p.c98[0]=p.c98[1]=p.c98[3]=1;p.c98[2]=-1;
         std::vector<gpu::NativeParticleVertex> native;
         for (uint32_t q=0;q<Quads;++q) {
-            const float x=260+float(q%4)*5, y=120+float(q/4)*5;
+            const float x=(260+float(q%4)*5)*float(W)/1280.0f;
+            const float y=(120+float(q/4)*5)*float(H)/720.0f;
+            const float quad_width=760.0f*float(W)/1280.0f;
+            const float quad_height=480.0f*float(H)/720.0f;
             const float z=1.0f/3.0f;
             const uint32_t color=0x38FFE0C0;
             native.push_back({{x,y,z,2.25f},color,{0,0},0});
-            native.push_back({{x,y+480,z,2.25f},color,{0,1},0});
-            native.push_back({{x+760,y+480,z,2.25f},color,{1,1},0});
-            native.push_back({{x+760,y,z,2.25f},color,{1,0},0});
+            native.push_back({{x,y+quad_height,z,2.25f},color,{0,1},0});
+            native.push_back({{x+quad_width,y+quad_height,z,2.25f},color,{1,1},0});
+            native.push_back({{x+quad_width,y,z,2.25f},color,{1,0},0});
             const uint16_t k=uint16_t(q*4);
             indices_.insert(indices_.end(),{k,uint16_t(k+1),uint16_t(k+2),
                                               k,uint16_t(k+2),uint16_t(k+3)});
@@ -497,7 +529,7 @@ private:
         vcb_=Upload(vc.data(),sizeof(vc));
         gpu::DrawConstants dc{};
         dc.surf[0]=float(W);dc.surf[1]=float(H);dc.surf[2]=1;
-        dc.misc[1]=7;dc.texsize[0][0]=dc.texsize[0][1]=1;
+        dc.misc[1]=7;dc.texsize[0][0]=dc.texsize[0][1]=32;
         // v25d4110 has a 48-byte globals block and 32-byte quad records. Never memcpy the current stride.
         constexpr size_t old_globals=48, old_quad=32;
         static_assert(sizeof(gpu::DrawConstants)==2080);
@@ -530,16 +562,25 @@ private:
             Require(!rectangles.empty(),"benchmark page contains no source cells");
             page_rects_.push_back(std::move(rectangles));
         }
-        std::printf("Fixture: %u quads, %u batches, %zu production atlas pages at %ux%u; "
+        std::printf("Fixture: %ux%u, actual radius %.3f px, %u quads, %u batches, "
+                    "%zu production atlas pages at %ux%u; "
                     "%llu allocated texels/page-set (guards included); R16G16B16A16_FLOAT atlas\n",
-                    Quads,Batches,pages_.size(),AtlasExtent,AtlasExtent,
+                    W,H,TargetRadius,Quads,Batches,pages_.size(),AtlasExtent,AtlasExtent,
                     static_cast<unsigned long long>(atlas_pixels));
-        // 1x1 opaque RGBA texture is immutable across all three timed modes.
+        // The same colored, partially transparent material is used by every mode.
         texture_=MakeTexture(TextureDesc(DXGI_FORMAT_R8G8B8A8_UNORM,
-            D3D12_RESOURCE_FLAG_NONE,1,1,1),D3D12_RESOURCE_STATE_COPY_DEST);
-        std::array<uint8_t,256> texel{};
-        texel[0]=texel[1]=texel[2]=texel[3]=255;
-        auto staging=Upload(texel.data(),texel.size());
+            D3D12_RESOURCE_FLAG_NONE,1,32,32),D3D12_RESOURCE_STATE_COPY_DEST);
+        std::array<uint8_t,256*32> texels{};
+        for (uint32_t y=0;y<32;++y)
+            for (uint32_t x=0;x<32;++x) {
+                const uint32_t hash=(x*71u+y*131u+x*y*19u)^((x+y*3u)<<4);
+                const size_t offset=size_t(y)*256+x*4;
+                texels[offset]=uint8_t(32+(hash&223u));
+                texels[offset+1]=uint8_t(16+((hash>>8)&239u));
+                texels[offset+2]=uint8_t((hash>>16)&255u);
+                texels[offset+3]=(x==16 && y==16)?255:uint8_t((hash>>2)&127u);
+            }
+        auto staging=Upload(texels.data(),texels.size());
         ComPtr<ID3D12CommandAllocator> a;ComPtr<ID3D12GraphicsCommandList> l;
         Hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&a)),"Tex allocator");
         Hr(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,a.Get(),nullptr,
@@ -548,7 +589,7 @@ private:
         dst.pResource=texture_.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src.pResource=staging.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Footprint.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-        src.PlacedFootprint.Footprint.Width=src.PlacedFootprint.Footprint.Height=1;
+        src.PlacedFootprint.Footprint.Width=src.PlacedFootprint.Footprint.Height=32;
         src.PlacedFootprint.Footprint.Depth=1;src.PlacedFootprint.Footprint.RowPitch=256;
         l->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
         auto b=Barrier(texture_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
@@ -613,7 +654,8 @@ private:
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<ID3D12Fence> fence_;
     ComPtr<ID3D12RootSignature> root_;
-    ComPtr<ID3D12PipelineState> native_pso_,old_pso_,source_pso_,filter_pso_,composite_pso_,range_pso_;
+    ComPtr<ID3D12PipelineState> native_pso_,old_pso_,source_pso_,filter_pso_,candidate_pso_,
+                                 composite_pso_,range_pso_;
     ComPtr<ID3D12Resource> native_vb_,vb_,ib_,vcb_,old_dcb_,radii_cb_,texture_;
     std::vector<ComPtr<ID3D12Resource>> page_dcbs_;
     std::vector<gpu::ParticleDofAtlasPage> pages_;
@@ -643,14 +685,14 @@ double MedianTotal(const std::vector<Result>& runs) {
     return Percentile(std::move(values),.5);
 }
 void Print(const char* name,const std::vector<Result>& runs) {
-    std::printf("%s GPU ms median/p90:",name);
+    std::printf("%s GPU ms median/p95:",name);
     const std::pair<const char*,double Intervals::*> fields[]{
         {"copy",&Intervals::copy},{"range",&Intervals::range},{"source",&Intervals::prepare},
         {"filter",&Intervals::filter},{"composite",&Intervals::composite},{"total",&Intervals::total}};
     for (const auto& [label,member]:fields) {
         std::vector<double> values;
         for (const auto& run:runs) values.push_back(run.ms.*member);
-        std::printf(" %s %.3f/%.3f",label,Percentile(values,.5),Percentile(values,.9));
+        std::printf(" %s %.3f/%.3f",label,Percentile(values,.5),Percentile(values,.95));
     }
     std::puts("");
 }
@@ -694,53 +736,125 @@ Difference Compare(const Result& reference,const Result& candidate,const char* l
     return difference;
 }
 
+void WriteBmp(const char* name,const Result& result) {
+    Require(result.rgba.size()==size_t(W)*H*4,"BMP readback extent differs");
+    const auto dir=std::filesystem::path("out")/"reports"/"particle-optimization";
+    std::filesystem::create_directories(dir);
+    std::ofstream out(dir/name,std::ios::binary);
+    Require(bool(out),"cannot open particle benchmark BMP");
+    const uint32_t pitch=(W*3+3)&~3u;
+    auto u16=[&](uint16_t x){out.put(char(x&255));out.put(char(x>>8));};
+    auto u32=[&](uint32_t x){u16(uint16_t(x));u16(uint16_t(x>>16));};
+    out.write("BM",2);u32(54+pitch*H);u32(0);u32(54);
+    u32(40);u32(W);u32(H);u16(1);u16(24);
+    u32(0);u32(pitch*H);u32(2835);u32(2835);u32(0);u32(0);
+    std::vector<char> row(pitch,0);
+    const auto byte=[](float v){return char(int(std::round(std::clamp(v,0.0f,1.0f)*255)));};
+    for (uint32_t iy=0;iy<H;++iy) {
+        const uint32_t y=H-1-iy;
+        for (uint32_t x=0;x<W;++x) {
+            const auto* pixel=result.rgba.data()+(size_t(y)*W+x)*4;
+            row[3*x]=byte(FromHalf(pixel[2]));
+            row[3*x+1]=byte(FromHalf(pixel[1]));
+            row[3*x+2]=byte(FromHalf(pixel[0]));
+        }
+        out.write(row.data(),row.size());
+    }
+    Require(bool(out),"particle benchmark BMP write failed");
+}
+
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
     try {
-        // Declared before measurement. The atlas deliberately resamples a premultiplied source field;
-        // it is not bit-identical to evaluating the native material independently at every aperture tap.
-        constexpr double max_rms=.01, max_active_rms=.02, max_energy_percent=2.0;
-        constexpr float max_absolute=.15f;
-        std::printf("Atlas/v25 acceptance declared before run: max RGBA <=%.3f, full RMS <=%.3f, "
-                    "active RMS <=%.3f, RGB and alpha background-relative energy delta <=%.1f%%\n",
+        for (int arg=1;arg<argc;++arg) {
+            if (std::strcmp(argv[arg],"--height")==0 && arg+1<argc) {
+                const int height=std::atoi(argv[++arg]);
+                Require(height==720 || height==2160,"--height must be 720 or 2160");
+                H=uint32_t(height);W=H==720?1280:3840;
+                AtlasExtent=H==720?2048:4096;
+            } else if (std::strcmp(argv[arg],"--radius")==0 && arg+1<argc) {
+                char* end=nullptr;
+                TargetRadius=std::strtof(argv[++arg],&end);
+                Require(end!=argv[arg] && *end=='\0' && std::isfinite(TargetRadius) &&
+                        TargetRadius>0 && TargetRadius<=24,"--radius must be in (0,24]");
+            } else if (std::strcmp(argv[arg],"--opt")==0 && arg+1<argc) {
+                const char* level=argv[++arg];
+                Require(std::strcmp(level,"O1")==0 || std::strcmp(level,"O3")==0,
+                        "--opt must be O1 or O3");
+                CandidateOptimization=std::strcmp(level,"O3")==0 ?
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3:D3DCOMPILE_OPTIMIZATION_LEVEL1;
+            } else {
+                throw std::runtime_error("usage: new_smoke_dof_gpu_bench [--height 720|2160] "
+                                         "[--radius px] [--opt O1|O3]");
+            }
+        }
+        // Declared before measurement. These variants use the same source/composite,
+        // atlas placement, 64 disk taps and native blend. Only the filter implementation differs.
+        constexpr double max_rms=.006, max_active_rms=.012, max_energy_percent=1.5;
+        constexpr float max_absolute=.075f;
+        std::printf("f543/candidate acceptance: max RGBA <=%.3f, full RMS <=%.3f, "
+                    "active RMS <=%.3f, RGB/alpha energy delta <=%.1f%%\n",
                     max_absolute,max_rms,max_active_rms,max_energy_percent);
+        std::printf("Configuration: %ux%u, radius %.3f native pixels, f543 FXC O1 / "
+                    "candidate FXC %s, 8x depth; 8 warmups + 32 timestamp runs/mode, "
+                    "median/p95, no fixed clocks\n",
+                    W,H,TargetRadius,CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL3?"O3":"O1");
+        const auto cold_start=std::chrono::steady_clock::now();
         Bench bench;
-        bench.Run(Mode::Native);bench.Run(Mode::V25);bench.Run(Mode::Atlas);
-        std::vector<Result> native,v25,atlas;
-        // Eight runs per mode, with V25/atlas ABBA pairs and symmetric native measurements.
-        constexpr Mode order[]{Mode::Native,Mode::V25,Mode::Atlas,Mode::Atlas,Mode::V25,Mode::Native,
-                               Mode::Native,Mode::V25,Mode::Atlas,Mode::Atlas,Mode::V25,Mode::Native};
-        for (unsigned round=0;round<2;++round) {
+        const auto cold_seconds=std::chrono::duration<double>(
+            std::chrono::steady_clock::now()-cold_start).count();
+        std::printf("Cold device/FXC/PSO/fixture setup %.3fs (excluded from GPU timestamps)\n",
+                    cold_seconds);
+        constexpr Mode candidate=Mode::Candidate;
+        for (int warmup=0;warmup<8;++warmup) {
+            bench.Run(Mode::Native);
+            bench.Run(Mode::Atlas);
+            bench.Run(candidate);
+        }
+        std::vector<Result> native,atlas,optimized;
+        // Symmetric ABBA ordering bounds clock drift between the frozen and candidate modes.
+        const Mode order[]{Mode::Native,Mode::Atlas,candidate,candidate,Mode::Atlas,Mode::Native,
+                           Mode::Native,Mode::Atlas,candidate,candidate,Mode::Atlas,Mode::Native};
+        for (unsigned round=0;round<8;++round) {
             for (Mode mode:order) {
                 auto result=bench.Run(mode);
-                auto& bucket=mode==Mode::Native?native:mode==Mode::V25?v25:atlas;
+                auto& bucket=mode==Mode::Native?native:mode==Mode::Atlas?atlas:optimized;
+                if (!bucket.empty()) result.rgba.clear(); // Retain one image per mode, all timings.
                 bucket.push_back(std::move(result));
             }
         }
-        Require(native.size()==8&&v25.size()==8&&atlas.size()==8,"three-mode ABBA pairing failed");
+        Require(native.size()==32&&atlas.size()==32&&optimized.size()==32,
+                "three-mode ABBA pairing failed");
         Print("native",native);
-        Print("v25d4110 cached depth + direct64",v25);
-        Print("atlas cached depth + source + filter64 + composite",atlas);
-        Compare(native.front(),v25.front(),"native/v25 (diagnostic; blur intentionally differs)");
-        const auto difference=Compare(v25.front(),atlas.front(),"v25/atlas");
-        const double native_ms=MedianTotal(native),old_ms=MedianTotal(v25),new_ms=MedianTotal(atlas);
-        std::printf("Total median: native %.3fms, v25 %.3fms, atlas %.3fms; "
-                    "DoF overhead versus native %.3fms -> %.3fms; v25/atlas %.3fx (%.2f%% reduction)\n",
+        Print("f543f54 atlas PS64",atlas);
+        Print("alternate PS (nine-load <=1, guarded interior >1)",optimized);
+        Compare(native.front(),atlas.front(),"native/f543 (diagnostic; blur intentionally differs)");
+        const auto difference=Compare(atlas.front(),optimized.front(),"f543/candidate");
+        char before_name[96],after_name[96];
+        const char* opt=CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL3?"O3":"O1";
+        std::snprintf(before_name,sizeof(before_name),"f543-%up-r%.2f-%s.bmp",H,TargetRadius,opt);
+        std::snprintf(after_name,sizeof(after_name),"candidate-%up-r%.2f-%s.bmp",H,TargetRadius,opt);
+        WriteBmp(before_name,atlas.front());
+        WriteBmp(after_name,optimized.front());
+        const double native_ms=MedianTotal(native),old_ms=MedianTotal(atlas),new_ms=MedianTotal(optimized);
+        std::printf("Total median: native %.3fms, f543 %.3fms, candidate %.3fms; "
+                    "DoF overhead versus native %.3fms -> %.3fms; f543/candidate %.3fx (%.2f%% reduction)\n",
                     native_ms,old_ms,new_ms,old_ms-native_ms,new_ms-native_ms,
                     old_ms/std::max(new_ms,1e-9),100*(old_ms-new_ms)/std::max(old_ms,1e-9));
         Require(difference.maximum<=max_absolute && difference.rms<=max_rms &&
                 difference.active_rms<=max_active_rms &&
                 difference.rgb_energy_percent<=max_energy_percent &&
                 difference.alpha_energy_percent<=max_energy_percent,
-                "atlas image exceeded predeclared approximation gates");
-        std::puts("Hardware timestamp benchmark PASS: 1280x720, 8x D24S8 source depth, 1x color, "
+                "candidate image exceeded predeclared same-kernel quality gates");
+        std::puts("Hardware timestamp benchmark PASS: selectable 720p/2160p, 8x D24S8 source depth, 1x color, "
                   "12 overlapping quads, four unchanged-depth batches. Native: no DoF preparation. "
                   "Both DoF paths: one depth copy + one range pass; atlas includes every batch/page's "
-                  "source clear/evaluation, 64-tap filter, transitions and composite. "
-                  "Clear depth fixture and constant white texture isolate dense particle cost; destination "
+                  "source clear/evaluation, filter, transitions and composite. "
+                  "Clear depth and colored texture exercise dense overlapping particle cost; destination "
                   "depth is disabled because color is single-sampled. WARP separately covers occlusion, "
-                  "textured materials, blending and correctness. No game was launched or accessed.");
+                  "textured materials, blending and correctness. GPU clocks/power state were not fixed; "
+                  "timestamps are workload evidence, not gameplay FPS. No game was launched or accessed.");
         return 0;
     } catch(const std::exception& e) {
         std::fprintf(stderr,"smoke GPU benchmark FAILED: %s\n",e.what());

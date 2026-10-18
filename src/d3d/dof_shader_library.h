@@ -22,6 +22,24 @@ struct DofShaderKeyHash {
     uint64_t second;
 };
 
+enum class DofShaderOptimization : uint8_t { O1, O3 };
+
+inline constexpr uint64_t DofShaderCompilerFlags(DofShaderOptimization optimization) {
+    return optimization == DofShaderOptimization::O3
+        ? uint64_t(D3DCOMPILE_OPTIMIZATION_LEVEL3)
+        : uint64_t(D3DCOMPILE_OPTIMIZATION_LEVEL1);
+}
+
+// Single policy point for shipped DoF bytecode. Keep the entry/profile parameters so a
+// reviewed per-entry policy can be introduced from measured evidence; all entries ship O1.
+inline constexpr uint64_t DofShaderCompilerFlags(std::string_view entry, std::string_view profile) {
+    (void)entry;
+    (void)profile;
+    return DofShaderCompilerFlags(DofShaderOptimization::O1);
+}
+
+inline constexpr uint64_t DofShaderCompilerFlags2 = 0;
+
 // Two independent byte-wise hashes keep the generated table compact. The generator rejects
 // any collision on the complete lookup tuple before writing its output.
 inline DofShaderKeyHash HashDofShaderSource(std::string_view source) {

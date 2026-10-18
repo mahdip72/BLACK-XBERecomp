@@ -53,12 +53,14 @@ add_custom_command(
     DEPENDS build_dof_shaders
         tools/build_dof_shaders.cpp
         src/d3d/dof_shader_library.h
+        src/d3d/shader_cache.h
         src/d3d/dof_shader_source.h
         src/d3d/depth_of_field_shader.h
         src/d3d/viewmodel_dof_shader.h
         src/d3d/fidelityfx_dof_shader.h
         src/d3d/particle_dof_shader.h
         src/d3d/particle_dof_wrapper.h
+        src/d3d/particle_dof_small_radius.h
         "${SDK}/runtime/gpu/shaders.h"
     VERBATIM)
 set_source_files_properties("${DOF_SHADER_LIBRARY_CPP}" PROPERTIES GENERATED TRUE)
@@ -87,6 +89,39 @@ target_include_directories(dof_pipeline_cache_test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
 target_link_libraries(dof_pipeline_cache_test PRIVATE d3d12 dxgi dxguid d3dcompiler)
 add_dependencies(dof_pipeline_cache_test embedded_dof_shaders)
+
+# Explicit, CPU-only compiler study. This experimental target never changes the shipped
+# O1 embedded library and never creates a graphics device.
+add_executable(dof_shader_optimization_compare
+    tools/tests/dof_shader_optimization_compare.cpp
+    ${SDK}/runtime/gpu/shaders.cpp)
+target_include_directories(dof_shader_optimization_compare PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
+target_compile_definitions(dof_shader_optimization_compare PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(dof_shader_optimization_compare PRIVATE d3dcompiler dxguid)
+
+# Explicit offscreen GPU timing harness, independent of the optional FidelityFX SDK adapter.
+add_executable(new_smoke_dof_gpu_bench
+    tools/tests/new_smoke_dof_gpu_bench.cpp
+    ${SDK}/runtime/gpu/shaders.cpp)
+target_include_directories(new_smoke_dof_gpu_bench PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
+target_link_libraries(new_smoke_dof_gpu_bench PRIVATE d3d12 dxgi dxguid d3dcompiler)
+
+# Isolated timing measurements for the GPU DoF telemetry helpers. Defaults to WARP;
+# hardware timing requires an explicit --hardware argument.
+add_executable(dof_gpu_timing_test tools/tests/dof_gpu_timing_test.cpp)
+target_include_directories(dof_gpu_timing_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(dof_gpu_timing_test PRIVATE d3d12 dxgi dxguid)
+
+# Offscreen viewmodel DoF WARP regression, independent of the optional FFX adapter.
+add_executable(viewmodel_dof_test tools/tests/viewmodel_dof_warp.cpp)
+target_include_directories(viewmodel_dof_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(viewmodel_dof_test PRIVATE d3d11 d3dcompiler dxgi dxguid)
+
+# CPU-only radius and dispatch-planner regression.
+add_executable(particle_small_radius_cpu tools/tests/particle_small_radius_cpu.cpp)
+target_include_directories(particle_small_radius_cpu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Official AMD FidelityFX DoF component and DX12 backend. The SDK itself is
 # prepared as a sparse, pinned checkout by tools/cmake/prepare_fidelityfx_sdk.ps1.
@@ -145,14 +180,6 @@ if(BLACK_FIDELITYFX_DOF)
     target_include_directories(new_smoke_dof_warp PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
     target_link_libraries(new_smoke_dof_warp PRIVATE d3d12 dxgi dxguid d3dcompiler)
-
-    # Explicit hardware-only, offscreen GPU timestamps for the smoke DoF shader path.
-    add_executable(new_smoke_dof_gpu_bench
-        tools/tests/new_smoke_dof_gpu_bench.cpp
-        ${SDK}/runtime/gpu/shaders.cpp)
-    target_include_directories(new_smoke_dof_gpu_bench PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
-    target_link_libraries(new_smoke_dof_gpu_bench PRIVATE d3d12 dxgi dxguid d3dcompiler)
 
     # Hardware regression for the production atlas clear, including large rectangle lists.
     add_executable(particle_clear_d3d12 tools/tests/particle_clear_d3d12.cpp)

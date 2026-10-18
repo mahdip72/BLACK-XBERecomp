@@ -107,6 +107,8 @@ struct FidelityFxDof::Impl {
 };
 
 FidelityFxDof::FidelityFxDof() : impl_(std::make_unique<Impl>()) {}
+
+void FidelityFxDof::Swap(FidelityFxDof& other) noexcept { impl_.swap(other.impl_); }
 FidelityFxDof::~FidelityFxDof() { Reset(); }
 bool FidelityFxDof::Ready() const { return impl_->active; }
 bool FidelityFxDof::Matches(uint32_t width, uint32_t height, uint32_t rings, bool disable_ring_merge) const {

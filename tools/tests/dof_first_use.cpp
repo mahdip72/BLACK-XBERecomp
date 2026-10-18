@@ -24,19 +24,19 @@
 using Microsoft::WRL::ComPtr;
 namespace {
 
-constexpr uint64_t kFlags=D3DCOMPILE_OPTIMIZATION_LEVEL1; // Flags2 is zero in the renderer.
 struct Counters { unsigned static_pairs=0,range_pairs=0,atlas_pairs=0,particle_vs=0,
-                           particle_ps=0,lookups=0; };
+                           particle_ps=0,coverage_ps=0,tile_vs=0,lookups=0; };
 void Check(bool value,const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 void RequireEmbedded(std::string_view source,std::string_view entry,
                      std::string_view profile,Counters& count) {
-    const auto bytes=gpu::FindDofShaderBytecode(source,entry,profile,kFlags);
+    const auto flags=gpu::DofShaderCompilerFlags(entry,profile);
+    const auto bytes=gpu::FindDofShaderBytecode(source,entry,profile,flags);
     Check(bytes.data && bytes.size>16,"production DOF shader variant is absent from the embedded library");
     Check(std::memcmp(bytes.data,"DXBC",4)==0,
           "embedded DOF variant does not start with an FXC bytecode container");
-    const auto blob=gpu::LoadDofShaderBytecode(source,entry,profile,kFlags);
+    const auto blob=gpu::LoadDofShaderBytecode(source,entry,profile,flags);
     Check(blob && blob->GetBufferSize()==bytes.size &&
           std::memcmp(blob->GetBufferPointer(),bytes.data,bytes.size)==0,
           "embedded DOF loader did not return the indexed bytecode");
@@ -70,6 +70,20 @@ void CheckStaticManifest(Counters& count) {
     ms("ffx_dof_prepare");
     one("ffx_dof_present");
     Check(count.static_pairs==17,"static DOF call-site matrix changed without updating test");
+
+    RequireEmbedded(gpu::DofStaticPassSource("viewmodel_dof_coverage",1),
+                    "viewmodel_dof_coverage","ps_5_0",count);
+    ++count.coverage_ps;
+    for (uint32_t samples:{1u,2u,4u,8u}) {
+        RequireEmbedded(gpu::DofStaticPassSource("viewmodel_dof_pack",samples),
+                        "viewmodel_dof_tiles_vs","vs_5_0",count);
+        ++count.tile_vs;
+    }
+    RequireEmbedded(gpu::DofStaticPassSource("viewmodel_dof"),
+                    "viewmodel_dof_tiles_vs","vs_5_0",count);
+    ++count.tile_vs;
+    Check(count.coverage_ps==1 && count.tile_vs==5,
+          "viewmodel coverage shader call-site matrix changed without updating test");
 
     for (uint32_t samples:{1u,2u,4u,8u}) {
         const auto source=gpu::DofParticleRangeSource(samples);
@@ -105,11 +119,12 @@ void CheckParticleMatrix(Counters& count) {
 }
 void CheckSelectedBytecode(std::string_view source,const char* entry,const char* profile,
                            const char* label) {
-    const auto embedded=gpu::FindDofShaderBytecode(source,entry,profile,kFlags);
+    const auto flags=gpu::DofShaderCompilerFlags(entry,profile);
+    const auto embedded=gpu::FindDofShaderBytecode(source,entry,profile,flags);
     Check(embedded.data && embedded.size,"selected embedded DOF shader is missing");
     ComPtr<ID3DBlob> compiled,errors;
     const HRESULT hr=D3DCompile(source.data(),source.size(),nullptr,nullptr,nullptr,
-                                entry,profile,UINT(kFlags),0,&compiled,&errors);
+                                entry,profile,UINT(flags),0,&compiled,&errors);
     if (FAILED(hr) && errors)
         std::fprintf(stderr,"%s FXC: %s\n",label,
                      static_cast<const char*>(errors->GetBufferPointer()));
@@ -129,11 +144,12 @@ void CheckMissingVariants() {
               "production DOF loader compiled or returned a missing variant");
     };
     const auto changed=source+"\n// intentionally unembedded variant\n";
-    miss(changed,"depth_of_field_pack","ps_5_0",kFlags);
-    miss(source,"unlisted_entry","ps_5_0",kFlags);
-    miss(source,"depth_of_field_pack","vs_5_0",kFlags);
-    miss(source,"depth_of_field_pack","ps_5_0",kFlags^1ull);
-    miss(source,"depth_of_field_pack","ps_5_0",kFlags|(1ull<<32));
+    const auto flags=gpu::DofShaderCompilerFlags("depth_of_field_pack","ps_5_0");
+    miss(changed,"depth_of_field_pack","ps_5_0",flags);
+    miss(source,"unlisted_entry","ps_5_0",flags);
+    miss(source,"depth_of_field_pack","vs_5_0",flags);
+    miss(source,"depth_of_field_pack","ps_5_0",flags^1ull);
+    miss(source,"depth_of_field_pack","ps_5_0",flags|(1ull<<32));
 }
 } // namespace
 
@@ -170,10 +186,11 @@ int main(int argc,char** argv) {
             Check(!std::filesystem::exists(cache_root,cache_error),
                   "embedded lookup wrote an executable-local FXC disk cache");
         }
-        std::printf("embedded DOF first use PASS: %u static pairs, %u range pairs, %u atlas pair, "
+        std::printf("embedded DOF first use PASS: %u static pairs, %u viewmodel coverage PS, "
+                    "%u viewmodel tile VS, %u range pairs, %u atlas pair, "
                     "%u particle VS, %u particle PS; %u successful lookups; cache initially %s; FXC references %s\n",
-                    count.static_pairs,count.range_pairs,count.atlas_pairs,
-                    count.particle_vs,count.particle_ps,count.lookups,
+                    count.static_pairs,count.coverage_ps,count.tile_vs,count.range_pairs,
+                    count.atlas_pairs,count.particle_vs,count.particle_ps,count.lookups,
                     initially_empty?"absent":"already present",no_fxc?"disabled":"four byte-exact");
         return 0;
     } catch (const std::exception& error) {

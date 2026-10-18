@@ -614,3 +614,14 @@ after = true
 at = 0x1F813B
 call = "GameLanguage"
 after = true
+
+# src/game/dof_loading.cpp: prepare during the native mission loading screen.
+[[hook]]
+at = 0x20F6E5
+call = "ObserveMissionDofLoading"
+
+# Keep the native loading loop alive before its brightness fade begins.
+[[hook]]
+at = 0x20CE78
+call = "MissionDofLoadingReady"
+on_false = 0x20CEB2

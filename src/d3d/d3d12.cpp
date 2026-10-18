@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -42,6 +43,7 @@
 #include "d3d/fidelityfx_dof.h"
 #include "d3d/fidelityfx_dof_shader.h"
 #include "d3d/viewmodel_dof_shader.h"
+#include "d3d/weapon_dof_region.h"
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_clear.h"
 #include "d3d/particle_dof_atlas.h"
@@ -49,6 +51,9 @@
 #include "d3d/dof_shader_source.h"
 #include "d3d/dof_shader_library.h"
 #include "d3d/dof_pipeline_cache.h"
+#include "d3d/dof_gpu_timing.h"
+#include "d3d/dof_loading.h"
+#include "d3d/dof_profile.h"
 #include "d3d/shader_cache.h"
 #include "d3d/occlusion.h"
 #include "d3d/smaa_shader.h"
@@ -878,7 +883,8 @@ private:
     }
     void Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D12_RESOURCE_STATES want) override;
     void Begin();
-    void Submit(bool wait);
+    void Submit(bool wait, bool final_native_present = false);
+    void BeginDofTiming();
     void WaitFence(uint64_t value);
     void SetFullViewport(uint32_t w, uint32_t h);
     void SetBlitTarget(D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t w, uint32_t h);
@@ -977,7 +983,7 @@ private:
             kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + target, rtv_inc_);
     }
     ID3D12PipelineState* EnsureDepthOfFieldPipeline(const char* entry, DXGI_FORMAT out, uint32_t samples,
-                                                  uint32_t input_samples = 1);
+                                                  uint32_t input_samples = 1, bool tiled = false);
     bool EnsureDepthOfFieldFilter(uint32_t w, uint32_t h);
     bool EnsureDepthOfFieldLayers(uint32_t w, uint32_t h);
     D3D12_CPU_DESCRIPTOR_HANDLE DepthOfFieldView(uint32_t mip, uint32_t target) {
@@ -996,12 +1002,16 @@ private:
     void DepthOfFieldSkipped(uint32_t reason, const char* message);
     void WeaponDepthOfField(const State& s, const float p[4 * kWeaponDofRects], bool begin);
     bool EnsureWeaponDofTargets(uint32_t w, uint32_t h);
+    bool EnsureWeaponDofTiles(uint32_t w, uint32_t h);
+    void RecordWeaponDofCoverage(const State& s, const Assembled& a, const DrawShaders& sh,
+                                 const PsoKey& k, ID3D12PipelineState* native, uint32_t guest_width);
+    D3D12_CPU_DESCRIPTOR_HANDLE WeaponDofTileView() { return ParticleDofRangeView(kParticleDofSnapshots + 2); }
     D3D12_CPU_DESCRIPTOR_HANDLE WeaponDofView(uint32_t target) {
         return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
             kDofLevels * kDofTargets + kDofLayerViews + target, rtv_inc_);
     }
     void WeaponDofViews(uint32_t slot, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* color,
-                        DXGI_FORMAT format, bool pack, bool ms);
+                        DXGI_FORMAT format, bool pack, bool ms, ID3D12Resource* tiles = nullptr);
     void WeaponDofSkipped(uint32_t reason, const char* message);
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
@@ -1025,7 +1035,10 @@ private:
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
     ID3D12PipelineState* EnsureParticlePipeline(PsoKey k, ID3DBlob* vs, ID3DBlob* ps);
     void PrimeDepthOfField();
-    void DrawDofPreparation(const char* phase);
+    void QueueDofPipelines(uint32_t samples);
+    bool PrepareDofResources(uint32_t width, uint32_t height, bool balanced);
+    void FinishDofPreparation(bool usable);
+    void PublishDofPreparation();
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> UploadConstants(const State& s, const DrawShaders& sh,
         const PsoKey& k, const DrawTextures& stages, GuestExtent size, DrawConstants& c);
@@ -1040,7 +1053,7 @@ private:
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, DrawTextures& stages, bool clamp);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
-    void SetViewportScissor(const State& s, uint32_t gw);
+    void SetViewportScissor(const State& s, uint32_t gw, bool weapon_tiles = false);
     void SetBlendFactorStencilRef(const State& s);
     void DrawGeometry(const Assembled& a);
     void UploadVertexBuffers(const Assembled& a);
@@ -1173,9 +1186,19 @@ private:
     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
     std::unique_ptr<DofPipelineCache> dof_pipelines_;
+    DofGpuTiming dof_timing_;
     uint64_t dof_prime_signature_ = 0, dof_embedded_loads_ = 0, dof_embedded_missing_ = 0;
-    bool dof_preparing_ = false, dof_priming_ = false;
-    const char* dof_preparation_phase_ = "";
+    enum class DofPreparation { Dormant, Drain, Queue, Cpu, Resources, Warm, Gpu, Complete };
+    DofPreparation dof_preparation_ = DofPreparation::Dormant;
+    struct DofPreparedCpu {
+        std::unique_ptr<FidelityFxDof> context;
+    };
+    std::future<DofPreparedCpu> dof_cpu_preparation_;
+    uint64_t dof_cpu_signature_ = 0, dof_drain_fence_ = 0, dof_warm_fence_ = 0;
+    uint64_t dof_loading_generation_ = 0, dof_loading_after_present_ = 0;
+    bool dof_preparation_started_ = false, dof_prepared_ = false, dof_resources_quiescent_ = false;
+    bool dof_warm_recorded_ = false;
+    PerfClock::time_point dof_preparation_start_{};
     std::unordered_map<uint64_t, uint32_t> samplers_;
     uint32_t smp_used_ = 0;
     std::unordered_map<uint64_t, Target> targets_;
@@ -1264,6 +1287,12 @@ private:
     uint32_t ffx_dof_failed_ = 0;  // one failure latch per Standard/Cinematic profile
     bool ffx_dof_reported_ = false;
     struct WeaponDof {
+        ComPtr<ID3DBlob> coverage_ps;
+        uint64_t coverage_hash = 0;
+        bool conservative_supported = false;
+        WeaponDofRegion region;
+        ComPtr<ID3D12Resource> tiles;
+        D3D12_RESOURCE_STATES tiles_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         ComPtr<ID3D12Resource> before;
         D3D12_RESOURCE_STATES before_state = D3D12_RESOURCE_STATE_COPY_DEST;
         ComPtr<ID3D12Resource> packed[kDofTargets];
@@ -1338,7 +1367,11 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     Begin();
     try { dof_pipelines_ = std::make_unique<DofPipelineCache>(dev_.Get()); }
     catch (...) { LOGR("Particle DOF pipeline worker unavailable; native particles retained"); }
-    PrimeDepthOfField();
+    D3D12_FEATURE_DATA_D3D12_OPTIONS conservative{};
+    weapon_dof_.conservative_supported = SUCCEEDED(dev_->CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS, &conservative, sizeof(conservative))) &&
+        conservative.ConservativeRasterizationTier >= D3D12_CONSERVATIVE_RASTERIZATION_TIER_2;
+    BeginDofTiming();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
 }
@@ -1410,7 +1443,7 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
 // RTVs: the targets' pool, then the back buffers, occlusion, output, SMAA and the DOF filter mips
 void D3D12Backend::CreateHeaps() {
     constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
-        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots + 2;
+        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots + 3;
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvTotal, false, rtv_heap_);
@@ -1442,7 +1475,7 @@ bool D3D12Backend::CreateRootSignature() {
         params[2 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[2 + i].DescriptorTable.NumDescriptorRanges = 1;
         params[2 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
-        params[2 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[2 + i].ShaderVisibility = i == 0 ? D3D12_SHADER_VISIBILITY_ALL : D3D12_SHADER_VISIBILITY_PIXEL;
     }
     D3D12_ROOT_SIGNATURE_DESC rsd{};
     rsd.NumParameters = 4;
@@ -1495,11 +1528,17 @@ void D3D12Backend::Begin() {
     bound_rt_ = bound_ds_ = nullptr;
 }
 
-void D3D12Backend::Submit(bool wait) {
+void D3D12Backend::Submit(bool wait, bool final_native_present) {
+    dof_timing_.Resolve(cl_.Get());
     cl_->Close();
     ID3D12CommandList* lists[] = {cl_.Get()};
     queue_->ExecuteCommandLists(1, lists);
     queue_->Signal(fence_.Get(), ++fence_value_);
+    if (dof_warm_recorded_) {
+        dof_warm_fence_ = fence_value_;
+        dof_warm_recorded_ = false;
+    }
+    dof_timing_.Submitted(fence_value_, presents_ + 1, final_native_present);
     Frame& f = CurrentFrame();
     f.fence = fence_value_;
     if (wait) {
@@ -1509,6 +1548,26 @@ void D3D12Backend::Submit(bool wait) {
         f.used = 0;
         cl_->Reset(f.alloc.Get(), nullptr);
         Begin();
+    }
+}
+
+void D3D12Backend::BeginDofTiming() {
+    const bool enabled = dof_prepared_ && DofGpuProfilingEnabled();
+    if (enabled && !dof_timing_.Available()) dof_timing_.Init(dev_.Get(), queue_.Get());
+    dof_timing_.BeginFrame(presents_ + 1, enabled, fence_->GetCompletedValue());
+    if (enabled && presents_ && presents_ % 120 == 0) {
+        const auto report = dof_timing_.TakeReport();
+        PublishDofGpuReport(report);
+        LOGR("DOF GPU timing: %llu complete frames, %llu invalid, %llu overflow, %llu busy; no GPU waits",
+             (unsigned long long)report.complete_frames, (unsigned long long)report.invalid_frames,
+             (unsigned long long)report.overflow_frames, (unsigned long long)report.busy_frames);
+        for (uint32_t i = 0; i < DofGpuTiming::kStageCount; ++i) {
+            const auto& stat = report.stage[i];
+            if (!stat.intervals) continue;
+            LOGR("DOF GPU %s: median %.3f ms, p95 %.3f ms, %u sampled frames, %llu intervals",
+                 DofGpuTiming::StageName(DofGpuTiming::Stage(i)), stat.median_frame_ms, stat.p95_frame_ms,
+                 stat.percentile_frames, (unsigned long long)stat.intervals);
+        }
     }
 }
 
@@ -1568,6 +1627,9 @@ uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
 }
 
 void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D12_RESOURCE_STATES want) {
+    if (weapon_dof_.pending && r == weapon_dof_.ds &&
+        (want & (D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST |
+                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS))) weapon_dof_.region.Invalidate();
     if (cur == want) return;
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1926,14 +1988,14 @@ bool D3D12Backend::OcclusionPass(const AoPass& a, float c[kAoConstants], const D
 }
 
 ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(const char* entry, DXGI_FORMAT out, uint32_t samples,
-                                                           uint32_t input_samples) {
-    uint64_t bits = uint64_t(out) | uint64_t(input_samples) << 32 | uint64_t(samples) << 40;
+                                                           uint32_t input_samples, bool tiled) {
+    uint64_t bits = uint64_t(out) | uint64_t(input_samples) << 32 | uint64_t(samples) << 40 | uint64_t(tiled) << 48;
     const uint64_t key = Hash(entry, std::strlen(entry), bits);
     auto found = blit_psos_.find(key);
     if (found != blit_psos_.end()) return found->second.Get();
     const auto text = DofStaticPassSource(entry, input_samples);
     uint64_t hash;
-    ID3DBlob* vs = CompileDof(text, "vs", "vs_5_0", hash);
+    ID3DBlob* vs = CompileDof(text, tiled ? "viewmodel_dof_tiles_vs" : "vs", "vs_5_0", hash);
     ID3DBlob* ps = CompileDof(text, entry, "ps_5_0", hash);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, out);
@@ -1954,14 +2016,9 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(const char* entry,
         d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     }
     d.SampleDesc.Count = samples;
-    if (!dof_priming_) {
-        auto* ready = dof_pipelines_ ? dof_pipelines_->Request(key ^ 0x444F465354415449ull, d, vs, ps) : nullptr;
-        if (ready) blit_psos_[key] = ready;
-        return ready; // Pending is not a permanent null cache entry. A later frame can use the ready PSO.
-    }
-    auto& pso = blit_psos_[key];
-    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
-    return pso.Get();
+    auto* ready = dof_pipelines_ ? dof_pipelines_->Request(key ^ 0x444F465354415449ull, d, vs, ps) : nullptr;
+    if (ready) blit_psos_[key] = ready;
+    return ready; // Pending is not a permanent null cache entry. A later frame can use the ready PSO.
 }
 
 bool D3D12Backend::EnsureDepthOfFieldFilter(uint32_t w, uint32_t h) {
@@ -2086,11 +2143,15 @@ void D3D12Backend::DepthOfFieldMipState(uint32_t mip, D3D12_RESOURCE_STATES stat
 }
 
 D3D12Backend::~D3D12Backend() {
+    // A CPU worker owns its device/context. Joining is allowed at shutdown, never in a native frame.
+    if (dof_cpu_preparation_.valid()) {
+        try { (void)dof_cpu_preparation_.get(); } catch (...) {}
+    }
     if (dof_pipelines_) dof_pipelines_->Wait();
     // The SDK owns resources referenced by recorded/in-flight commands, including a failed dispatch.
     bool particle_resources = false;
     for (const auto& snapshot : particle_dof_.snapshots) particle_resources |= bool(snapshot.depth);
-    if (ffx_dof_.Ready() || particle_resources || particle_dof_.atlas[0]) Flush();
+    if (ffx_dof_.Ready() || particle_resources || particle_dof_.atlas[0] || dof_timing_.Available()) Flush();
     if (ffx_dof_.Ready()) ffx_dof_.Reset();
 }
 
@@ -2146,10 +2207,10 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     const auto processing = FidelityFxDofProcessingSize(rt.w, rt.h, scale);
     if (!processing.width || !processing.height) return fail("unsupported processing extent");
     if (!ffx_dof_.Matches(processing.width, processing.height, rings, cinematic)) {
-        // Destruction/recreation must wait for the SDK's private resources. Ordinary frames never wait here.
-        if (ffx_dof_.Ready()) { Flush(); ffx_dof_.Reset(); }
-        if (!ffx_dof_.Create(dev_.Get(), processing.width, processing.height, rings, cinematic)) return fail(ffx_dof_.Failure());
-        ffx_dof_reported_ = false;
+        // Rebuild cooperatively after the next native Present, never inside a scene draw.
+        dof_prime_signature_ = 0;
+        dof_prepared_ = false;
+        return false;
     }
     uint32_t samples = Ms(rt);
     auto* prepare = EnsureDepthOfFieldPipeline("ffx_dof_prepare", DXGI_FORMAT_R16G16B16A16_FLOAT, 1, samples);
@@ -2158,6 +2219,7 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     // this profile while a pipeline is pending; the Balanced/native path can cover this frame.
     if (!prepare || !present) return false;
     if (!EnsureFidelityFxTargets(processing.width, processing.height)) return fail("adapter target allocation failed");
+    auto prepare_timing = dof_timing_.Measure(DofGpuTiming::Stage::ScenePrepare, cl_.Get());
     ID3D12Resource* source = Feedback(rt);
     if (!source) return fail("scene snapshot allocation failed");
     float c[12];
@@ -2184,12 +2246,16 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     for (uint32_t i = 0; i < 2; i++)
         Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    prepare_timing.End();
+    auto sdk_timing = dof_timing_.Measure(DofGpuTiming::Stage::Sdk, cl_.Get());
     bool dispatched = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
                                         ffx_dof_targets_[2].Get(), c[10]);
+    sdk_timing.End();
     // The SDK switches descriptor heaps and compute root signatures. Its external textures return to their
     // entry states. Restore the engine's heaps/root and invalidate cached bindings even if dispatch failed.
     Begin();
     if (!dispatched) return fail(ffx_dof_.Failure());
+    auto compose_timing = dof_timing_.Measure(DofGpuTiming::Stage::SceneCompose, cl_.Get());
     Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(ffx_dof_targets_[0].Get(), ffx_dof_states_[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     uint32_t present_slot = AllocSrvSlots(4);
@@ -2220,6 +2286,7 @@ void D3D12Backend::DepthOfFieldSkipped(uint32_t reason, const char* message) {
 // p: projection m14/m10, eased strength, focus, near/far scales, radius at 1080p, FidelityFX selector.
 void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]) {
     particle_dof_.world_valid = false;
+    if (!dof_prepared_) return;
     for (int i = 0; i < 4 * kDepthOfFieldRects; i++) if (!std::isfinite(p[i])) {
         DepthOfFieldSkipped(0, "non-finite projection, strength or focus");
         return;
@@ -2261,6 +2328,7 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
         ParticleDofWorld(*rt, c);
         return;
     }
+    if (!dof_prepared_) return; // A mismatched SDK context has queued a new preparation episode.
     uint32_t samples = Ms(*rt);
     ID3D12PipelineState* pso = EnsureDepthOfFieldPipeline("depth_of_field", rt->fmt, samples);
     ID3D12PipelineState* gather_pso = EnsureDepthOfFieldPipeline("depth_of_field_gather", kDofFormats[0], 1);
@@ -2276,6 +2344,7 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
         return;
     }
     // Feedback takes a copy even at 1x, so the scene is never read while it is being written. At MSAA it resolves.
+    auto prepare_timing = dof_timing_.Measure(DofGpuTiming::Stage::ScenePrepare, cl_.Get());
     ID3D12Resource* source = Feedback(*rt);
     if (!source) {
         DepthOfFieldSkipped(4, "scene color snapshot allocation failed");
@@ -2315,6 +2384,8 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
     DrawFullScreen(gather_pso, cb.gpu, gather_slot);
     for (uint32_t target = 0; target < kDofTargets; target++)
         Transition(dof_layers_[target].Get(), dof_layer_states_[target], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    prepare_timing.End();
+    auto compose_timing = dof_timing_.Measure(DofGpuTiming::Stage::SceneCompose, cl_.Get());
     uint32_t slot = AllocSrvSlots(4);
     DepthOfFieldComposeViews(slot, source, rt->fmt);
     Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2526,6 +2597,7 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
     if (snapshot->source != ds->res.Get() || snapshot->serial != particle_depth_serial_ || snapshot->frame != frame_) {
         // Actual depth mutations invalidate the cache; merely binding the same read-only particle DS does not.
         snapshot->source = nullptr;
+        auto copy_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleDepthCopy, cl_.Get());
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(snapshot->depth.Get(), snapshot->state, D3D12_RESOURCE_STATE_COPY_DEST);
         cl_->CopyResource(snapshot->depth.Get(), ds->res.Get());
@@ -2533,7 +2605,9 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
         p.copy_bytes += uint64_t(rt->w) * rt->h * samples * 4;
         Transition(snapshot->depth.Get(), snapshot->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        copy_timing.End();
         if (samples > 1) {
+            auto range_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleRange, cl_.Get());
             const bool range_ready = ParticleDofDepthRange(snapshot->depth.Get(), snapshot->range.Get(),
                 snapshot->range_state, snapshot_index, samples, rt->w, rt->h);
             // The prepass replaced graphics bindings; restore the native targets even on a PSO failure.
@@ -2582,6 +2656,7 @@ bool D3D12Backend::EnsureWeaponDofTargets(uint32_t w, uint32_t h) {
         if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                  nullptr, IID_PPV_ARGS(&targets[i])))) return false;
     }
+    if (weapon.packed[0] && !dof_resources_quiescent_) Flush(); // fixed RTVs can still be in flight outside preparation
     for (uint32_t i = 0; i < kDofTargets; i++) {
         if (weapon.packed[i]) Release(std::move(weapon.packed[i]));
         weapon.packed[i] = std::move(targets[i]);
@@ -2591,11 +2666,30 @@ bool D3D12Backend::EnsureWeaponDofTargets(uint32_t w, uint32_t h) {
     return true;
 }
 
+bool D3D12Backend::EnsureWeaponDofTiles(uint32_t w, uint32_t h) {
+    auto& weapon = weapon_dof_;
+    w = (w + kViewmodelDofTileSize - 1) / kViewmodelDofTileSize;
+    h = (h + kViewmodelDofTileSize - 1) / kViewmodelDofTileSize;
+    if (weapon.tiles && weapon.tiles->GetDesc().Width == w && weapon.tiles->GetDesc().Height == h) return true;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    auto desc = Texture2DDesc(DXGI_FORMAT_R8_UNORM, w, h);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ComPtr<ID3D12Resource> tiles;
+    if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&tiles)))) return false;
+    if (weapon.tiles && !dof_resources_quiescent_) Flush();
+    if (weapon.tiles) Release(std::move(weapon.tiles));
+    weapon.tiles = std::move(tiles);
+    weapon.tiles_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    dev_->CreateRenderTargetView(weapon.tiles.Get(), nullptr, WeaponDofTileView());
+    return true;
+}
+
 void D3D12Backend::WeaponDofViews(uint32_t slot, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* color,
-                                DXGI_FORMAT format, bool pack, bool ms) {
-    ID3D12Resource* resources[4] = {a, b, color, nullptr};
+                                DXGI_FORMAT format, bool pack, bool ms, ID3D12Resource* tiles) {
+    ID3D12Resource* resources[4] = {a, b, color, tiles};
     DXGI_FORMAT formats[4] = {pack ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kDofFormats[0],
-        pack ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kDofFormats[1], format, kBgra};
+        pack ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : kDofFormats[1], format, DXGI_FORMAT_R8_UNORM};
     for (uint32_t i = 0; i < 4; i++) {
         bool multisampled = pack && ms && i < 3;
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
@@ -2617,6 +2711,7 @@ void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4 * kWeaponD
     auto& weapon = weapon_dof_;
     bool pending = weapon.pending;
     weapon.pending = false;  // An End consumes a snapshot exactly once, including mismatches and failures.
+    if (!dof_prepared_) return;
     if (!begin && !pending) return;
     // The serial is an opaque bit pattern; some valid serials encode NaN/Inf as a float.
     uint32_t serial = std::bit_cast<uint32_t>(p[3]);
@@ -2656,17 +2751,32 @@ void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4 * kWeaponD
             weapon.before = std::move(before);
             weapon.before_state = D3D12_RESOURCE_STATE_COPY_DEST;
         }
+        auto copy_timing = dof_timing_.Measure(DofGpuTiming::Stage::WeaponDepthCopy, cl_.Get());
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(weapon.before.Get(), weapon.before_state, D3D12_RESOURCE_STATE_COPY_DEST);
         cl_->CopyResource(weapon.before.Get(), ds->res.Get());
         Transition(weapon.before.Get(), weapon.before_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        copy_timing.End();
         weapon.rt = rt->res.Get();
         weapon.ds = ds->res.Get();
         weapon.viewport = v;
         std::memcpy(weapon.parameters, p, sizeof(weapon.parameters));
         weapon.serial = serial;
         weapon.frame = frame_;
+        // Preparation owns allocations/fixed RTV replacement. A surprise size
+        // change during a weapon scope must fall back, never allocate or Flush.
+        const auto tile_desc = weapon.tiles ? weapon.tiles->GetDesc() : D3D12_RESOURCE_DESC{};
+        weapon.region.Begin(particle_depth_serial_, weapon.conservative_supported && weapon.coverage_ps &&
+            WeaponDofViewportSupported(0, 0, float(rt->w), float(rt->h)) &&
+            weapon.tiles && tile_desc.Width == (rt->w + kViewmodelDofTileSize - 1) / kViewmodelDofTileSize &&
+            tile_desc.Height == (rt->h + kViewmodelDofTileSize - 1) / kViewmodelDofTileSize);
+        if (weapon.region.valid) {
+            auto mask_timing = dof_timing_.Measure(DofGpuTiming::Stage::WeaponClassify, cl_.Get());
+            Transition(weapon.tiles.Get(), weapon.tiles_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const float zero[4]{};
+            cl_->ClearRenderTargetView(WeaponDofTileView(), zero, 0, nullptr);
+        }
         weapon.pending = true;
         return;
     }
@@ -2684,7 +2794,14 @@ void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4 * kWeaponD
         WeaponDofSkipped(2, "pipeline or packed target creation failed");
         return;
     }
+    auto* sparse_pack = EnsureDepthOfFieldPipeline("viewmodel_dof_pack", kDofFormats[0], 1, samples, true);
+    auto* sparse_compose = samples == 1 ? EnsureDepthOfFieldPipeline("viewmodel_dof", rt->fmt, 1, 1, true) : nullptr;
+    const bool sparse = weapon.region.Complete(particle_depth_serial_) &&
+        WeaponDofViewportSupported(0, 0, float(rt->w), float(rt->h)) &&
+        weapon.tiles && sparse_pack && (samples > 1 || sparse_compose);
+    auto scene_timing = dof_timing_.Measure(DofGpuTiming::Stage::WeaponSceneCopy, cl_.Get());
     ID3D12Resource* scene = Feedback(*rt);
+    scene_timing.End();
     if (!scene) {
         WeaponDofSkipped(2, "scene snapshot allocation failed");
         return;
@@ -2692,30 +2809,54 @@ void D3D12Backend::WeaponDepthOfField(const State& s, const float p[4 * kWeaponD
     float zr = v.max_z - v.min_z;
     const float c[12] = {p[0] * zr, v.min_z + p[1] * zr, std::clamp(p[2], 0.0f, 1.0f),
         float(rect.bottom - rect.top) / 1080.0f, float(rect.left), float(rect.top),
-        float(rect.right - rect.left), float(rect.bottom - rect.top), p[4], p[5], 0, 0};
+        float(rect.right - rect.left), float(rect.bottom - rect.top), p[4], p[5], float(rt->w), float(rt->h)};
     for (float value : c) if (!std::isfinite(value)) return;
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, c, sizeof(c));
     bound_rt_ = bound_ds_ = nullptr;
     Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (sparse) {
+        Transition(weapon.tiles.Get(), weapon.tiles_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
     for (uint32_t i = 0; i < kDofTargets; i++)
         Transition(weapon.packed[i].Get(), weapon.packed_state[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
     uint32_t pack_slot = AllocSrvSlots(4);
-    WeaponDofViews(pack_slot, ds->res.Get(), weapon.before.Get(), rt->res.Get(), rt->fmt, true, samples > 1);
+    WeaponDofViews(pack_slot, ds->res.Get(), weapon.before.Get(), rt->res.Get(), rt->fmt, true, samples > 1,
+                   sparse ? weapon.tiles.Get() : nullptr);
     D3D12_CPU_DESCRIPTOR_HANDLE views[kDofTargets] = {WeaponDofView(0), WeaponDofView(1)};
     cl_->OMSetRenderTargets(kDofTargets, views, FALSE, nullptr);
     SetFullViewport(rt->w, rt->h);
-    DrawFullScreen(pack, cb.gpu, pack_slot);
+    const auto draw_tiles = [&](ID3D12PipelineState* pipeline, uint32_t slot) {
+        cl_->SetPipelineState(pipeline);
+        cl_->SetGraphicsRootConstantBufferView(0, cb.gpu);
+        cl_->SetGraphicsRootConstantBufferView(1, cb.gpu);
+        cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), slot, srv_inc_));
+        cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const auto desc = weapon.tiles->GetDesc();
+        cl_->DrawInstanced(6, uint32_t(desc.Width) * desc.Height, 0, 0);
+    };
+    auto pack_timing = dof_timing_.Measure(DofGpuTiming::Stage::WeaponPack, cl_.Get());
+    if (sparse) {
+        const float clear[4]{};
+        for (auto view : views) cl_->ClearRenderTargetView(view, clear, 0, nullptr);
+        draw_tiles(sparse_pack, pack_slot);
+    } else DrawFullScreen(pack, cb.gpu, pack_slot);
     for (uint32_t i = 0; i < kDofTargets; i++)
         Transition(weapon.packed[i].Get(), weapon.packed_state[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    pack_timing.End();
+    auto compose_timing = dof_timing_.Measure(DofGpuTiming::Stage::WeaponCompose, cl_.Get());
     Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     uint32_t compose_slot = AllocSrvSlots(4);
-    WeaponDofViews(compose_slot, weapon.packed[0].Get(), weapon.packed[1].Get(), scene, rt->fmt, false, false);
+    WeaponDofViews(compose_slot, weapon.packed[0].Get(), weapon.packed[1].Get(), scene, rt->fmt, false, false,
+                   sparse ? weapon.tiles.Get() : nullptr);
     SetBlitTarget(Cpu(rtv_heap_.Get(), rt->view, rtv_inc_), rt->w, rt->h);
     cl_->RSSetScissorRects(1, &rect);
-    DrawFullScreen(compose, cb.gpu, compose_slot);
+    // Keep the original full-screen MSAA writeback: later blending can observe individual samples.
+    if (sparse && samples == 1) draw_tiles(sparse_compose, compose_slot);
+    else DrawFullScreen(compose, cb.gpu, compose_slot);
     rt->drawn = true;
     if (!weapon.reported) {
         weapon.reported = true;
@@ -2898,7 +3039,7 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
 }
 
 ID3DBlob* D3D12Backend::CompileDof(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
-    constexpr uint64_t flags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    const uint64_t flags = DofShaderCompilerFlags(entry, profile) | (DofShaderCompilerFlags2 << 32);
     const uint64_t profile_seed = Hash(profile, std::strlen(profile), Hash(&flags, sizeof(flags)));
     hash = Hash(src.data(), src.size(), Hash(entry, std::strlen(entry), profile_seed));
     auto found = blobs_.find(hash);
@@ -2977,7 +3118,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
         b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_BLEND_FACTOR;
         b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
-    if (dof && !dof_priming_) {
+    if (dof) {
         auto* ready = dof_pipelines_ ? dof_pipelines_->Request(key ^ 0x444F465041535300ull, d, vs, ps) : nullptr;
         if (ready) blit_psos_[key] = ready;
         return ready;
@@ -3169,39 +3310,20 @@ ID3D12PipelineState* D3D12Backend::EnsureParticlePipeline(PsoKey k, ID3DBlob* vs
     return dof_pipelines_->Request(Hash(&k, sizeof(k)), desc, vs, ps);
 }
 
-void D3D12Backend::PrimeDepthOfField() {
-    const auto& options = game::Opt();
-    const bool enabled = options.reload_blur && options.modern_reload_dof;
-    const uint32_t profile = options.fidelityfx_dof ? (options.dof_cinematic_quality ? 2u : 1u) : 0u;
-    const uint32_t width = std::max(1u, uint32_t(std::lround(guest_w_ * scale_)));
-    const uint32_t height = std::max(1u, uint32_t(std::lround(guest_h_ * scale_)));
-    const uint32_t key[] = {width, height, msaa_, profile, uint32_t(enabled)};
-    const uint64_t signature = Hash(key, sizeof(key));
-    if (dof_prime_signature_ == signature) return;
-    if (!enabled) { dof_prime_signature_ = signature; return; }
-    const auto started = PerfClock::now();
-    dof_preparing_ = !app::HandingOver();
-    dof_priming_ = true;
-    // Init runs before the title's render thread starts. Later calls only follow render/profile changes;
-    // fence before replacing any resources or fixed RTVs used by the previous configuration.
-    if (dof_prime_signature_) Flush();
-    if (ffx_dof_failed_) {
-        // A changed configuration is an explicit retry boundary. Discard a poisoned SDK context
-        // before clearing the latch; Matches alone would otherwise retain its failed backend jobs.
-        ffx_dof_.Reset();
-        ffx_dof_failed_ = 0;
-    }
-    dof_prime_signature_ = signature;
-    DrawDofPreparation("Loading graphics shaders");
+void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
     bool ready = true;
-    const uint32_t sample_counts[] = {1, msaa_};
+    weapon_dof_.coverage_ps = CompileDof(DofStaticPassSource("viewmodel_dof_coverage"),
+        "viewmodel_dof_coverage", "ps_5_0", weapon_dof_.coverage_hash);
+    const uint32_t sample_counts[] = {1, native_samples};
     for (uint32_t i = 0; i < 2; ++i) {
-        if (i && msaa_ == 1) continue;
+        if (i && native_samples == 1) continue;
         const uint32_t samples = sample_counts[i];
         ready &= EnsureDepthOfFieldPipeline("depth_of_field_pack", kDofFormats[0], 1, samples) != nullptr;
         ready &= EnsureDepthOfFieldPipeline("depth_of_field", kBgra, samples) != nullptr;
         ready &= EnsureDepthOfFieldPipeline("viewmodel_dof_pack", kDofFormats[0], 1, samples) != nullptr;
         ready &= EnsureDepthOfFieldPipeline("viewmodel_dof", kBgra, samples) != nullptr;
+        ready &= EnsureDepthOfFieldPipeline("viewmodel_dof_pack", kDofFormats[0], 1, samples, true) != nullptr;
+        if (samples == 1) ready &= EnsureDepthOfFieldPipeline("viewmodel_dof", kBgra, 1, 1, true) != nullptr;
         ready &= EnsureDepthOfFieldPipeline("ffx_dof_prepare", kDofFormats[0], 1, samples) != nullptr;
         ready &= EnsureDepthOfFieldPipeline("ffx_dof_present", kBgra, samples) != nullptr;
         if (samples > 1) {
@@ -3239,52 +3361,26 @@ void D3D12Backend::PrimeDepthOfField() {
                         EnsureParticlePipeline(state, vs, ps);
                     }
             }
-            DrawDofPreparation("Preparing particle pipelines");
         }
     }
     ready &= EnsureDepthOfFieldPipeline("depth_of_field_gather", kDofFormats[0], 1) != nullptr;
     ready &= EnsureDepthOfFieldPipeline("depth_of_field_downsample", kDofFormats[0], 1) != nullptr;
     ready &= EnsurePassPipeline(kParticleDofAtlasFilterHlsl.c_str(), "vs", "filter_ps",
                                 kDofFormats[0], -1, true) != nullptr;
+    (void)ready; // A null request means pending or unavailable; neither blocks this native frame.
+}
 
-    bool world_ready = false;
-    if (profile) {
-        DrawDofPreparation("Preparing cinematic graphics");
-        const bool cinematic = profile == 2;
-        const auto extent = FidelityFxDofProcessingSize(width, height, cinematic ? 2 : 1);
-        const uint32_t failure_bit = cinematic ? 2u : 1u;
-        world_ready = !(ffx_dof_failed_ & failure_bit) && extent.width && ffx_dof_.Create(dev_.Get(), extent.width, extent.height,
-                                                      cinematic ? 8 : 4, cinematic);
-        if (world_ready) world_ready = EnsureFidelityFxTargets(extent.width, extent.height);
-        if (world_ready) {
-            // The SDK creates its private upload ring on first dispatch. Exercise it on initialized,
-            // zero-CoC scratch images during preparation, without invoking a game effect or scene draw.
-            for (uint32_t i = 0; i < 2; ++i)
-                Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const float color[4] = {};
-            const float depth[4] = {.5f, .5f, .5f, .5f};
-            cl_->ClearRenderTargetView(FidelityFxView(0), color, 0, nullptr);
-            cl_->ClearRenderTargetView(FidelityFxView(1), depth, 0, nullptr);
-            for (uint32_t i = 0; i < 2; ++i)
-                Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            world_ready = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
-                                           ffx_dof_targets_[2].Get(), 1.0f);
-            Begin(); // SDK dispatch changes descriptor heaps/root bindings, including a failed dispatch.
-            Flush(); // Scratch/private resources are retired before gameplay or fallback recreation.
-        }
-        if (!world_ready) {
-            ffx_dof_failed_ |= failure_bit;
-            LOGR("DOF preparation: FidelityFX profile %u unavailable; preparing Balanced fallback", profile);
-        }
-        ffx_dof_reported_ = false;
-    }
-    DrawDofPreparation("Preparing depth and particle buffers");
-    if (!world_ready) {
+bool D3D12Backend::PrepareDofResources(uint32_t width, uint32_t height, bool balanced) {
+    // Prime reaches this only after polling the old DOF submission fence. DOF draws remain disabled.
+    dof_resources_quiescent_ = true;
+    struct Restore { bool& flag; ~Restore() { flag = false; } } restore{dof_resources_quiescent_};
+    bool ready = true;
+    if (balanced) {
         ready &= EnsureDepthOfFieldFilter(width, height);
         ready &= EnsureDepthOfFieldLayers((width + 1) / 2, (height + 1) / 2);
     }
     ready &= EnsureWeaponDofTargets(width, height);
+    EnsureWeaponDofTiles(width, height); // optional sparse path, full-screen fallback remains ready
     for (auto& [id, target] : targets_)
         if (!target.depth && target.gw == guest_w_ && target.gh == guest_h_) ready &= EnsureFeedbackResource(target);
     // At high native resolutions a small-CoC full-size quad may need a 4096 cell. Reserve that page
@@ -3329,35 +3425,152 @@ void D3D12Backend::PrimeDepthOfField() {
             } else ready = false;
         }
     }
-    if (dof_pipelines_) {
-        if (dof_preparing_) {
-            while (!dof_pipelines_->WaitFor(std::chrono::milliseconds(33)))
-                DrawDofPreparation("Preparing particle pipelines");
-        } else dof_pipelines_->Wait();
-    }
-    const auto pipelines = dof_pipelines_ ? dof_pipelines_->GetStats() : DofPipelineCache::Stats{};
-    ready &= dof_pipelines_ && pipelines.pending == 0 && pipelines.failed == 0;
-    DrawDofPreparation("Graphics ready");
-    dof_preparing_ = dof_priming_ = false;
-    LOGR("DOF preparation complete: %ux%u %ux MSAA profile %u, %llu embedded shaders/%llu missing, "
-         "%llu particle PSOs ready/%llu pending/%llu failed, resources %s, %.1f ms; no runtime DOF HLSL compiler",
-         width, height, msaa_, profile, (unsigned long long)dof_embedded_loads_, (unsigned long long)dof_embedded_missing_,
-         (unsigned long long)pipelines.ready, (unsigned long long)pipelines.pending, (unsigned long long)pipelines.failed,
-         ready ? "ready" : "partial", PerfMs(started));
+    return ready;
 }
 
-void D3D12Backend::DrawDofPreparation(const char* phase) {
-    if (!dof_preparing_) return;
-    dof_preparation_phase_ = phase;
-    Begin();
-    DrawFrame(nullptr, swap_->GetCurrentBackBufferIndex());
-    Submit(false);
-    swap_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    if (presents_ == 0) app::SplashFirstFrame();
-    // These are host preparation frames, not Xbox presents. Do not advance native pacing/delivery counters.
-    ++frame_;
-    ResetFrame();
+void D3D12Backend::PublishDofPreparation() {
+    if (dof_preparation_ != DofPreparation::Complete || presents_ < dof_loading_after_present_ ||
+        !dof_loading_generation_ ||
+        g_dof_loading_requested_generation.load(std::memory_order_acquire) != dof_loading_generation_) return;
+    g_dof_loading_ready_generation.store(dof_loading_generation_, std::memory_order_release);
 }
+
+void D3D12Backend::FinishDofPreparation(bool usable) {
+    dof_prepared_ = usable;
+    dof_preparation_ = DofPreparation::Complete;
+    const auto pipelines = dof_pipelines_ ? dof_pipelines_->GetStats() : DofPipelineCache::Stats{};
+    LOGR("DOF native-loading preparation complete: %llu embedded shaders/%llu missing, "
+         "%llu PSOs ready/%llu pending/%llu failed, effects %s, %.1f ms elapsed; native frames continued",
+         (unsigned long long)dof_embedded_loads_, (unsigned long long)dof_embedded_missing_,
+         (unsigned long long)pipelines.ready, (unsigned long long)pipelines.pending, (unsigned long long)pipelines.failed,
+         usable ? "ready" : "native fallback", PerfMs(dof_preparation_start_));
+    // A terminal resource/worker failure must release the native loading gate too.
+    PublishDofPreparation();
+}
+
+void D3D12Backend::PrimeDepthOfField() {
+    // Called once after an ordinary native Present. Boot/menu frames never start preparation on their own.
+    if (!dof_preparation_started_ || presents_ < dof_loading_after_present_) return;
+    const auto& options = game::Opt();
+    const bool enabled = options.reload_blur && options.modern_reload_dof;
+    const uint32_t profile = options.fidelityfx_dof ? (options.dof_cinematic_quality ? 2u : 1u) : 0u;
+    const uint32_t width = std::max(1u, uint32_t(std::lround(guest_w_ * scale_)));
+    const uint32_t height = std::max(1u, uint32_t(std::lround(guest_h_ * scale_)));
+    const uint32_t key[] = {width, height, msaa_, profile, uint32_t(enabled)};
+    const uint64_t signature = Hash(key, sizeof(key));
+    if (dof_prime_signature_ != signature) {
+        dof_prime_signature_ = signature;
+        dof_prepared_ = false;
+        dof_preparation_ = DofPreparation::Drain;
+        dof_drain_fence_ = fence_value_;
+        dof_warm_fence_ = 0;
+        dof_preparation_start_ = PerfClock::now();
+        g_dof_loading_ready_generation.store(0, std::memory_order_release);
+        particle_dof_.world_valid = weapon_dof_.pending = false;
+    }
+    try {
+        switch (dof_preparation_) {
+        case DofPreparation::Dormant:
+            return;
+        case DofPreparation::Complete:
+            PublishDofPreparation();
+            return;
+        case DofPreparation::Drain:
+            // Turning the feature off needs no new resources. Retain old GPU/CPU owners for safe
+            // later retirement, but do not make a disabled feature hold the mission loading gate.
+            if (!enabled) { FinishDofPreparation(false); return; }
+            if (fence_->GetCompletedValue() < dof_drain_fence_) return;
+            // std::future destruction can wait. Keep an obsolete CPU job until it has really finished.
+            if (dof_cpu_preparation_.valid()) {
+                if (dof_cpu_preparation_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+                try { (void)dof_cpu_preparation_.get(); } catch (...) {}
+            }
+            ffx_dof_.Reset(); // All previous SDK dispatches are complete; no GPU wait is issued here.
+            ffx_dof_failed_ = 0;
+            ffx_dof_reported_ = false;
+            dof_preparation_ = DofPreparation::Queue;
+            return;
+        case DofPreparation::Queue: {
+            if (!dof_pipelines_) { FinishDofPreparation(false); return; }
+            QueueDofPipelines(msaa_);
+            if (!profile) { dof_preparation_ = DofPreparation::Resources; return; }
+            auto device = dev_;
+            const bool cinematic = profile == 2;
+            const auto extent = FidelityFxDofProcessingSize(width, height, cinematic ? 2 : 1);
+            dof_cpu_signature_ = signature;
+            dof_cpu_preparation_ = std::async(std::launch::async, [device, extent, profile, cinematic] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                DofPreparedCpu result;
+                if (profile && extent.width && extent.height) {
+                    result.context = std::make_unique<FidelityFxDof>();
+                    result.context->Create(device.Get(), extent.width, extent.height, cinematic ? 8 : 4, cinematic);
+                }
+                return result;
+            });
+            dof_preparation_ = DofPreparation::Cpu;
+            return;
+        }
+        case DofPreparation::Cpu: {
+            if (dof_cpu_preparation_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+            auto result = dof_cpu_preparation_.get();
+            if (dof_cpu_signature_ != signature) { dof_preparation_ = DofPreparation::Drain; return; }
+            if (result.context && result.context->Ready()) ffx_dof_.Swap(*result.context);
+            if (profile && !ffx_dof_.Ready()) {
+                ffx_dof_failed_ |= profile == 2 ? 2u : 1u;
+                LOGR("DOF native loading: FidelityFX unavailable; preparing Balanced fallback");
+            }
+            dof_preparation_ = DofPreparation::Resources;
+            return;
+        }
+        case DofPreparation::Resources: {
+            bool world_ready = profile && ffx_dof_.Ready();
+            if (world_ready) {
+                const auto extent = FidelityFxDofProcessingSize(width, height, profile == 2 ? 2 : 1);
+                world_ready = EnsureFidelityFxTargets(extent.width, extent.height);
+                if (!world_ready) ffx_dof_failed_ |= profile == 2 ? 2u : 1u;
+            }
+            if (!PrepareDofResources(width, height, !world_ready)) { FinishDofPreparation(false); return; }
+            dof_preparation_ = world_ready ? DofPreparation::Warm : DofPreparation::Gpu;
+            dof_warm_fence_ = world_ready ? 0 : dof_drain_fence_;
+            return;
+        }
+        case DofPreparation::Warm: {
+            // Record on the renderer's next normal frame. Its ordinary Submit supplies the fence;
+            // preparation never presents, submits, or waits on a command list of its own.
+            dof_preparation_ = DofPreparation::Gpu;
+            dof_warm_recorded_ = true;
+            for (uint32_t i = 0; i < 2; ++i)
+                Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const float color[4] = {};
+            const float depth[4] = {.5f, .5f, .5f, .5f};
+            cl_->ClearRenderTargetView(FidelityFxView(0), color, 0, nullptr);
+            cl_->ClearRenderTargetView(FidelityFxView(1), depth, 0, nullptr);
+            for (uint32_t i = 0; i < 2; ++i)
+                Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            const bool warmed = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
+                                                 ffx_dof_targets_[2].Get(), 1.0f);
+            Begin(); // SDK work changes heaps/root bindings, including on a failed dispatch.
+            if (!warmed) {
+                ffx_dof_failed_ |= profile == 2 ? 2u : 1u;
+                if (!PrepareDofResources(width, height, true)) { FinishDofPreparation(false); return; }
+            }
+            return;
+        }
+        case DofPreparation::Gpu:
+            if (!dof_warm_fence_ || fence_->GetCompletedValue() < dof_warm_fence_) return;
+            if (dof_pipelines_ && dof_pipelines_->GetStats().pending) return;
+            FinishDofPreparation(bool(dof_pipelines_));
+            return;
+        }
+    } catch (...) {
+        // Keep any still-running future owned until a later configuration or shutdown can reap it.
+        // Queue/allocation/SDK failures never strand the mission at its loading gate.
+        Begin();
+        FinishDofPreparation(false);
+    }
+}
+
 
 TexKind TextureKind(const TextureDesc& d) {
     if (d.cube) return kTexCube;
@@ -4123,10 +4336,12 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, DrawTextures& stag
 }
 
 // viewport covers the target, the guest viewport is in the shader; scissor clips to it
-void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, bool weapon_tiles) {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
     D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
+    // Exact native viewport / 8, not the rounded-up tile resource extent.
+    if (weapon_tiles) { vp.Width /= kViewmodelDofTileSize; vp.Height /= kViewmodelDofTileSize; }
     cl_->RSSetViewports(1, &vp);
     float sc = W / gw;
     LONG x0 = LONG(s.viewport.x * sc);
@@ -4141,6 +4356,11 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
+    if (weapon_tiles) {
+        constexpr LONG tile = kViewmodelDofTileSize;
+        rect = {rect.left / tile, rect.top / tile, (rect.right + tile - 1) / tile,
+                (rect.bottom + tile - 1) / tile};
+    }
     cl_->RSSetScissorRects(1, &rect);
 }
 
@@ -4185,6 +4405,50 @@ void D3D12Backend::DrawGeometry(const Assembled& a) {
     }
 }
 
+void D3D12Backend::RecordWeaponDofCoverage(const State& s, const Assembled& a, const DrawShaders& sh,
+                                          const PsoKey& k, ID3D12PipelineState* native, uint32_t guest_width) {
+    auto& weapon = weapon_dof_;
+    if (!weapon.pending || !weapon.region.valid || !k.zen || !k.zwrite) return;
+    const bool supported = weapon.region.Complete(particle_depth_serial_) && bound_rt_ && bound_ds_ &&
+        // SetViewportScissor uses this full-target host viewport; the guest
+        // viewport affects VS coordinates/scissor, not the host viewport.
+        WeaponDofViewportSupported(0, 0, float(bound_rt_->w), float(bound_rt_->h)) &&
+        bound_rt_->res.Get() == weapon.rt && bound_ds_->res.Get() == weapon.ds &&
+        weapon.frame == frame_ && a.topology == Topology::Triangles && k.fill != kFillWireframe &&
+        !sh.particle_samples && sh.vs_code && weapon.coverage_ps && dof_pipelines_;
+    if (!supported) { weapon.region.Invalidate(); return; }
+
+    // Only VS/input-layout affect this PSO; all native color/depth/raster state
+    // is intentionally replaced by conservative overcoverage with no culling.
+    PsoKey key{};
+    key.vs = k.vs; key.ps = weapon.coverage_hash; key.regs = k.regs;
+    std::memcpy(key.elements, k.elements, sizeof(key.elements));
+    D3D12_INPUT_ELEMENT_DESC elements[16];
+    auto desc = FullScreenPipelineDesc(sh.vs_code, weapon.coverage_ps.Get(), DXGI_FORMAT_R8_UNORM);
+    desc.InputLayout = {elements, FillInputLayout(key, elements)};
+    desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+    desc.RasterizerState.DepthClipEnable = FALSE;
+    auto* coverage = dof_pipelines_->Request(Hash(&key, sizeof(key), 0x574541504F4E524Full),
+                                            desc, sh.vs_code, weapon.coverage_ps.Get());
+    if (!weapon.region.AcceptDraw(particle_depth_serial_, coverage != nullptr)) return;
+
+    auto timing = dof_timing_.Measure(DofGpuTiming::Stage::WeaponClassify, cl_.Get());
+    // DrawGeometry just bound the exact native IA buffers and constants. Reuse
+    // them without another upload; no textures or root parameters change.
+    const auto mask_rtv = WeaponDofTileView();
+    cl_->OMSetRenderTargets(1, &mask_rtv, FALSE, nullptr);
+    cl_->SetPipelineState(coverage);
+    SetViewportScissor(s, guest_width, true);
+    if (a.index_count) cl_->DrawIndexedInstanced(a.index_count, 1, 0, a.base_vertex, 0);
+    else cl_->DrawInstanced(a.draw_count, 1, 0, 0);
+
+    const auto native_rtv = Cpu(rtv_heap_.Get(), bound_rt_->view, rtv_inc_);
+    const auto native_dsv = Cpu(dsv_heap_.Get(), bound_ds_->view, dsv_inc_);
+    cl_->OMSetRenderTargets(1, &native_rtv, FALSE, &native_dsv);
+    cl_->SetPipelineState(native);
+    SetViewportScissor(s, guest_width);
+}
+
 bool D3D12Backend::EnsureParticleDofAtlas(uint32_t extent) {
     auto& p = particle_dof_;
     if (p.atlas[0] && p.atlas_extent == extent) return true;
@@ -4204,7 +4468,7 @@ bool D3D12Backend::EnsureParticleDofAtlas(uint32_t extent) {
     }
     // Replacing an RTV must wait for previous draws that reference its old descriptor/resource.
     // The fixed pages otherwise survive target resizes and are reused without a CPU wait.
-    if (p.atlas[0]) Flush();
+    if (p.atlas[0] && !dof_resources_quiescent_) Flush();
     for (uint32_t i = 0; i < 2; ++i) {
         if (p.atlas[i]) Release(std::move(p.atlas[i]));
         p.atlas[i] = std::move(atlas[i]);
@@ -4342,6 +4606,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             p.atlas_rects.push_back({x, y, x + LONG(map.atlas_size & 0xffff), y + LONG(map.atlas_size >> 16)});
         }
         if (!p.atlas_rects.empty()) {
+            auto source_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleSource, cl_.Get());
             Transition(p.atlas[0].Get(), p.atlas_states[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
             SetBlitTarget(ParticleDofAtlasView(0), extent, extent);
             ClearParticleDofAtlasCells(cl_.Get(), ParticleDofAtlasView(0), p.atlas_rects);
@@ -4350,6 +4615,8 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
             Transition(p.atlas[0].Get(), p.atlas_states[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            source_timing.End();
+            auto filter_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleFilter, cl_.Get());
 
             Transition(p.atlas[1].Get(), p.atlas_states[1], D3D12_RESOURCE_STATE_RENDER_TARGET);
             SetBlitTarget(ParticleDofAtlasView(1), extent, extent);
@@ -4362,6 +4629,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             cl_->DrawInstanced(6, page.quad_count, 0, 0);
             Transition(p.atlas[1].Get(), p.atlas_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
+        auto composite_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleComposite, cl_.Get());
         restore_target();
         cl_->SetPipelineState(composite_pso);
         cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
@@ -4480,7 +4748,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         SetTextureViewsAndSamplers(s, stages, native_clamp);
         SetViewportScissor(s, size.w);
         SetBlendFactorStencilRef(s);
+        auto direct_timing = sh.particle_samples ? dof_timing_.Measure(DofGpuTiming::Stage::ParticleDirect, cl_.Get()) :
+                                                   DofGpuTiming::Scope{};
         DrawGeometry(a);
+        RecordWeaponDofCoverage(s, a, sh, k, pso, size.w);
     }
     if (bound_ds_ && k.zen && k.zwrite) ++particle_depth_serial_;
     if (sh.particle_samples) {
@@ -4536,6 +4807,22 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
+    if (flags & kClearDofLoading) {
+        if (flags != kClearDofLoading || count != 1 || !rects) return;
+        DofLoadingMarker marker{};
+        std::memcpy(&marker, rects, sizeof(marker));
+        if (!marker.generation || marker.reserved || marker.begin > 1) return;
+        if (marker.begin) {
+            // The atomic cancellation check also rejects a Begin whose mission ended while it was queued.
+            if (g_dof_loading_requested_generation.load(std::memory_order_acquire) != marker.generation) return;
+            dof_loading_generation_ = marker.generation;
+            dof_loading_after_present_ = presents_ + 1;
+            dof_preparation_started_ = true;
+        } else if (dof_loading_generation_ == marker.generation) {
+            dof_loading_generation_ = 0;
+        }
+        return;
+    }
     if (flags & (kClearParticleDofBegin | kClearParticleDofEnd)) {
         particle_dof_.marker = flags == kClearParticleDofBegin && count == 0 && !rects;
         return;
@@ -5034,24 +5321,7 @@ void D3D12Backend::RenderUi() {
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    if (dof_preparing_) {
-        const auto* viewport = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(.5f, .5f));
-        ImGui::Begin("Graphics preparation", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
-                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
-        ImGui::TextUnformatted("Preparing graphics...");
-        ImGui::TextUnformatted(dof_preparation_phase_);
-        if (dof_pipelines_) {
-            const auto stats = dof_pipelines_->GetStats();
-            const uint64_t total = stats.ready + stats.pending + stats.failed;
-            if (total) {
-                ImGui::Text("Particle pipelines: %llu / %llu", (unsigned long long)(stats.ready + stats.failed),
-                            (unsigned long long)total);
-                ImGui::ProgressBar(float(stats.ready + stats.failed) / float(total), ImVec2(280, 0));
-            }
-        }
-        ImGui::End();
-    } else if (app::kGame.ui) app::kGame.ui(fps_);
+    if (app::kGame.ui) app::kGame.ui(fps_);
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     cl_->SetDescriptorHeaps(1, uh);
@@ -5225,7 +5495,7 @@ void D3D12Backend::Present(const Surface& front) {
 
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
-    Submit(false);
+    Submit(false, true);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     bool vsync = app::Get().vsync;
     auto perf_swap = PerfClock::now();
@@ -5261,6 +5531,7 @@ void D3D12Backend::ApplySettings() {
         bound_rt_ = bound_ds_ = nullptr;
     }
     PrimeDepthOfField();
+    BeginDofTiming();
 }
 
 // the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure

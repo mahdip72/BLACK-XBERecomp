@@ -39,6 +39,8 @@ public:
     bool Dispatch(ID3D12GraphicsCommandList* command_list, ID3D12Resource* color, ID3D12Resource* encoded_depth,
                   ID3D12Resource* output, float coc_bound);
     void Reset();
+    // Transfer a separately prepared context only after the receiver's GPU work has completed.
+    void Swap(FidelityFxDof& other) noexcept;
     bool Ready() const;
     bool Matches(uint32_t width, uint32_t height, uint32_t rings = 4, bool disable_ring_merge = false) const;
     const char* Failure() const;

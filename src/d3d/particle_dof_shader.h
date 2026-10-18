@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "particle_dof_small_radius.h"
 
 namespace gpu {
 
@@ -324,13 +325,15 @@ float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target { return ParticleLe
 
 // Filter-only b0 is independent of the native vertex constants. Each packed float4 contains four radii
 // already scaled into atlas pixels. b1 keeps the production DrawConstants prefix and shared metadata ABI.
-inline const std::string kParticleDofAtlasFilterHlsl = std::string(kParticleDofQuadHlsl) + R"(
+inline std::string ParticleDofAtlasFilterSource(bool small_radius, bool interior) {
+    return std::string(kParticleDofQuadHlsl) + R"(
 cbuffer ParticleAtlasRadii : register(b0) { float4 particleRadii[256]; };
 cbuffer ParticleAtlasDraw : register(b1) { float4 drawPadding[130];
 )" + kParticleDofCbufferFields + R"(
 };
 )" + kParticleDofDiskHlsl + R"(
-Texture2D<float4> particleSourceAtlas : register(t0);
+Texture2D<float4> particleSourceAtlas : register(t0);)" +
+        (small_radius ? std::string(kParticleDofSmallRadiusHlsl) : std::string{}) + R"(
 SamplerState particleAtlasSampler : register(s0);
 struct AtlasOut { float4 pos : SV_Position; nointerpolation uint quad : TEXCOORD0; };
 float2 AtlasUnpack(uint packed) { return float2(packed & 65535u, packed >> 16); }
@@ -354,7 +357,21 @@ float4 filter_ps(AtlasOut i) : SV_Target {
     // Write the entire allocated cell, including transparent guards; no separate filtered-atlas clear.
     if (any(i.pos.xy < low + 2) || any(i.pos.xy >= high - 2)) return 0;
     float radius = particleRadii[i.quad / 4][i.quad % 4];
-    if ((asuint(radius) & 0x7f800000u) == 0x7f800000u || radius < 0) return 0;
+    if ((asuint(radius) & 0x7f800000u) == 0x7f800000u || radius < 0) return 0;)" +
+        (small_radius ? std::string("\n    if (radius <= 1.0) return ParticleSmallRadiusFilter(i.pos.xy, radius);\n") : std::string{}) +
+        (interior ? std::string(R"(
+    // Every original disk sample and its bilinear footprint are inside this cell.
+    // The edge path below retains its original rejection, clamping and denominator.
+    [branch] if (all(i.pos.xy - radius >= low + .5) && all(i.pos.xy + radius <= high - .5)) {
+        float2 centerUV = i.pos.xy / particleAtlasTarget.xy;
+        float2 radiusUV = radius / particleAtlasTarget.xy;
+        float4 interiorSum = 0;
+        [loop] for (int tap = 0; tap < PARTICLE_DOF_TAPS; ++tap)
+            interiorSum += particleSourceAtlas.SampleLevel(particleAtlasSampler,
+                centerUV + particleDisk[tap] * radiusUV, 0);
+        return interiorSum / PARTICLE_DOF_TAPS;
+    }
+)") : std::string{}) + R"(
     float4 sum = 0;
     [loop] for (int tap = 0; tap < PARTICLE_DOF_TAPS; ++tap) {
         float2 source = i.pos.xy + particleDisk[tap] * radius;
@@ -367,5 +384,9 @@ float4 filter_ps(AtlasOut i) : SV_Target {
     return sum / PARTICLE_DOF_TAPS;
 }
 )";
+}
+
+// Small apertures combine the same bilinear weights; interior pixels retain all 64 disk taps.
+inline const std::string kParticleDofAtlasFilterHlsl = ParticleDofAtlasFilterSource(true, true);
 
 } // namespace gpu

@@ -29,6 +29,7 @@
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
 #include "common/translations.h"
+#include "d3d/dof_profile.h"
 
 namespace app {
 
@@ -985,6 +986,38 @@ void DrawDofPanel() {
         }
         DofViewUnitsSlider("Weapon sharp depth", o.dof_weapon_sharp_depth, 10000, &o.dof_weapon_transition);
         DofViewUnitsSlider("Weapon focus transition", o.dof_weapon_transition, o.dof_weapon_sharp_depth);
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("GPU frame timings")) {
+            bool profiling = gpu::DofGpuProfilingEnabled();
+            if (ImGui::Checkbox("Measure GPU stages", &profiling)) gpu::SetDofGpuProfilingEnabled(profiling);
+            ImGui::TextDisabled("Capture adds timing markers; off for normal play.");
+            if (profiling) {
+                const auto report = gpu::GetDofGpuReport();
+                ImGui::Text("Complete frames: %llu", (unsigned long long)report.complete_frames);
+                if (report.invalid_frames || report.busy_frames || report.dropped_intervals)
+                    ImGui::Text("Excluded: %llu frames, %llu dropped markers",
+                        (unsigned long long)report.invalid_frames, (unsigned long long)report.dropped_intervals);
+                if (ImGui::BeginTable("##dof_gpu_stages", 3, ImGuiTableFlags_SizingStretchProp)) {
+                    ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+                    ImGui::TableSetupColumn("Median ms", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                    ImGui::TableSetupColumn("p95 ms", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                    ImGui::TableHeadersRow();
+                    for (uint32_t i = 0; i < gpu::DofGpuTiming::kStageCount; ++i) {
+                        const auto& stage = report.stage[i];
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(gpu::DofGpuTiming::StageName(gpu::DofGpuTiming::Stage(i)));
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Active in %llu of %llu complete frames.\nGPU duration, not CPU submission time.\nFrame percentiles include inactive zero-cost frames.",
+                            (unsigned long long)stage.active_frames, (unsigned long long)report.complete_frames);
+                        ImGui::TableNextColumn();
+                        if (stage.intervals) ImGui::Text("%.3f", stage.median_frame_ms); else ImGui::TextUnformatted("--");
+                        ImGui::TableNextColumn();
+                        if (stage.intervals) ImGui::Text("%.3f", stage.p95_frame_ms); else ImGui::TextUnformatted("--");
+                    }
+                    ImGui::EndTable();
+                }
+            }
+        }
         ImGui::Separator();
         if (ImGui::Button(Ui("Reset DOF tuning", false).c_str())) {
             RowText(kResetDofTuning, 1);

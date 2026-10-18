@@ -33,6 +33,7 @@
 #include "d3d/particle_dof.h"
 #include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_geometry.h"
+#include "d3d/particle_dof_small_radius.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "gpu/shaders.h"
 
@@ -50,6 +51,9 @@ using ::gpu::kTexWide;
 #include "reference/particle_dof_wrapper.h"
 #undef ParticleDofNativePixelKey
 }
+namespace smoke_f543 {
+#include "reference/f543f54/particle_dof_shader.h"
+}
 namespace smoke_v25 {
 namespace gpu {
 using ::gpu::PixelKey;
@@ -66,6 +70,8 @@ using ::gpu::kTexWide;
 using Microsoft::WRL::ComPtr;
 
 namespace {
+bool g_optimization_only=false;
+bool g_small_radius_only=false;
 
 void Check(bool okay, const char* why) {
     if (!okay) throw std::runtime_error(why);
@@ -290,6 +296,7 @@ ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile,
     static std::map<Key,ComPtr<ID3DBlob>> compiled;
     Key key{source,profile,entry};
     if (const auto it=compiled.find(key);it!=compiled.end()) return it->second;
+    std::printf("FXC begin %s/%s %zu bytes\n",entry,profile,source.size());
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "production particle shader",
                                   nullptr, nullptr, entry, profile,
@@ -298,6 +305,7 @@ ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile,
         std::fprintf(stderr, "%s: %s\n", profile,
                      static_cast<const char*>(errors->GetBufferPointer()));
     Hr(hr, "D3DCompile(production particle shader)");
+    std::printf("FXC ready %s/%s %zu bytes\n",entry,profile,code->GetBufferSize());
     compiled.emplace(std::move(key),code);
     return code;
 }
@@ -316,9 +324,14 @@ struct SmokeScene {
     D3D12_RECT sample_occluder{40, 24, 56, 40};
 };
 
+std::string SmallRadiusFilterSource() {
+    return gpu::ParticleDofAtlasFilterSource(true,false);
+}
+
 class Warp {
 public:
     Warp() {
+        std::puts("WARP fixture: create device and production shader variants");
         ComPtr<ID3D12Debug> debug;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
             debug->EnableDebugLayer();
@@ -377,6 +390,7 @@ public:
                 atlas_composite_ps_[blend][i]=gpu::MakeParticleDofPixelShader(native_ps_,samples,blend,7,2);
             }
         }
+        if (!g_optimization_only) {
         Compile(native_vs_, "vs_5_0"); Compile(native_ps_, "ps_5_0");
         Compile(wrapped_vs_, "vs_5_0");
         for (const auto& source : wrapped_ps_) Compile(source, "ps_5_0");
@@ -398,6 +412,7 @@ public:
         for (const auto& modes:atlas_composite_ps_) for (const auto& source:modes) Compile(source,"ps_5_0");
         Compile(gpu::kParticleDofAtlasFilterHlsl,"vs_5_0","vs");
         Compile(gpu::kParticleDofAtlasFilterHlsl,"ps_5_0","filter_ps");
+        Compile(SmallRadiusFilterSource(),"ps_5_0","filter_ps");
         auto assembly = [&](const std::string& source) {
             const auto code = Compile(source, "ps_5_0");
             ComPtr<ID3DBlob> disassembled;
@@ -423,7 +438,12 @@ public:
         std::printf("64-tap PS disassembly: frozen sincos/sqrt %zu/%zu, optimized %zu/%zu\n",
                     old_trig, old_sqrt, new_trig, new_sqrt);
         std::puts("actual native particle VS/PS and current/reference 1x/2x/4x/8x wrappers compiled");
+        } else {
+            Compile(SmallRadiusFilterSource(),"ps_5_0","filter_ps");
+            std::puts("optimization-only shader variants compiled");
+        }
         MakeRoot();
+        std::puts("WARP fixture: shader roots ready");
     }
 
     ~Warp() { if (event_) CloseHandle(event_); }
@@ -443,12 +463,18 @@ public:
                               bool additive = false,
                               bool v25 = false,
                               bool atlas = false,
-                              uint32_t atlas_extent = 128) {
+                              uint32_t atlas_extent = 128,
+                              bool baseline_filter = false,
+                              bool small_radius_filter = false,
+                              std::vector<Pixel>* filter_pixels = nullptr,
+                              bool interior_filter = false) {
         Check(!additive || blend, "additive smoke needs its native blend state");
         Check(!additive || !reference, "the frozen reference predates additive smoke");
         Check(!reference || !v25, "select only one frozen smoke reference");
         Check(!atlas || (wrapped && !reference && !v25),
               "atlas smoke requires the production wrapper");
+        Check(!(small_radius_filter || interior_filter) || (atlas && !baseline_filter),
+              "pixel-filter candidate must use current atlas source");
         Check(scene.width && scene.height && scene.tex_width && scene.tex_height &&
               scene.texture.size() == size_t(scene.tex_width) * scene.tex_height &&
               scene.source_depth.size() == size_t(scene.width) * scene.height &&
@@ -549,8 +575,8 @@ public:
         auto dcb = UploadBuffer(constants.data(), constants.size());
         ComPtr<ID3D12Resource> radii_cb;
         std::vector<ComPtr<ID3D12Resource>> atlas_page_cb;
+        std::array<float,gpu::kParticleDofMaxQuads> radii{};
         if (atlas) {
-            std::array<float,gpu::kParticleDofMaxQuads> radii{};
             for (size_t q=0;q<metadata.size();++q)
                 if (metadata[q].atlas_scale>0)
                     radii[q]=gpu::ParticleDofRadius(1.0f/vertices[q*4].position[2],
@@ -697,8 +723,13 @@ public:
             const auto composite_vs=Compile(atlas_composite_vs_,"vs_5_0");
             const auto composite_ps=Compile(alpha_function==7?atlas_composite_ps_[mode][ps_index]:
                 gpu::MakeParticleDofPixelShader(native_ps_,depth_samples,mode,alpha_function,2),"ps_5_0");
-            const auto filter_vs=Compile(gpu::kParticleDofAtlasFilterHlsl,"vs_5_0","vs");
-            const auto filter_ps=Compile(gpu::kParticleDofAtlasFilterHlsl,"ps_5_0","filter_ps");
+            const std::string filter_source=baseline_filter ?
+                smoke_f543::gpu::kParticleDofAtlasFilterHlsl :
+                (small_radius_filter || interior_filter) ?
+                    gpu::ParticleDofAtlasFilterSource(small_radius_filter,interior_filter) :
+                    gpu::kParticleDofAtlasFilterHlsl;
+            const auto filter_vs=Compile(filter_source,"vs_5_0","vs");
+            const auto filter_ps=Compile(filter_source,"ps_5_0","filter_ps");
             source_pso=Pipeline(source_vs.Get(),source_ps.Get(),false);
             composite_pso=Pipeline(composite_vs.Get(),composite_ps.Get(),blend,additive);
             filter_pso=RangePipeline(filter_vs.Get(),filter_ps.Get(),
@@ -833,7 +864,7 @@ public:
                         atlas_page_cb[pi]->GetGPUVirtualAddress());
                     list->SetPipelineState(filter_pso.Get());
                     list->DrawInstanced(6,page.quad_count,0,0);
-                    auto b=Transition(atlas_filtered.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    auto b=Transition(atlas_filtered.Get(),filtered_state,
                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     list->ResourceBarrier(1,&b);
                     filtered_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -870,6 +901,23 @@ public:
         destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         destination.PlacedFootprint = footprint.placed;
         list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        ComPtr<ID3D12Resource> filter_readback;
+        CopyFootprint filter_footprint{};
+        if (atlas && filter_pixels) {
+            filter_footprint=Footprint(atlas_filtered.Get());
+            filter_readback=NewBuffer(filter_footprint.bytes,D3D12_HEAP_TYPE_READBACK,
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+            const auto b=Transition(atlas_filtered.Get(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1,&b);
+            D3D12_TEXTURE_COPY_LOCATION atlas_src{},atlas_dst{};
+            atlas_src.pResource=atlas_filtered.Get();
+            atlas_src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            atlas_dst.pResource=filter_readback.Get();
+            atlas_dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            atlas_dst.PlacedFootprint=filter_footprint.placed;
+            list->CopyTextureRegion(&atlas_dst,0,0,0,&atlas_src,nullptr);
+        }
         Hr(list->Close(), "Close smoke command list");
         ID3D12CommandList* lists[] = {list.Get()};
         queue_->ExecuteCommandLists(1, lists);
@@ -881,6 +929,9 @@ public:
                   "WARP smoke draw timed out");
         }
         CheckDebugMessages();
+        if (filter_readback)
+            *filter_pixels=ReadPixels(filter_readback.Get(),filter_footprint.placed,
+                                      kAtlasExtent,kAtlasExtent);
         return ReadPixels(readback.Get(), footprint.placed, scene.width, scene.height);
     }
 
@@ -1620,6 +1671,13 @@ std::vector<Pixel> RenderAtlas(Warp& warp,const SmokeScene& s,bool blend=false,
                                uint32_t extent=128) {
     return warp.Render(s,true,blend,samples,mixed,false,additive,false,true,extent);
 }
+std::vector<Pixel> RenderAtlasFilter(Warp& warp,const SmokeScene& s,
+    bool frozen,std::vector<Pixel>* filter=nullptr,
+    bool blend=false,uint32_t samples=1,bool mixed=false,bool additive=false,
+    uint32_t extent=128,bool use_small_radius=false,bool use_interior=false) {
+    return warp.Render(s,true,blend,samples,mixed,false,additive,false,true,
+                       extent,frozen,use_small_radius,filter,use_interior);
+}
 struct AtlasError { float rgb_rms=0,alpha_energy=0,max_rgba=0,raw_rgb_max=0; };
 AtlasError CompareAtlasPixels(const SmokeScene& s,const std::vector<Pixel>& old,
                               const std::vector<Pixel>& now,bool straight_layer=true) {
@@ -1839,13 +1897,230 @@ void CheckAtlasClippedAlphaTest(Warp& warp) {
           "atlas wrote outside the odd clipped viewport");
 }
 
+SmokeScene FilterTextureScene(float radius,float view_z=3.0f) {
+    auto s=Scene(view_z);
+    s.geometry.globals.optics[1]=1.0f;
+    const float unit_coc=gpu::ParticleDofRadius(view_z,s.geometry.globals);
+    Check(unit_coc>0,"filter fixture requires a defocused plane");
+    s.geometry.globals.optics[1]=radius/unit_coc;
+    const uint32_t colors[]{0xC0FF7040,0x8020E0FF,0xE0FFE050,0x702080FF};
+    for (size_t i=0;i<4;++i) s.vertices[i].argb=colors[i];
+    for (uint32_t y=0;y<s.tex_height;++y)
+        for (uint32_t x=0;x<s.tex_width;++x) {
+            const uint32_t h=(x*71u+y*131u+x*y*19u)^((x+y*3u)<<4);
+            const uint8_t a=(x==16 && y==16)?255:uint8_t((h>>2)&127u);
+            s.texture[size_t(y)*s.tex_width+x]=Rgba(uint8_t(32+(h&223u)),
+                uint8_t(16+((h>>8)&239u)),uint8_t((h>>16)&255u),a);
+        }
+    return s;
+}
+
+struct FilterDifference { double rms=0,maximum=0; };
+FilterDifference CompareFilteredCell(const SmokeScene& scene,
+    const std::vector<Pixel>& old,const std::vector<Pixel>& now,uint32_t extent) {
+    Check(old.size()==size_t(extent)*extent && now.size()==old.size(),
+          "atlas filter readback extent differs");
+    std::vector<gpu::NativeParticleVertex> expanded;
+    std::vector<gpu::ParticleDofQuad> meta;
+    gpu::ParticleDofGeometryStats stats{};
+    Check(gpu::BuildParticleDofGeometry(scene.vertices,scene.geometry,expanded,meta,stats) &&
+          meta.size()==1,"filter fixture did not expand one native quad");
+    const auto pages=gpu::BuildParticleDofAtlasPages(expanded,scene.geometry,meta,extent,extent);
+    Check(pages.size()==1 && meta[0].atlas_scale>0,
+          "filter fixture did not map one atlas cell");
+    const auto& cell=meta[0];
+    const uint32_t x0=cell.atlas_xy&65535u,y0=cell.atlas_xy>>16;
+    const uint32_t w=cell.atlas_size&65535u,h=cell.atlas_size>>16;
+    Check(x0+w<=extent && y0+h<=extent,"filter cell extends outside atlas");
+    double sum=0;size_t values=0;
+    FilterDifference error{};
+    for (uint32_t y=y0;y<y0+h;++y)
+        for (uint32_t x=x0;x<x0+w;++x) {
+            const auto& a=old[size_t(y)*extent+x];
+            const auto& b=now[size_t(y)*extent+x];
+            const float delta[]{a.r-b.r,a.g-b.g,a.b-b.b,a.a-b.a};
+            for (float d:delta) {
+                Check(std::isfinite(d),"pixel filter returned nonfinite atlas data");
+                sum+=double(d)*d;
+                error.maximum=std::max(error.maximum,double(std::abs(d)));
+                ++values;
+            }
+        }
+    error.rms=std::sqrt(sum/std::max<size_t>(values,1));
+    return error;
+}
+
+void CheckAlternatePixelFilter(Warp& warp) {
+    // The small-radius and interior branches share the exact production source
+    // factory; the frozen f543 filter supplies an independent 64-tap reference.
+    constexpr double kCellRms=.006,kCellMax=.025;
+    constexpr float kVisibleRms=.008f,kAlphaEnergy=.015f;
+    for (float radius:{.05f,.25f,.5f,1.0f,1.001f,2.0f,3.9f,4.0f,12.0f,24.0f}) {
+        auto s=FilterTextureScene(radius);
+        std::vector<Pixel> old_filter,new_filter;
+        const auto old=RenderAtlasFilter(warp,s,true,&old_filter);
+        const auto now=RenderAtlasFilter(warp,s,false,&new_filter,
+                                         false,1,false,false,128,true,true);
+        const auto visible=CompareAtlasPixels(s,old,now);
+        const auto cell=CompareFilteredCell(s,old_filter,new_filter,128);
+        std::printf("alternate PS radius %.3f (%s): cell RGBA RMS %.6f max %.6f; "
+                    "visible premult RGB RMS %.6f, alpha energy %.4f%%\n",
+                    radius,radius<=1?"nine-load":"64-tap interior/border",
+                    cell.rms,cell.maximum,visible.rgb_rms,100*visible.alpha_energy);
+        if (radius==4.0f || radius==12.0f || radius==24.0f) {
+            const char* prefix=radius==4.0f?"alternate-r4":radius==12.0f?"alternate-r12":"alternate-r24";
+            WriteBmp((std::string(prefix)+"-f543.bmp").c_str(),s,old);
+            WriteBmp((std::string(prefix)+"-after.bmp").c_str(),s,now);
+        }
+        Check(cell.rms<kCellRms && cell.maximum<kCellMax &&
+              visible.rgb_rms<kVisibleRms && visible.alpha_energy<kAlphaEnergy,
+              "alternate pixel filter differs materially from frozen f543f54 aperture");
+    }
+
+    auto focus=Scene(5.0f);
+    const auto native=warp.Render(focus,false,false);
+    const auto focused=RenderAtlasFilter(warp,focus,false,nullptr,
+                                         false,1,false,false,128,true,true);
+    Check(CompareAtlasPixels(focus,native,focused).max_rgba<.003f,
+          "alternate PS changed zero-CoC native smoke");
+
+    for (float view_z:{3.0f,12.0f}) {
+        auto s=FilterTextureScene(4.0f,view_z);
+        for (uint32_t y=24;y<40;++y)
+            for (uint32_t x=40;x<56;++x) s.source_depth[At(s,x,y)]=.1f;
+        const auto old=RenderAtlasFilter(warp,s,true);
+        const auto now=RenderAtlasFilter(warp,s,false,nullptr,
+                                         false,1,false,false,128,true,true);
+        const auto e=CompareAtlasPixels(s,old,now);
+        std::printf("alternate PS z%.0f occlusion: visible RMS %.6f alpha energy %.4f%%\n",
+                    view_z,e.rgb_rms,100*e.alpha_energy);
+        Check(e.rgb_rms<kVisibleRms && e.alpha_energy<kAlphaEnergy,
+              "alternate PS changed near/far source occlusion");
+    }
+
+    auto additive=FilterTextureScene(4.0f);
+    additive.clear={.04f,.07f,.11f,.15f};
+    const auto old_add=RenderAtlasFilter(warp,additive,true,nullptr,true,1,false,true);
+    const auto new_add=RenderAtlasFilter(warp,additive,false,nullptr,
+                                         true,1,false,true,128,true,true);
+    const auto add_error=CompareAtlasPixels(additive,old_add,new_add,false);
+    Check(add_error.rgb_rms<kVisibleRms && add_error.alpha_energy<kAlphaEnergy,
+          "alternate PS changed additive color or second-moment alpha");
+
+    auto clipped=FilterTextureScene(4.0f);
+    clipped.geometry.globals.viewport[0]=7;
+    clipped.geometry.globals.viewport[1]=9;
+    clipped.geometry.globals.viewport[2]=55;
+    clipped.geometry.globals.viewport[3]=48;
+    clipped.scissor={7,9,62,57};
+    const auto old_clip=RenderAtlasFilter(warp,clipped,true);
+    const auto new_clip=RenderAtlasFilter(warp,clipped,false,nullptr,
+                                         false,1,false,false,128,true,true);
+    const auto clip_error=CompareAtlasPixels(clipped,old_clip,new_clip);
+    Check(clip_error.rgb_rms<kVisibleRms && clip_error.alpha_energy<kAlphaEnergy &&
+          new_clip[At(clipped,6,32)].a==0 && new_clip[At(clipped,48,8)].a==0,
+          "alternate PS changed odd-offset viewport or wrote outside scissor");
+
+    auto pair=Scene(3.0f);
+    std::fill(pair.texture.begin(),pair.texture.end(),Rgba(255,255,255,255));
+    auto near_quad=Quad(40,24,56,40,1.0f/3,2.25f);
+    auto far_quad=Quad(41,24,57,40,1.0f/12,2.25f);
+    for (auto& v:near_quad) v.argb=0xA0FF2020;
+    for (auto& v:far_quad) v.argb=0xA02040FF;
+    pair.vertices.assign(near_quad.begin(),near_quad.end());
+    pair.vertices.insert(pair.vertices.end(),far_quad.begin(),far_quad.end());
+    const auto old_pair=RenderAtlasFilter(warp,pair,true,nullptr,true,
+                                           1,false,false,32);
+    const auto new_pair=RenderAtlasFilter(warp,pair,false,nullptr,true,
+                                           1,false,false,32,true,true);
+    const auto order_error=CompareAtlasPixels(pair,old_pair,new_pair,false);
+    auto reversed=pair;
+    std::copy(far_quad.begin(),far_quad.end(),reversed.vertices.begin());
+    std::copy(near_quad.begin(),near_quad.end(),reversed.vertices.begin()+4);
+    const auto new_reverse=RenderAtlasFilter(warp,reversed,false,nullptr,true,
+                                              1,false,false,32,true,true);
+    const auto center=At(pair,48,32);
+    Check(order_error.rgb_rms<kVisibleRms && order_error.alpha_energy<kAlphaEnergy &&
+          (std::abs(new_pair[center].r-new_reverse[center].r)>.01f ||
+           std::abs(new_pair[center].b-new_reverse[center].b)>.01f),
+          "alternate PS changed two-page order or scene energy");
+
+    auto mixed=FilterTextureScene(4.0f);
+    mixed.source_depth[At(mixed,48,32)]=.1f;
+    for (uint32_t samples:{4u,8u}) {
+        if (!warp.SupportsDepthSamples(samples)) continue;
+        const auto old=RenderAtlasFilter(warp,mixed,true,nullptr,
+                                         false,samples,true);
+        const auto now=RenderAtlasFilter(warp,mixed,false,nullptr,
+                                         false,samples,true,false,128,true,true);
+        const auto e=CompareAtlasPixels(mixed,old,now);
+        std::printf("alternate PS %ux mixed visibility: visible RMS %.6f alpha energy %.4f%%\n",
+                    samples,e.rgb_rms,100*e.alpha_energy);
+        Check(e.rgb_rms<kVisibleRms && e.alpha_energy<kAlphaEnergy,
+              "alternate PS changed fractional MSAA source visibility");
+    }
+}
+
+void CheckSmallRadiusFilter(Warp& warp) {
+    constexpr double kCellRms=.006,kCellMax=.025;
+    constexpr float kVisibleRms=.008f,kAlphaEnergy=.015f;
+    for (float radius:{.05f,.25f,.5f,.99f,1.0f,1.001f}) {
+        gpu::ParticleDofSmallRadiusWeights weights{};
+        if (radius<=1.0f) {
+            Check(gpu::BuildParticleDofSmallRadiusWeights(radius,weights),
+                  "production small-radius coefficients rejected valid radius");
+            double sum=0;
+            for (float weight:weights.texel) {
+                Check(std::isfinite(weight) && weight>=-1e-5f,
+                      "small-radius algebra produced a negative/nonfinite weight");
+                sum+=weight;
+            }
+            Check(std::abs(sum-1.0)<1e-5,"small-radius weights do not conserve color/opacity");
+        }
+        auto s=FilterTextureScene(radius);
+        std::vector<Pixel> old_filter,new_filter;
+        const auto old=RenderAtlasFilter(warp,s,true,&old_filter);
+        const auto now=RenderAtlasFilter(warp,s,false,&new_filter,
+                                         false,1,false,false,128,true);
+        const auto cell=CompareFilteredCell(s,old_filter,new_filter,128);
+        const auto visible=CompareAtlasPixels(s,old,now);
+        std::printf("small radius %.3f: cell RGBA RMS %.6f max %.6f; "
+                    "visible premult RGB RMS %.6f, alpha energy %.4f%%\n",
+                    radius,cell.rms,cell.maximum,visible.rgb_rms,100*visible.alpha_energy);
+        Check(cell.rms<kCellRms && cell.maximum<kCellMax &&
+              visible.rgb_rms<kVisibleRms && visible.alpha_energy<kAlphaEnergy,
+              "small-radius polynomial differs materially from frozen 64-tap filter");
+    }
+}
+
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
     try {
+        std::setvbuf(stdout,nullptr,_IONBF,0);
+        std::setvbuf(stderr,nullptr,_IONBF,0);
+        Check(argc==1 || (argc==2 &&
+              (std::strcmp(argv[1],"--optimization-only")==0 ||
+               std::strcmp(argv[1],"--small-radius-only")==0)),
+              "usage: new_smoke_dof_warp [--optimization-only|--small-radius-only]");
+        g_small_radius_only=argc==2 && std::strcmp(argv[1],"--small-radius-only")==0;
+        g_optimization_only=argc==2;
+        if (g_optimization_only) {
+            Warp warp;
+            std::puts("RUN small-radius optimization fixtures");
+            CheckSmallRadiusFilter(warp);
+            if (!g_small_radius_only) {
+                std::puts("RUN alternate pixel-filter fixtures");
+                CheckAlternatePixelFilter(warp);
+            }
+            std::puts("production particle smoke DoF WARP optimization checks PASS");
+            return 0;
+        }
+        std::puts("RUN particle shader canonicalization and geometry");
         CheckParticleShaderCanonicalization();
         CheckGeometry();
         Warp warp;
+        std::puts("RUN legacy and atlas smoke fixtures");
         CheckFocusAndMixedBatch(warp);
         CheckBlurSupportAndAlpha(warp);
         CheckNativeDiagonal(warp);
@@ -1862,6 +2137,10 @@ int main() {
         CheckAtlasFallbackAndOrder(warp);
         CheckAtlasAdditive(warp);
         CheckAtlasClippedAlphaTest(warp);
+        std::puts("RUN small-radius optimization fixtures");
+        CheckSmallRadiusFilter(warp);
+        std::puts("RUN alternate pixel-filter fixtures");
+        CheckAlternatePixelFilter(warp);
         std::puts("production particle smoke DoF WARP checks PASS");
         return 0;
     } catch (const std::exception& e) {

@@ -2,13 +2,15 @@
 
 namespace gpu {
 
+inline constexpr unsigned kViewmodelDofTileSize = 8;
+
 // Interior-only softening for depth-writing first-person geometry. The renderer captures depth immediately
 // before the early gun draw and invokes this pass only during normal gameplay, before the HUD.
 inline constexpr char kViewmodelDofHlsl[] = R"(
 // zp = projection numerator, projection depth offset, amount [0,1], target height / 1080.
 // The projection numerator uses the renderer's view-depth scale; these depths do not claim physical metres.
-// vp = viewport origin and size. Pack initializes both complete targets, including the viewport exterior.
-// focus = sharp depth, transition width, reserved, reserved. Both depths use the reconstructed view scale.
+// vp = viewport origin and size. Sparse pack requires both complete targets cleared to zero first.
+// focus = sharp depth, transition width, target width, target height. Depths use the reconstructed view scale.
 cbuffer ViewmodelDof : register(b1) { float4 zp; float4 vp; float4 focus; };
 #ifdef MS
 Texture2DMS<float> after_depth : register(t0);
@@ -32,11 +34,54 @@ float3 RawColor(int2 p, int i) { return raw_color.Load(int3(p, 0)).rgb; }
 Texture2D<float4> gun_color : register(t0);
 Texture2D<float> gun_depth : register(t1);
 Texture2D<float4> resolved_scene : register(t2);
+Texture2D<float> weapon_tiles : register(t3);
 struct Packed { float4 color : SV_Target0; float depth : SV_Target1; };
 
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+// Replayed native weapon geometry supplies the VS/IA/constants. Conservative
+// rasterization marks a superset at 1/8 resolution without reading scene depth.
+float viewmodel_dof_coverage() : SV_Target { return 1; }
+
+// Test-only depth-mask oracle; the renderer must not dispatch this serial scan.
+// The tile classifier is conservative: invalid changed samples may activate a
+// tile, but every sample accepted by ChangedDepth necessarily activates it.
+// It scans actual paired depth, never an assumed on-screen weapon rectangle.
+float viewmodel_dof_tiles(float4 pos : SV_Position) : SV_Target {
+    int2 first = int2(pos.xy) * 8;
+    [loop] for (int y = 0; y < 8; ++y) {
+        [loop] for (int x = 0; x < 8; ++x) {
+            int2 p = first + int2(x, y);
+            float2 center = float2(p) + 0.5;
+            if (any(p >= int2(focus.zw)) || any(center < vp.xy) || any(center >= vp.xy + vp.zw)) continue;
+            [unroll] for (int s = 0; s < DOF_SAMPLES; ++s)
+                if (asuint(After(p, s)) != asuint(Before(p, s))) return 1;
+        }
+    }
+    return 0;
+}
+
+// Draw six vertices per tile, one instance for every tile. Empty tiles become
+// degenerate triangles before rasterization. All changed tiles are packed,
+// including focused geometry that neighboring blur taps may need; no dilation
+// is required because the original effect does not expand the gun silhouette.
+// Use this VS for pack at every sample count, but composition only at 1x.
+// MSAA composition must retain the full-screen VS: its resolved-RGB broadcast
+// into unchanged world samples affects later coverage-dependent blending.
+float4 viewmodel_dof_tiles_vs(uint id : SV_VertexID, uint instance : SV_InstanceID) : SV_Position {
+    uint columns, rows;
+    weapon_tiles.GetDimensions(columns, rows);
+    uint2 tile = uint2(instance % columns, instance / columns);
+    if (tile.y >= rows || weapon_tiles.Load(int3(tile, 0)) == 0) return float4(2, 2, 0, 1);
+    static const uint2 corners[6] = {
+        uint2(0, 0), uint2(1, 0), uint2(0, 1),
+        uint2(0, 1), uint2(1, 0), uint2(1, 1)
+    };
+    float2 pixel = min(float2((tile + corners[id]) * 8), focus.zw);
+    return float4(pixel / focus.zw * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 
 float ChangedDepth(int2 p, int sample_index) {

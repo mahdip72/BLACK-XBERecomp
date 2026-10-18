@@ -15,12 +15,14 @@
 
 #include "d3d/dof_shader_library.h"
 #include "d3d/dof_shader_source.h"
+#include "d3d/shader_cache.h"
 #include "gpu/shaders.h"
 
 namespace {
 
 constexpr uint32_t kSamples[] = {1, 2, 4, 8};
-constexpr uint64_t kCompilerFlags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
+constexpr size_t kExpectedUniqueKeys = 432;
+const gpu::ShaderCache* g_bytecode_cache = nullptr;
 
 struct Key {
     uint64_t hash0 = 0;
@@ -61,11 +63,12 @@ std::string Quote(std::string_view value) {
 }
 
 bool Add(std::map<Key, Record>& records, std::string source, std::string_view entry,
-         std::string_view profile, uint64_t flags) {
+         std::string_view profile) {
     if (source.empty()) {
         std::cerr << "shader source builder returned empty source for " << entry << '\n';
         return false;
     }
+    const uint64_t flags = gpu::DofShaderCompilerFlags(entry, profile);
     const auto hash = gpu::HashDofShaderSource(source);
     Key key{hash.first, hash.second, source.size(), std::string(entry), std::string(profile), flags};
     auto found = records.find(key);
@@ -78,17 +81,23 @@ bool Add(std::map<Key, Record>& records, std::string source, std::string_view en
     }
 
     Microsoft::WRL::ComPtr<ID3DBlob> code;
-    Microsoft::WRL::ComPtr<ID3DBlob> errors;
-    const HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr,
-                                  std::string(entry).c_str(), std::string(profile).c_str(),
-                                  static_cast<UINT>(flags & 0xffffffffu),
-                                  static_cast<UINT>(flags >> 32), &code, &errors);
-    if (FAILED(hr) || !code || !code->GetBufferSize()) {
-        std::cerr << "D3DCompile failed for " << entry << ' ' << profile << " hr=0x"
-                  << std::hex << static_cast<uint32_t>(hr) << std::dec << '\n';
-        if (errors && errors->GetBufferSize())
-            std::cerr << static_cast<const char*>(errors->GetBufferPointer()) << '\n';
-        return false;
+    if (g_bytecode_cache)
+        code = g_bytecode_cache->Load(source, entry, profile, flags);
+    if (!code) {
+        Microsoft::WRL::ComPtr<ID3DBlob> errors;
+        const HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr,
+                                      std::string(entry).c_str(), std::string(profile).c_str(),
+                                      static_cast<UINT>(flags & 0xffffffffu),
+                                      static_cast<UINT>(flags >> 32), &code, &errors);
+        if (FAILED(hr) || !code || !code->GetBufferSize()) {
+            std::cerr << "D3DCompile failed for " << entry << ' ' << profile << " hr=0x"
+                      << std::hex << static_cast<uint32_t>(hr) << std::dec << '\n';
+            if (errors && errors->GetBufferSize())
+                std::cerr << static_cast<const char*>(errors->GetBufferPointer()) << '\n';
+            return false;
+        }
+        if (g_bytecode_cache)
+            g_bytecode_cache->Store(source, entry, profile, flags, code.Get());
     }
 
     Record record;
@@ -102,8 +111,8 @@ bool Add(std::map<Key, Record>& records, std::string source, std::string_view en
 
 bool AddPair(std::map<Key, Record>& records, std::string source, std::string_view vs_entry,
              std::string_view ps_entry) {
-    return Add(records, source, vs_entry, "vs_5_0", kCompilerFlags) &&
-           Add(records, std::move(source), ps_entry, "ps_5_0", kCompilerFlags);
+    return Add(records, source, vs_entry, "vs_5_0") &&
+           Add(records, std::move(source), ps_entry, "ps_5_0");
 }
 
 bool Build(std::map<Key, Record>& records) {
@@ -126,6 +135,15 @@ bool Build(std::map<Key, Record>& records) {
         if (!AddPair(records, std::move(source), "vs", pass.entry)) return false;
     }
 
+    if (!Add(records, gpu::DofStaticPassSource("viewmodel_dof_coverage", 1),
+             "viewmodel_dof_coverage", "ps_5_0")) return false;
+    for (uint32_t samples : kSamples) {
+        if (!Add(records, gpu::DofStaticPassSource("viewmodel_dof_pack", samples),
+                 "viewmodel_dof_tiles_vs", "vs_5_0")) return false;
+    }
+    if (!Add(records, gpu::DofStaticPassSource("viewmodel_dof"),
+             "viewmodel_dof_tiles_vs", "vs_5_0")) return false;
+
     for (uint32_t samples : kSamples) {
         auto source = gpu::DofParticleRangeSource(samples);
         if (!AddPair(records, std::move(source), "vs", "range_ps")) return false;
@@ -133,7 +151,7 @@ bool Build(std::map<Key, Record>& records) {
     if (!AddPair(records, gpu::kParticleDofAtlasFilterHlsl, "vs", "filter_ps")) return false;
 
     for (uint32_t pass = 0; pass <= 2; ++pass) {
-        if (!Add(records, gpu::DofParticleVertexSource(pass), "main", "vs_5_0", kCompilerFlags)) return false;
+        if (!Add(records, gpu::DofParticleVertexSource(pass), "main", "vs_5_0")) return false;
     }
     constexpr int alpha_functions[] = {0, 1, 2, 3, 4, 5, 6, 7};
     for (uint32_t samples : kSamples) {
@@ -143,7 +161,7 @@ bool Build(std::map<Key, Record>& records) {
                     for (uint32_t pass = 0; pass <= 2; ++pass) {
                         auto source = gpu::DofParticlePixelSource(
                             samples, blend, alpha_function, alpha_kill, pass);
-                        if (!Add(records, std::move(source), "main", "ps_5_0", kCompilerFlags)) return false;
+                        if (!Add(records, std::move(source), "main", "ps_5_0")) return false;
                     }
                 }
             }
@@ -224,13 +242,18 @@ int main(int argc, char** argv) {
         std::cerr << "usage: build_dof_shaders <generated-cpp-path>\n";
         return 2;
     }
+    const std::filesystem::path output(argv[1]);
+    const gpu::ShaderCache bytecode_cache(output.parent_path() / "dof-bytecode-cache");
+    g_bytecode_cache = &bytecode_cache;
+
     std::map<Key, Record> records;
     if (!Build(records)) return 1;
-    if (records.size() < 425) {
-        std::cerr << "incomplete DOF shader manifest: only " << records.size() << " unique keys\n";
+    if (records.size() != kExpectedUniqueKeys) {
+        std::cerr << "DOF shader manifest key count changed: expected " << kExpectedUniqueKeys
+                  << ", produced " << records.size() << " unique keys\n";
         return 1;
     }
-    if (!Write(std::filesystem::path(argv[1]), records)) return 1;
+    if (!Write(output, records)) return 1;
     std::cout << "Embedded " << records.size() << " unique DOF shader bytecode keys\n";
     return 0;
 }
