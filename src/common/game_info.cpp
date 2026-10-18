@@ -179,6 +179,7 @@ const app::GameInfo app::kGame = {
                 {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},
                 {"audio_output", nullptr, &game::Opt().audio_output},
                 {"controller_hold_aim", &game::Opt().controller_hold_aim, nullptr},
+                {"aim_assist", &game::Opt().aim_assist, nullptr},
                 {"rumble_intensity", nullptr, &game::Opt().rumble_intensity},
                 {"gyro_aiming", &game::Opt().gyro_aiming, nullptr},
                 {"menu_animations", &game::Opt().menu_animations, nullptr}},

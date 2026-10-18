@@ -97,8 +97,8 @@ void MouseLook(X86Context& ctx, uint8_t*) {
     UpdateSway(ctx, yaw, pitch);
 }
 
-// false with the keyboard or mouse used last: no pull of the view to a target, no shots bent to one
-bool AimAssist(X86Context&, uint8_t*) { return !input::KeyboardActive(); }
+// false with the keyboard or mouse used last or the option off: no pull of the view to a target, no shots bent to one
+bool AimAssist(X86Context&, uint8_t*) { return game::Opt().aim_assist && !input::KeyboardActive(); }
 
 // the look update: xmm3 the stick's yaw speed, xmm0 its pitch speed, before the zoom scale and frame time
 void StickLook(X86Context& ctx, uint8_t*) {

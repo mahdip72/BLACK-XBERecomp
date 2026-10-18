@@ -230,7 +230,7 @@ enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFps
              kAmbientOcclusion, kAudioOutput, kHdrOutput, kMonitor, kLanguage, kSmaa,
              kPauseOnFocusLoss, kFmvScale,
              kControllerHoldAim, kControllerSensitivity, kRumbleIntensity, kMenuAnimations,
-             kGyroAiming, kGyroSensitivity };
+             kGyroAiming, kGyroSensitivity, kAimAssist };
 
 using rows::Kind;
 using rows::Row;
@@ -282,6 +282,7 @@ const std::vector<Row>& InputRows() {
 constexpr Row kControllerRows[] = {
     {Kind::Heading, -1, "CONTROLLER"},
     {Kind::Value, kControllerHoldAim, "HOLD TO AIM"},
+    {Kind::Value, kAimAssist, "AIM ASSIST"},
     {Kind::Value, kControllerSensitivity, "SENSITIVITY"},
     {Kind::Value, kRumbleIntensity, "RUMBLE INTENSITY"},
     {Kind::Value, kGyroAiming, "GYRO AIMING"},
@@ -304,6 +305,7 @@ bool* ToggleFlag(Settings& s, int id) {
         case kHoldAim: return &o.hold_aim;
         case kControllerHoldAim: return &o.controller_hold_aim;
         case kGyroAiming: return &o.gyro_aiming;
+        case kAimAssist: return &o.aim_assist;
         default: return nullptr;
     }
 }
@@ -541,6 +543,7 @@ void RestoreDefaults(int page) {
     game::Options& o = game::Opt();
     if (page == kControllerPage) {
         o.controller_hold_aim = false;
+        o.aim_assist = true;
         o.controller_sensitivity = game::Options{}.controller_sensitivity;
         o.rumble_intensity = game::Options{}.rumble_intensity;
         o.gyro_aiming = false;
@@ -564,6 +567,7 @@ void RestoreDefaults(int page) {
     o.hold_aim = keep.hold_aim;
     o.walk_speed = keep.walk_speed;
     o.controller_hold_aim = keep.controller_hold_aim;
+    o.aim_assist = keep.aim_assist;
     o.controller_sensitivity = keep.controller_sensitivity;
     o.rumble_intensity = keep.rumble_intensity;
     o.gyro_aiming = keep.gyro_aiming;

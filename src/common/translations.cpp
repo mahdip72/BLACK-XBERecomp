@@ -110,6 +110,7 @@ constexpr Entry kEntries[] = {
     // CONTROLLER rows
     {"SENSITIVITY", {u"Sensibilité", u"Empfindlichkeit", u"Sensibilità", u"Sensibilidad"}},
     {"RUMBLE INTENSITY", {u"Intensité des vibrations", u"Vibrationsstärke", u"Intensità della vibrazione", u"Intensidad de la vibración"}},
+    {"AIM ASSIST", {u"Aide à la visée", u"Zielhilfe", u"Mira assistita", u"Asistencia de apuntado"}},
     {"GYRO AIMING", {u"Visée gyroscopique", u"Gyro-Zielen", u"Mira giroscopica", u"Apuntado con giroscopio"}},
     {"GYRO SENSITIVITY", {u"Sensibilité du gyroscope", u"Gyro-Empfindlichkeit", u"Sensibilità del giroscopio", u"Sensibilidad del giroscopio"}},
 
