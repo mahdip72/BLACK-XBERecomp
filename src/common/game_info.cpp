@@ -94,7 +94,7 @@ void Pad(int port, input::Pad& pad) {
 
 // the vibration at the rumble intensity, none while the keyboard and mouse are in use
 void Rumble(int port, uint16_t& left, uint16_t& right) {
-    uint32_t percent = std::min(Opt().rumble_intensity, 200u);
+    uint32_t percent = std::clamp(Opt().rumble_intensity, 10u, 200u);
     if (port == 0 && input::KeyboardActive()) percent = 0;
     left = uint16_t(std::min(left * percent / 100, 0xFFFFu));  // past 100% the motors saturate
     right = uint16_t(std::min(right * percent / 100, 0xFFFFu));
@@ -177,7 +177,8 @@ const app::GameInfo app::kGame = {
                 {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},
                 {"audio_output", nullptr, &game::Opt().audio_output},
                 {"controller_hold_aim", &game::Opt().controller_hold_aim, nullptr},
-                {"rumble_intensity", nullptr, &game::Opt().rumble_intensity}},
+                {"rumble_intensity", nullptr, &game::Opt().rumble_intensity},
+                {"menu_animations", &game::Opt().menu_animations, nullptr}},
     .load = game::Load,
     .save = game::Save,
     .init = game::Init,

@@ -591,3 +591,8 @@ call = "MoveEase"
 [[hook]]
 at = 0x1BD69F
 call = "StickLook"
+
+# src/game/menu_animations.cpp, before the Flash player's tick
+[[hook]]
+at = 0x124624
+call = "MenuAnimations"

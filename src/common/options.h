@@ -33,6 +33,7 @@ struct Options {
     bool controller_hold_aim = false;  // scopes too; off is the game's own, held to aim and scopes toggled
     float controller_sensitivity = 1.0f;  // times the game's right stick look speeds
     uint32_t rumble_intensity = 100;  // percent of the game's vibration
+    bool menu_animations = true;  // off: menu pages and the pause menu change without sliding in and out
     std::map<std::string, std::string> keys;  // action id to key names, absent is the default
 };
 Options& Opt();
