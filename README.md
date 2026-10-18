@@ -10,6 +10,24 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 - Put your game files in the `assets` folder. This can be an ISO, or the extracted data files, of the USA or Europe release.
 - Run `BLACK.exe`.
 - Recomp settings can be adjusted in the in-game options menu while the game is running, or through the Settings overlay, which is opened with F10 by default.
+
+### Install an HD texture pack
+
+If you have a prepared `BLACK-HD-Textures-4x.zip`, close the game and extract it
+into the folder containing `BLACK.exe`. The `textures` folder must be directly
+beside the executable:
+
+```text
+BLACK.exe
+assets/       your existing game files
+textures/     the DDS files from the texture pack
+```
+
+Start the game normally. Keep your existing `assets`, settings and saves.
+The ISO does not need to be changed. To disable the pack, rename or remove
+`textures` and restart. Use a build with texture-pack support and a pack matching
+your Xbox game files. See [pack contents and local preparation](docs/hd-textures.md).
+
 <img width="1920" height="1080" alt="{5852D359-24A0-48C8-9319-07C3A619E355}" src="https://github.com/user-attachments/assets/e0156eb8-c1b5-49d9-ab93-3abb46bf5f47" />
 
 
