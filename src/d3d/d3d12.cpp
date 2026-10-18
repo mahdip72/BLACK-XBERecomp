@@ -769,7 +769,7 @@ struct DrawTextures {
     float k[4] = {1, 1, 1, 1};  // Extension::Sample's k
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
     bool blur[4] = {};          // wide for a blur between small targets
-    bool align_glow = false;   // the final glow composite, separate from reflection/reload blur
+    bool final_glow = false;   // the final glow composite, separate from reflection/reload blur
 };
 
 // a draw's shaders: what they are made from, their cache keys, the hashes Compile returned and the compiled blobs
@@ -945,9 +945,11 @@ private:
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
+    float TargetScale() const;  // host pixels per console pixel of the bound target
+    float RenderTargetShift(const State& s, const DrawShaders& sh) const;
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                          GuestExtent size, DrawConstants& c);
-    void FillTextureConstants(const State& s, const DrawTextures& stages, DrawConstants& c);
+    void FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, DrawConstants& c);
     void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                      const DrawTextures& stages);
@@ -2162,6 +2164,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     if (&t == draw_ds_) return nullptr;
     bool feedback = &t == draw_rt_;
     stages.rt[stage] = true;
+    info.flags |= kTexTarget;
     if (!t.depth && LatchCpuWrite(t)) {
         Surface su;
         su.header = s.textures[size_t(stage)];
@@ -2532,7 +2535,7 @@ bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& sta
 }
 
 constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
-constexpr uint8_t kTexGlowSmooth = 8;  // local shader variant; SDK extension flags use bits 0 and 1
+constexpr uint8_t kTexGlowSmooth = 16;  // local shader variant, separate from SDK target/extension flags
 
 // Smooth only the final glow layer. Shared reflection and reload blur shaders stay intact.
 std::string GlowPixelHlsl(const PixelKey& pk) {
@@ -2677,11 +2680,8 @@ constexpr float kBlurTapTexels = 7.0f / 6;  // console texels between a blur's t
 void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c) {
     c.texsize[i][0] = float(d.width);
     c.texsize[i][1] = float(d.height);
-    // the console samples pixels at integer positions, D3D12 half a pixel on: targets are read half a texel back
     if (!stages.rt[i]) return;
     float k = stages.k[i];
-    c.texsize[i][2] = -0.5f / (float(d.width) * k);
-    c.texsize[i][3] = -0.5f / (float(d.height) * k);
     if (stages.info[i].flags & kTexGlowSmooth) {
         constexpr float kExtraGlowBlur = 2.27f;
         c.spread[i][0] = kGlowBoxTexels * kExtraGlowBlur / (4 * float(d.width) * k);
@@ -2701,10 +2701,12 @@ void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTex
     }
 }
 
-void D3D12Backend::FillTextureConstants(const State& s, const DrawTextures& stages, DrawConstants& c) {
+void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages,
+                                        DrawConstants& c) {
     for (int i = 0; i < 4; i++) {
         TextureDesc d;
         if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) FillTexelConstants(i, d, stages, c);
+        if (stages.rt[i]) c.rtshift[i] = RenderTargetShift(s, sh);
         const auto& t = s.tss[size_t(i)];
         c.bump[i][0] = Bits(t[kTssBumpEnvMat00]);
         c.bump[i][1] = Bits(t[kTssBumpEnvMat01]);
@@ -2828,6 +2830,19 @@ void FillLightConstants(const State& s, const FixedKey& fk, DrawConstants& c) {
     }
 }
 
+float D3D12Backend::TargetScale() const {
+    const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
+    if (!t || !t->gw) return 1;
+    return float(t->w) / float(t->gw);
+}
+
+// the XDK's screen space offset puts the console's positions half a pixel right and down of the host's, unless a
+// program writes them without c-37; render target reads move back that far (TexUv)
+float D3D12Backend::RenderTargetShift(const State& s, const DrawShaders& sh) const {
+    bool offset = !sh.prog || ReadsViewportOffset(s.vs->program);
+    return offset ? -0.5f * TargetScale() : 0.0f;
+}
+
 void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                                    GuestExtent size, DrawConstants& c) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
@@ -2836,17 +2851,12 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     FillSurfaceConstants(s, size, c);
     FillFogConstants(s, c);
     FillCombinerConstants(s, c);
-    if (stages.align_glow) {
+    if (stages.final_glow) {
         // RGB only: preserve the original alpha and the scene underneath the glow.
         for (int i = 0; i < 3; i++) c.pc[0][i] *= 0.65f;
     }
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
-    FillTextureConstants(s, stages, c);
-    if (stages.align_glow) {
-        // Calibrated in scene pixels so the glow stays aligned at any output resolution.
-        c.texsize[0][2] += 7.38f / guest_w_;
-        c.texsize[0][3] += 10.77f / guest_h_;
-    }
+    FillTextureConstants(s, sh, stages, c);
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
@@ -3057,7 +3067,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     PixelKey pk = MakePixelKey(s, stages.info);
     // The final glow is a quarter-size target added to the scene with RGB = t0 * pc0.
     TextureDesc glow;
-    stages.align_glow = prim == 5 && count == 3 && bound_rt_ && bound_rt_->gw == guest_w_ &&
+    stages.final_glow = prim == 5 && count == 3 && bound_rt_ && bound_rt_->gw == guest_w_ &&
         bound_rt_->gh == guest_h_ && !s.rs[kRsZEnable] && pk.programmable && (pk.count & 0xFF) == 1 &&
         pk.tex_modes == 1 && !pk.alphakill && pk.rgb_in[0] == 0xC8C10000 && pk.rgb_out[0] == 0xC0 &&
         pk.final_abcd == 0x00000C00 && pk.final_efg == 0x00001180 &&
@@ -3066,7 +3076,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         stages.rt[0] && (SimpleState(s, kMPsFinalConstant0) >> 24) == 255 &&
         !s.textures[1] && !s.textures[2] && !s.textures[3] && Describe(s.textures[0], glow) &&
         glow.format == 0x12 && glow.width * 4 == guest_w_ && glow.height * 4 == guest_h_;
-    if (stages.align_glow) {
+    if (stages.final_glow) {
         stages.info[0].flags |= kTexWide | kTexGlowSmooth;
         pk = MakePixelKey(s, stages.info);
     }
