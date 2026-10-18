@@ -142,9 +142,12 @@ float4 GuardedTexel(int2 p, float z) {
 
 // Guard every bilinear contributor before interpolation; a nearest-depth test with an ordinary bilinear
 // color sample would still contaminate edges with neighboring world or differently deep gun parts.
-float4 Gather(float2 q, float z) {
-    int2 p = int2(floor(q));
-    float2 f = frac(q);
+float4 Gather(int2 center, float2 offset, float z) {
+    // Keep floor and fraction on the same relative offset: FXC can remove the
+    // integer center from frac while floor still sees a rounded absolute sum.
+    // Near zero radius that mismatch selects an adjacent texel at full weight.
+    int2 p = center + int2(floor(offset));
+    float2 f = frac(offset);
     return GuardedTexel(p, z) * ((1 - f.x) * (1 - f.y))
          + GuardedTexel(p + int2(1, 0), z) * (f.x * (1 - f.y))
          + GuardedTexel(p + int2(0, 1), z) * ((1 - f.x) * f.y)
@@ -174,7 +177,7 @@ float4 viewmodel_dof(float4 pos : SV_Position) : SV_Target {
         float2(-.85, 0), float2(-.60104, -.60104), float2(0, -.85), float2(.60104, -.60104)
     };
     float4 sum = float4(center.rgb * center.a, center.a);
-    [loop] for (int i = 0; i < 12; i++) sum += Gather(p + disk[i] * radius, z);
+    [loop] for (int i = 0; i < 12; i++) sum += Gather(p, disk[i] * radius, z);
     float3 blurred = sum.rgb / sum.a;
     // Replace only the covered gun contribution. No silhouette expansion, world blur, or alpha change.
     return float4(original.rgb + center.a * (blurred - center.rgb), original.a);

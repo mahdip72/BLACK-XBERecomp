@@ -278,7 +278,9 @@ void TickDofPreview(float seconds) {
     g_preview_clock_started = true;
 }
 
-// These bool hooks bypass only the two render branches. Preview never changes the native effect or its clock.
+// Keep Modern mode's weapon after the scene effects even at zero focus strength. Switching its draw
+// stage at preview/idle endpoints abruptly changes post-effect lighting independently of the blur fade.
+// These bool hooks change only the render branches; Off/Original and native effect clocks stay native.
 bool DeferPreviewWeapon(X86Context&, uint8_t*) {
     g_preview = {};
     g_preview_weapon = {};
@@ -288,7 +290,7 @@ bool DeferPreviewWeapon(X86Context&, uint8_t*) {
         float seconds = g_preview_clock_started ? std::chrono::duration<float>(now - g_preview_clock).count() : 0;
         TickDofPreview(seconds);
     }
-    if (!PreviewAllowed() || (!game::Opt().dof_preview && !IdleFocusActive() && g_preview_phase == 0)) return false;
+    if (!PreviewAllowed()) return false;
     if (++g_preview_serial == 0) ++g_preview_serial;
     g_preview = {R32(kEffects), R32(layout::kDisplay), R32(kFrameCount), g_preview_serial,
                  CinematicDofStrength(g_preview_phase)};
@@ -358,8 +360,8 @@ void ReloadDepthOfField(X86Context&, uint8_t*) {
     }
 }
 
-// The normal weapon draw follows world list 0. Capture its existing depth so only newly written weapon samples
-// can receive the light blur. The original type-1 branch skips both hooks and draws the reload weapon later.
+// Keep the native early hooks installed. Eligible Modern frames defer this draw; Off/Original and
+// other native effect types fail blur eligibility. Native type-1 reloads also skip this early path.
 void BeginWeaponDepthOfField(X86Context& ctx, uint8_t*) {
     g_weapon_pending = false;
     if (!WeaponDofEligible()) return;
@@ -370,8 +372,8 @@ void EndWeaponDepthOfField(X86Context&, uint8_t*) {
     EndWeaponDof(false);
 }
 
-// Preview uses the same isolated list-5 depth mask after world effects, fading its normal blur inversely
-// to the latched world strength. A native type-1 reload never receives either weapon blur marker.
+// Modern mode uses the same isolated list-5 depth mask after world effects, including at zero focus.
+// Its normal blur fades inversely to the latched world strength; native type-1 reloads remain sharp.
 void BeginPreviewWeaponDepthOfField(X86Context& ctx, uint8_t*) {
     const PreviewDraw draw = g_preview_weapon;
     g_preview_weapon = {};

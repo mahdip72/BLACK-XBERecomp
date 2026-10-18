@@ -416,7 +416,6 @@ void TestPreviewGuards() {
         PreviewRenderFrame();
         Check(queue_calls == 0 && !DrawPreview(), message);
     };
-    Reset(); denied("preview default-on regression or missing early-route guard");
     Reset(); options.dof_preview = true; options.reload_blur = false;
     denied("Off mode entered preview");
     Reset(); options.dof_preview = true; options.modern_reload_dof = false;
@@ -432,7 +431,7 @@ void TestPreviewGuards() {
     Reset(1); options.dof_preview = true;
     denied("untagged type-1 effect entered preview");
     Effect(false);
-    std::puts("PASS preview default-off, mode, world/display and type provenance guards");
+    std::puts("PASS preview mode, world/display and type provenance guards");
 }
 
 void TestPreviewFadeAndCancellation() {
@@ -448,10 +447,19 @@ void TestPreviewFadeAndCancellation() {
           "fade-out did not queue partial eased preview strength");
     Check(DrawPreview(), "fade-out lost deferred sharp gun draw");
     AdvancePreview(8, false);
-    Check(!DeferPreview(), "expired preview still deferred the gun");
+    Check(DeferPreview(), "fade-out endpoint changed the Modern gun draw route");
     BeginGun(); EndGun();
-    Check(weapon_begin_calls == 1 && weapon_end_calls == 1,
-          "normal weapon blur did not resume after preview faded out");
+    Check(weapon_begin_calls == 0 && weapon_end_calls == 0,
+          "fade-out endpoint also blurred the early gun");
+    const int faded_worlds = queue_calls;
+    PreviewRenderFrame();
+    Check(queue_calls == faded_worlds, "zero-strength fade endpoint queued world blur");
+    Check(DrawPreview(), "fade-out endpoint lost its late gun draw");
+    BeginPreviewGun(); EndPreviewGun();
+    Check(!DrawPreview(), "fade-out endpoint drew a second late gun");
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 1 &&
+          std::abs(weapon_begin_strength - 0.25f) < 1e-6f,
+          "fade-out endpoint did not restore configured weapon blur at the late draw");
 
     Reset(); AdvancePreview(4, true);
     Check(DeferPreview(), "partial preview failed to defer gun");
@@ -481,9 +489,14 @@ void TestPreviewFadeAndCancellation() {
     options.modern_reload_dof = true;
     options.dof_preview = false;
     TickPreview(0.1f);
+    Check(DeferPreview(), "returning to Modern did not restore the stable late gun route");
     BeginGun(); EndGun();
+    Check(weapon_begin_calls == 0 && weapon_end_calls == 0,
+          "returning to Modern also blurred the early gun");
+    Check(DrawPreview(), "returning to Modern lost the late gun draw");
+    BeginPreviewGun(); EndPreviewGun();
     Check(weapon_begin_calls == 1 && weapon_end_calls == 1,
-          "normal weapon blur did not resume after non-Modern preview reset");
+          "returning to Modern did not restore late weapon blur");
     Reset(); AdvancePreview(4, true);
     Check(DeferPreview(), "preview did not create world cancellation token");
     R32(layout::kWorld) = 0;
@@ -587,7 +600,7 @@ void TestWeaponEligibility() {
     std::puts("PASS weapon eligibility, draw-list provenance and stale-pair cancellation");
 }
 
-// Exercise the production routes in native order, including the return to the early draw at phase zero.
+// Exercise the native draw order while the eligible Modern route stays late through phase zero.
 float PreviewWeaponFrame(float seconds, bool enabled, bool expected_deferred) {
     options.dof_preview = enabled;
     ++R32(kFrameCount);
@@ -597,11 +610,15 @@ float PreviewWeaponFrame(float seconds, bool enabled, bool expected_deferred) {
     const int begins = weapon_begin_calls;
     const int ends = weapon_end_calls;
     const int worlds = queue_calls;
-    if (!deferred) { BeginGun(); EndGun(); }
+    BeginGun(); EndGun();
+    if (deferred)
+        Check(weapon_begin_calls == begins && weapon_end_calls == ends,
+              "stable late route also blurred the early gun");
     PreviewRenderFrame();
     if (deferred) {
-        Check(DrawPreview(), "preview lost its late gun route");
+        Check(DrawPreview(), "preview lost its late gun draw");
         BeginPreviewGun(); EndPreviewGun();
+        Check(!DrawPreview(), "preview drew a second late gun");
     } else {
         Check(!DrawPreview(), "expired preview forced a late gun route");
         BeginPreviewGun(); EndPreviewGun();
@@ -626,7 +643,7 @@ void TestPreviewWeaponContinuity() {
     }
     Check(previous == 0, "full preview did not make the weapon fully sharp");
     for (int i = 0; i < 9; ++i) {
-        const float amount = PreviewWeaponFrame(0.1f, false, i < 8);
+        const float amount = PreviewWeaponFrame(0.1f, false, true);
         Check(amount >= previous, "preview exit decreased weapon blur");
         previous = amount;
     }
@@ -642,6 +659,64 @@ void TestPreviewWeaponContinuity() {
     const float on = PreviewWeaponFrame(0.1f, true, true);
     Check(on < off && on > 0, "mid-fade reversal snapped or failed to reduce weapon blur");
     std::puts("PASS preview weapon entry/exit endpoints, inverse easing and continuous reversal");
+}
+
+void TestStableLateModernRoute() {
+    Reset();
+    Check(DeferPreview(), "preview OFF at phase zero reverted to the early gun route");
+    BeginGun(); EndGun();
+    Check(weapon_begin_calls == 0 && weapon_end_calls == 0,
+          "preview OFF at phase zero blurred the early gun");
+    PreviewRenderFrame();
+    Check(queue_calls == 0, "preview OFF at phase zero queued world blur");
+    Check(DrawPreview(), "preview OFF lost its late gun draw");
+    BeginPreviewGun(); EndPreviewGun();
+    Check(!DrawPreview(), "preview OFF drew a second late gun");
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 1 &&
+          std::abs(weapon_begin_strength - 0.25f) < 1e-6f,
+          "preview OFF did not preserve configured late weapon blur");
+    Effect(false); // Preview must leave the stock effect and reload provenance intact.
+
+    Reset();
+    options.dof_preview = true;
+    TickPreview(0);
+    Check(DeferPreview(), "preview ON at phase zero reverted to the early gun route");
+    PreviewRenderFrame();
+    Check(queue_calls == 0, "preview ON at phase zero queued world blur");
+    Check(DrawPreview(), "preview ON phase zero lost its late gun draw");
+    BeginPreviewGun(); EndPreviewGun();
+    Check(!DrawPreview(), "preview ON phase zero drew a second late gun");
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 1 &&
+          std::abs(weapon_begin_strength - 0.25f) < 1e-6f,
+          "preview ON at phase zero changed the late weapon amount");
+
+    Reset();
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        float previous = PreviewWeaponFrame(0, false, true);
+        Check(previous == 0.25f, "repeated preview cycle lost its phase-zero weapon amount");
+        for (int i = 0; i < 8; ++i) {
+            const float amount = PreviewWeaponFrame(0.1f, true, true);
+            Check(amount <= previous, "repeated preview ramp increased weapon blur");
+            previous = amount;
+        }
+        Check(previous == 0, "repeated preview ramp did not sharpen the gun");
+        for (int i = 0; i < 9; ++i) {
+            const float amount = PreviewWeaponFrame(0.1f, false, true);
+            Check(amount >= previous, "repeated preview fade decreased weapon blur");
+            previous = amount;
+        }
+        Check(previous == 0.25f, "repeated preview fade lost its late weapon endpoint");
+    }
+    float previous = 0.25f;
+    for (int reversal = 0; reversal < 4; ++reversal) {
+        const float entering = PreviewWeaponFrame(0.1f, true, true);
+        Check(entering < previous, "rapid preview enable did not reduce weapon blur");
+        const float leaving = PreviewWeaponFrame(0.1f, false, true);
+        Check(leaving > entering && leaving <= 0.25f,
+              "rapid preview reversal snapped or lost late weapon blur");
+        previous = leaving;
+    }
+    std::puts("PASS stable late Modern gun at phase zero, repeated fades and rapid reversals");
 }
 
 void PrepareLateWeapon() {
@@ -825,10 +900,17 @@ void TestIdlePhaseAndLoop() {
     Reset(); IdleFixture();
     G<uint8_t>(kIdleController + 0xB4) = 0;
     SampleIdle(39.999f); TickPreview(0.1f);
-    Check(!DeferPreview(), "ordinary idle lead-in enabled world focus");
+    Check(DeferPreview(), "ordinary idle lead-in lost the stable Modern gun route");
     BeginGun(); EndGun();
-    Check(weapon_begin_calls == 1 && weapon_end_calls == 1,
-          "ordinary idle lost normal weapon blur");
+    Check(weapon_begin_calls == 0 && weapon_end_calls == 0,
+          "ordinary idle lead-in blurred the early gun");
+    PreviewRenderFrame();
+    Check(queue_calls == 0, "ordinary idle lead-in enabled world focus");
+    Check(DrawPreview(), "ordinary idle lead-in lost its late gun draw");
+    BeginPreviewGun(); EndPreviewGun();
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 1 &&
+          std::abs(weapon_begin_strength - 0.25f) < 1e-6f,
+          "ordinary idle lost normal late weapon blur");
     SampleIdle(40);
     // The controller update sets B4 after its pose sample and before the render hook reads it.
     G<uint8_t>(kIdleController + 0xB4) = 1;
@@ -856,14 +938,22 @@ void TestIdlePhaseAndLoop() {
     Check(queued_strength > 0 && queued_strength < 1, "loop wrap did not fade world focus out");
     Check(DrawPreview(), "inspection fade lost gun draw");
     AdvanceIdle(8, 0);
-    Check(!DeferPreview(), "inspection focus survived the completed 0.9-second fade");
+    Check(DeferPreview(), "completed inspection fade lost the stable late gun route");
+    const int faded_worlds = queue_calls;
+    PreviewRenderFrame();
+    Check(queue_calls == faded_worlds,
+          "inspection focus survived the completed 0.9-second fade");
+    Check(DrawPreview(), "completed inspection fade lost the gun draw");
     std::puts("PASS authored idle lead-in/tail boundary, native sample time, sharp gun and loop fade");
 }
 
 void TestIdleRejectsUnknownAndInvalid() {
     auto denied = [](auto change, const char* message) {
         Reset(); IdleFixture(); change(); SampleIdle(45); TickPreview(0.1f);
-        Check(!DeferPreview(), message);
+        Check(DeferPreview(), "invalid idle sample lost the stable Modern gun route");
+        PreviewRenderFrame();
+        Check(queue_calls == 0, message);
+        Check(DrawPreview() && !DrawPreview(), "invalid idle sample drew more than one gun");
     };
     denied([] { ++R32(kIdleInstance + 0x10); }, "failed name lookup relabeled old playback as idle");
     denied([] { G<char>(kIdleController + 0x5C + 10) = '2'; }, "non-idle action enabled focus");
@@ -887,16 +977,22 @@ void TestIdleRejectsUnknownAndInvalid() {
     denied([] { G<float>(kIdleParams) = -1; }, "invalid duration wrapper enabled focus");
     for (float time : {-1.0f, 60.0f, INFINITY, NAN}) {
         Reset(); IdleFixture(); SampleIdle(time); TickPreview(0.1f);
-        Check(!DeferPreview(), "invalid/un-normalized sample time enabled focus");
+        Check(DeferPreview(), "invalid sample time lost the stable Modern gun route");
+        PreviewRenderFrame();
+        Check(queue_calls == 0, "invalid/un-normalized sample time enabled focus");
     }
     Reset(); IdleFixture(); SampleIdle(45, 8); TickPreview(0.1f);
-    Check(!DeferPreview(), "outgoing root sampler flags enabled focus");
+    Check(DeferPreview(), "outgoing root sampler flags lost the stable gun route");
+    PreviewRenderFrame(); Check(queue_calls == 0, "outgoing root sampler flags enabled focus");
     Reset(); IdleFixture(); SampleIdle(45, 0, kIdleInstance + 4); TickPreview(0.1f);
-    Check(!DeferPreview(), "foreign animation instance enabled focus");
+    Check(DeferPreview(), "foreign animation instance lost the stable gun route");
+    PreviewRenderFrame(); Check(queue_calls == 0, "foreign animation instance enabled focus");
     Reset(); IdleFixture(); SampleIdle(45, 0, kIdleInstance, kIdleSequence); TickPreview(0.1f);
-    Check(!DeferPreview(), "child sample was mistaken for normalized root time");
+    Check(DeferPreview(), "child sample lost the stable gun route");
+    PreviewRenderFrame(); Check(queue_calls == 0, "child sample was mistaken for normalized root time");
     Reset(); IdleFixture(); SampleIdle(45, 0, kIdleInstance, kIdleRoot, kIdleCache + 4); TickPreview(0.1f);
-    Check(!DeferPreview(), "foreign animation cache enabled focus");
+    Check(DeferPreview(), "foreign animation cache lost the stable gun route");
+    PreviewRenderFrame(); Check(queue_calls == 0, "foreign animation cache enabled focus");
     std::puts("PASS idle graph, failed-start, owner, completion, cache and outgoing-sample guards");
 }
 
@@ -916,7 +1012,11 @@ void TestIdleInterruptionAndOverlap() {
         Check(queued_strength > 0 && queued_strength < 1, "stale idle identity continued holding focus");
         Check(DrawPreview(), "idle interruption lost already deferred gun");
         AdvancePreview(8, false);
-        Check(!DeferPreview(), "interrupted idle focus failed to settle");
+        Check(DeferPreview(), "settled idle interruption lost the stable gun route");
+        const int settled_worlds = queue_calls;
+        PreviewRenderFrame();
+        Check(queue_calls == settled_worlds, "interrupted idle focus failed to settle");
+        Check(DrawPreview(), "settled idle interruption lost its late gun draw");
     }
     Reset(); IdleFixture(); SampleIdle(45); ++R32(kFrameCount); TickPreview(0.1f);
     Check(DeferPreview(), "previous-frame native sample was rejected");
@@ -952,7 +1052,11 @@ void TestIdleInterruptionAndOverlap() {
     Check(weapon_begin_calls == 0, "actual reload gun received idle weapon blur");
     Effect(true);
     R32(kEffect + 0x34) = 0; TickPreview(0);
-    Check(!DeferPreview(), "actual reload retained stale idle focus");
+    Check(DeferPreview(), "return from reload lost the stable Modern gun route");
+    const int post_reload_worlds = queue_calls;
+    PreviewRenderFrame();
+    Check(queue_calls == post_reload_worlds, "actual reload retained stale idle focus");
+    Check(DrawPreview(), "return from reload lost one native gun draw");
     std::puts("PASS idle interruption fade, sample freshness, manual overlap/reversal and reload priority");
 }
 } // namespace
@@ -1014,6 +1118,7 @@ int main() {
         TestPreviewEnvelope();
         TestPreviewIdleAndReloadPriority();
         TestPreviewGuards();
+        TestStableLateModernRoute();
         TestPreviewFadeAndCancellation();
         TestWeaponPair();
         TestWeaponEligibility();

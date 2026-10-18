@@ -938,6 +938,29 @@ int main(int argc, char** argv) {
             auto zero = warp.Run(n, 0);
             ExactIdentity(zero, "zero amount is not exact identity");
             auto normal = warp.Run(n, .25f); Invariants(normal);
+            // At z=.1, default focus1/width.75 has unit falloff. These amounts
+            // therefore select the stated radii directly, away from a focus
+            // boundary; a positive radius must approach the source continuously.
+            for (float radius : {1e-7f, 1e-4f, 1e-3f}) {
+                const auto tiny = warp.Run(n, radius / 6);
+                Invariants(tiny);
+                float max_change = 0;
+                size_t max_at = 0;
+                for (size_t i = 0; i < tiny.output.size(); ++i) {
+                    const float change = std::abs(tiny.output[i].r - tiny.original[i].r);
+                    if (change > max_change) { max_change = change; max_at = i; }
+                }
+                if (max_change > 2 * radius + 2e-6f) {
+                    std::printf("TINY-RADIUS %ux radius=%.9g maxChange=%.9g at=(%u,%u) originalR=%.9g outputR=%.9g packedZ=%.9g\n",
+                        n, radius, max_change, unsigned(max_at % W), unsigned(max_at / W),
+                        tiny.original[max_at].r, tiny.output[max_at].r, tiny.depth[max_at]);
+                    std::fflush(stdout);
+                }
+                // A unit-range checkerboard changes by at most |dx|+|dy| per
+                // bilinear tap. 2r is conservative; the additive allowance is
+                // float accumulation error, independent of image magnitude.
+                Check(max_change <= 2 * radius + 2e-6f, "positive tiny radius did not converge continuously to identity");
+            }
             // The widened-viewmodel path keeps the original projection's Z
             // coefficients (near=.08 here); its XY scaling does not enter the
             // depth inverse. Encode the exact native front/rear piecewise map.
@@ -951,8 +974,35 @@ int main(int argc, char** argv) {
                       "near-depth mapping changed MSAA coverage");
                 const auto legacy = warp.Run(n, .25f, z, false, false, false, false, .25f, .25f);
                 float maximum_difference = 0;
-                for (size_t i = 0; i < legacy.output.size(); ++i)
-                    maximum_difference = std::max(maximum_difference, std::abs(remapped.output[i].r - legacy.output[i].r));
+                size_t maximum_at = 0;
+                for (size_t i = 0; i < legacy.output.size(); ++i) {
+                    const float difference = std::abs(remapped.output[i].r - legacy.output[i].r);
+                    if (difference > maximum_difference) { maximum_difference = difference; maximum_at = i; }
+                }
+                if (maximum_difference >= .003f || (z >= .25f && std::memcmp(remapped.output.data(),
+                    remapped.original.data(), remapped.output.size() * sizeof(Pixel)) != 0)) {
+                constexpr float front_share = 1.f / 4096;
+                const float legacy_raw = 1.001f - .01f / z;
+                const float rear_raw = 1.001f - .08008f / z;
+                const float mapped_raw = z < .08f ? front_share * z / .08f : front_share + (1 - front_share) * rear_raw;
+                const float legacy_inverse = -.01f / (legacy_raw - 1.001f);
+                const float mapped_inverse = mapped_raw < front_share ? .08f * mapped_raw / front_share :
+                    -.08008f / ((mapped_raw - front_share) / (1 - front_share) - 1.001f);
+                const Pixel& mapped_pixel = remapped.output[maximum_at];
+                const Pixel& legacy_pixel = legacy.output[maximum_at];
+                std::printf("NEAR-DEPTH DIAGNOSTIC %ux inputZ=%.9g focus=.25 plane=.08 legacyRaw=%.9g rearRaw=%.9g mappedRaw=%.9g cpuInverseLegacy=%.9g cpuInverseMapped=%.9g packedZ(9,16)=(%.9g,%.9g) maxDiff=%.9g at=(%u,%u)\n",
+                    n, z, legacy_raw, rear_raw, mapped_raw, legacy_inverse, mapped_inverse,
+                    legacy.depth[At(9,16)], remapped.depth[At(9,16)], maximum_difference,
+                    unsigned(maximum_at % W), unsigned(maximum_at / W));
+                std::printf("  maxPixel legacyRGBA=(%.9g,%.9g,%.9g,%.9g) mappedRGBA=(%.9g,%.9g,%.9g,%.9g) originalRGBA=(%.9g,%.9g,%.9g,%.9g) packedZ=(%.9g,%.9g) packedCoverage=(%.9g,%.9g)\n",
+                    legacy_pixel.r, legacy_pixel.g, legacy_pixel.b, legacy_pixel.a,
+                    mapped_pixel.r, mapped_pixel.g, mapped_pixel.b, mapped_pixel.a,
+                    remapped.original[maximum_at].r, remapped.original[maximum_at].g,
+                    remapped.original[maximum_at].b, remapped.original[maximum_at].a,
+                    legacy.depth[maximum_at], remapped.depth[maximum_at],
+                    legacy.packed[maximum_at].a, remapped.packed[maximum_at].a);
+                std::fflush(stdout);
+                }
                 Check(maximum_difference < .003f, "near-depth mapping changed the physical-depth focus curve");
                 if (z >= .25f) ExactIdentity(remapped, "remapped weapon at/beyond focus did not remain sharp");
                 std::printf("PASS near-depth %ux z=%.3g plane=.08 focus=.25 maxRGBdifference=%.7g\n", n, z, maximum_difference);
