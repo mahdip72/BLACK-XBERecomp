@@ -915,9 +915,9 @@ private:
         const char* entry;
         DXGI_FORMAT out = kAoFormat;
         uint32_t samples = 1;   // of the target written
-        bool multiply = false;  // onto that target
+        bool blend = false;  // onto that target, OcclusionBlend
         D3D12_CPU_DESCRIPTOR_HANDLE rtv;
-        ID3D12Resource* depth = nullptr;  // the scene's, read by the first pass
+        ID3D12Resource* depth = nullptr;  // the scene's depth and stencil, read by the first pass
         bool ms_depth = false;
         ID3D12Resource* src = nullptr;  // the pass before
         float step_x = 0;
@@ -1679,7 +1679,7 @@ void D3D12Backend::Occlusion(const State& s, const float p[4 * kOcclusionRects])
     AoPass raw{.entry = entry, .rtv = OcclusionView(0), .depth = ds->res.Get(), .ms_depth = samples > 1};
     AoPass across{.entry = "occlusion_blur", .rtv = OcclusionView(1), .src = ao_[0].Get(), .step_x = 1};
     D3D12_CPU_DESCRIPTOR_HANDLE scene = Cpu(rtv_heap_.Get(), rt->view, rtv_inc_);
-    AoPass down{.entry = "occlusion_apply", .out = rt->fmt, .samples = Ms(*rt), .multiply = true, .rtv = scene,
+    AoPass down{.entry = "occlusion_apply", .out = rt->fmt, .samples = Ms(*rt), .blend = true, .rtv = scene,
                 .src = ao_[1].Get(), .step_y = 1};
     bound_rt_ = bound_ds_ = nullptr;
     Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1733,7 +1733,7 @@ ID3D12PipelineState* D3D12Backend::EnsureOcclusionPipeline(const AoPass& a) {
     ID3DBlob* ps = Compile(text, a.entry, "ps_5_0", h);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, a.out);
-    if (a.multiply) OcclusionBlend(d.BlendState.RenderTarget[0]);
+    if (a.blend) OcclusionBlend(d.BlendState.RenderTarget[0]);
     d.SampleDesc.Count = a.samples;
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();

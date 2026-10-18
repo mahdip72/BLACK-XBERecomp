@@ -171,10 +171,11 @@ void ZoomStep(X86Context& ctx, uint8_t*) {
 }
 
 constexpr float kHalf = 3.14159265f / 360.0f;
+constexpr uint32_t kGameFov = 70;  // the view's and the viewmodel's
 
-// tangent of a setting's half angle over that of the game's 70 degrees
+// tangent of a setting's half angle over that of the game's
 static float Widen(uint32_t degrees) {
-    return std::tan(std::clamp(degrees, 45u, 100u) * kHalf) / std::tan(70 * kHalf);
+    return std::tan(std::clamp(degrees, 45u, 100u) * kHalf) / std::tan(kGameFov * kHalf);
 }
 
 static float g_gun = 1.0f;  // the gun's picture over the view's
@@ -200,7 +201,7 @@ X86_EXTERN_FUNC(__imp__sub_00176F60);
 X86_FUNC(sub_00176F60) {
     bool list = ctx.esi == R32(kDisplay) + kDisplayDrawLists + kGunDrawList * kDrawListSize;
     bool scale = list && g_gun != 1;
-    bool keep_near = list && game::Opt().viewmodel_fov > 70;
+    bool keep_near = list && game::Opt().viewmodel_fov > kGameFov;
     if (scale) d3d::ViewScale(g_gun);
     if (keep_near) d3d::NearDepth(kNearPlane);
     __imp__sub_00176F60(ctx, base);
