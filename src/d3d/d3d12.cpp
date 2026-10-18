@@ -933,7 +933,7 @@ private:
     void OcclusionViews(uint32_t slot, const AoPass& a);
     bool OcclusionPass(const AoPass& a, float c[kAoConstants], const D3D12_RECT& rect, uint32_t w, uint32_t h);
     void DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]);
-    bool FidelityFxDepthOfField(Target& rt, Target& ds, const float c[12], const D3D12_RECT& rect);
+    bool FidelityFxDepthOfField(Target& rt, Target& ds, const float c[12], const D3D12_RECT& rect, bool cinematic);
     bool EnsureFidelityFxTargets(uint32_t w, uint32_t h);
     void FidelityFxViews(uint32_t slot, ID3D12Resource* first, DXGI_FORMAT first_format, bool first_ms,
                         ID3D12Resource* second, DXGI_FORMAT second_format);
@@ -1183,7 +1183,7 @@ private:
     FidelityFxDof ffx_dof_;
     ComPtr<ID3D12Resource> ffx_dof_targets_[3];  // prepared color, encoded CoC depth, official output
     D3D12_RESOURCE_STATES ffx_dof_states_[3] = {};
-    bool ffx_dof_failed_ = false;
+    uint32_t ffx_dof_failed_ = 0;  // one failure latch per Standard/Cinematic profile
     bool ffx_dof_reported_ = false;
     struct WeaponDof {
         ComPtr<ID3D12Resource> before;
@@ -2041,21 +2041,26 @@ void D3D12Backend::FidelityFxViews(uint32_t slot, ID3D12Resource* first, DXGI_FO
     }
 }
 
-bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float constants[12], const D3D12_RECT& rect) {
+bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float constants[12], const D3D12_RECT& rect,
+                                        bool cinematic) {
     float bound = constants[3] * std::max(constants[8], constants[9]);
     if (bound <= 0.25f) return true;
-    if (ffx_dof_failed_) return false;
+    const uint32_t failure_bit = cinematic ? 2u : 1u;
+    if (ffx_dof_failed_ & failure_bit) return false;
     auto fail = [&](const char* reason) {
-        ffx_dof_failed_ = true;
-        LOGR("FidelityFX DOF unavailable; using Balanced: %s", reason);
+        ffx_dof_failed_ |= failure_bit;
+        LOGR("FidelityFX DOF %s unavailable; using Balanced: %s", cinematic ? "Cinematic" : "Standard", reason);
         return false;
     };
-    const auto processing = FidelityFxDofProcessingSize(rt.w, rt.h);
+    const uint32_t scale = cinematic ? 2 : 1;
+    const uint32_t rings = cinematic ? 8 : 4;
+    const auto processing = FidelityFxDofProcessingSize(rt.w, rt.h, scale);
     if (!processing.width || !processing.height) return fail("unsupported processing extent");
-    if (!ffx_dof_.Matches(processing.width, processing.height)) {
+    if (!ffx_dof_.Matches(processing.width, processing.height, rings, cinematic)) {
         // Destruction/recreation must wait for the SDK's private resources. Ordinary frames never wait here.
         if (ffx_dof_.Ready()) { Flush(); ffx_dof_.Reset(); }
-        if (!ffx_dof_.Create(dev_.Get(), processing.width, processing.height)) return fail(ffx_dof_.Failure());
+        if (!ffx_dof_.Create(dev_.Get(), processing.width, processing.height, rings, cinematic)) return fail(ffx_dof_.Failure());
+        ffx_dof_reported_ = false;
     }
     uint32_t samples = Ms(rt);
     auto* prepare = EnsureDepthOfFieldPipeline("ffx_dof_prepare", DXGI_FORMAT_R16G16B16A16_FLOAT, 1, samples);
@@ -2066,7 +2071,11 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     if (!source) return fail("scene snapshot allocation failed");
     float c[12];
     std::memcpy(c, constants, sizeof(c));
-    c[10] = bound;
+    // The SDK operates in processing pixels. Scale CoC and its bound together; UI/view distances and native
+    // viewport coordinates are unchanged, and the final 2x2 resolve returns the same visible blur radius.
+    c[3] *= float(scale);
+    c[10] = bound * float(scale);
+    c[11] = float(scale);
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, c, sizeof(c));
     bound_rt_ = bound_ds_ = nullptr;
@@ -2085,7 +2094,7 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
         Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     bool dispatched = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
-                                        ffx_dof_targets_[2].Get(), bound);
+                                        ffx_dof_targets_[2].Get(), c[10]);
     // The SDK switches descriptor heaps and compute root signatures. Its external textures return to their
     // entry states. Restore the engine's heaps/root and invalidate cached bindings even if dispatch failed.
     Begin();
@@ -2102,9 +2111,10 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     rt.drawn = true;
     if (!ffx_dof_reported_) {
         ffx_dof_reported_ = true;
-        LOGR("Official FidelityFX SDK 1.1.4 DOF active: %ux%u, processing %ux%u, %ux MSAA, focus %.2f world units, "
-             "radius %.3fpx, near %.2f far %.2f, quality 4", rt.w, rt.h, processing.width, processing.height,
-             samples, c[2], c[3], c[8], c[9]);
+        LOGR("Official FidelityFX SDK 1.1.4 DOF %s active: %ux%u, processing %ux%u (%ux), %ux MSAA, "
+             "focus %.2f world units, native radius %.3fpx, near %.2f far %.2f, rings %u, ring merge %s",
+             cinematic ? "Cinematic" : "Standard", rt.w, rt.h, processing.width, processing.height, scale,
+             samples, c[2], constants[3], c[8], c[9], rings, cinematic ? "off" : "on");
     }
     return true;
 }
@@ -2155,7 +2165,7 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
         DepthOfFieldSkipped(0, "non-finite derived shader constants");
         return;
     }
-    if (p[7] >= 0.5f && FidelityFxDepthOfField(*rt, *ds, c, rect)) return;
+    if (p[7] >= 0.5f && FidelityFxDepthOfField(*rt, *ds, c, rect, p[7] >= 1.5f)) return;
     uint32_t samples = Ms(*rt);
     ID3D12PipelineState* pso = EnsureDepthOfFieldPipeline("depth_of_field", rt->fmt, samples);
     ID3D12PipelineState* gather_pso = EnsureDepthOfFieldPipeline("depth_of_field_gather", kDofFormats[0], 1);

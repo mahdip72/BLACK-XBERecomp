@@ -24,6 +24,8 @@ struct FidelityFxDof::Impl {
     bool active = false;
     ID3D12Device* device = nullptr;
     uint32_t width = 0, height = 0;
+    uint32_t rings = 4;
+    bool disable_ring_merge = false;
     char failure[160] = {};
 #if BLACK_FIDELITYFX_DOF
     FfxDofContext context{};
@@ -107,8 +109,9 @@ struct FidelityFxDof::Impl {
 FidelityFxDof::FidelityFxDof() : impl_(std::make_unique<Impl>()) {}
 FidelityFxDof::~FidelityFxDof() { Reset(); }
 bool FidelityFxDof::Ready() const { return impl_->active; }
-bool FidelityFxDof::Matches(uint32_t width, uint32_t height) const {
-    return Ready() && impl_->width == width && impl_->height == height;
+bool FidelityFxDof::Matches(uint32_t width, uint32_t height, uint32_t rings, bool disable_ring_merge) const {
+    return Ready() && impl_->width == width && impl_->height == height && impl_->rings == rings &&
+        impl_->disable_ring_merge == disable_ring_merge;
 }
 const char* FidelityFxDof::Failure() const { return impl_->failure; }
 
@@ -124,12 +127,14 @@ void FidelityFxDof::Reset() {
     impl_->active = false;
     impl_->device = nullptr;
     impl_->width = impl_->height = 0;
+    impl_->rings = 4;
+    impl_->disable_ring_merge = false;
 }
 
-bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height) {
-    if (Matches(width, height) && impl_->device == device) return true;
+bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t rings, bool disable_ring_merge) {
+    if (Matches(width, height, rings, disable_ring_merge) && impl_->device == device) return true;
     Reset();
-    if (!device || !width || !height) return impl_->Fail("invalid device or extent");
+    if (!device || !width || !height || !rings || rings > 16) return impl_->Fail("invalid device, extent or ring count");
 #if BLACK_FIDELITYFX_DOF
     D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_2};
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
@@ -139,7 +144,8 @@ bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height
         return impl_->Fail("FidelityFX requires Shader Model 6.2 and wave operations");
     FfxDofContextDescription desc{};
     desc.resolution = {width, height};
-    desc.quality = 4;
+    desc.quality = rings;
+    desc.flags = disable_ring_merge ? FFX_DOF_DISABLE_RING_MERGE : 0;
     // UI limit: 30px at 1080p times 150% near/far strength. Actual radius/strength stays a dispatch input.
     desc.cocLimitFactor = 45.0f / 1080.0f;
     try { impl_->scratch.resize(ffxGetScratchMemorySizeDX12(1)); }
@@ -161,6 +167,8 @@ bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height
     impl_->device = device;
     impl_->width = width;
     impl_->height = height;
+    impl_->rings = rings;
+    impl_->disable_ring_merge = disable_ring_merge;
     impl_->failure[0] = 0;
     return true;
 #else

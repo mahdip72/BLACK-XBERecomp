@@ -320,7 +320,8 @@ bool DepthOfField(const float* m, float strength) {
         float(std::clamp(options.dof_focus_distance, 1u, 30u)),
         float(std::min(options.dof_near_strength, 150u)) / 100.0f,
         float(std::min(options.dof_far_strength, 150u)) / 100.0f,
-        float(std::clamp(options.dof_bokeh_radius, 4u, 30u)), options.fidelityfx_dof ? 1.0f : 0.0f};
+        float(std::clamp(options.dof_bokeh_radius, 4u, 30u)),
+        options.fidelityfx_dof ? (options.dof_cinematic_quality ? 2.0f : 1.0f) : 0.0f};
     g_backend->Clear(g_state, gpu::kDepthOfFieldRects, reinterpret_cast<const uint8_t*>(p),
                      gpu::kClearDepthOfField, 0, 0, 0);
     return true;

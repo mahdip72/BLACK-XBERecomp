@@ -70,6 +70,7 @@ constexpr uint32_t kAoValues[] = {0, 1, 2};
 const char* const kAoNames[] = {"OFF", "SSAO", "GTAO"};
 constexpr uint32_t kReloadBlurModes[] = {0, 1, 2, 3};
 const char* const kReloadBlurNames[] = {"OFF", "ORIGINAL", "BALANCED DOF", "FIDELITYFX DOF"};
+const char* const kDofQualityNames[] = {"STANDARD", "CINEMATIC"};
 constexpr uint32_t kFmvScales[] = {0, 1};
 const char* const kFmvScaleNames[] = {"FILL", "4:3"};
 constexpr uint32_t kAudioOutputs[] = {audio::kOutputAuto, audio::kOutputMono, audio::kOutputStereo,
@@ -252,7 +253,7 @@ enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFps
              kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
              kAmbientOcclusion, kAudioOutput, kHdrOutput, kMonitor, kLanguage, kSmaa,
              kPauseOnFocusLoss, kFmvScale, kDofFocusDistance, kDofNearStrength, kDofFarStrength,
-             kDofBokehRadius, kDofWeaponBlur, kResetDofTuning, kDofPreview };
+             kDofBokehRadius, kDofWeaponBlur, kResetDofTuning, kDofPreview, kDofQuality };
 
 using rows::Kind;
 using rows::Row;
@@ -279,6 +280,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kReloadBlur, "RELOAD BLUR"},
     {Kind::Heading, -1, "MODERN DOF"},
     {Kind::Value, kDofPreview, "PREVIEW RELOAD DOF"},
+    {Kind::Value, kDofQuality, "DOF QUALITY"},
     {Kind::Value, kDofFocusDistance, "FOCUS DISTANCE"},
     {Kind::Value, kDofNearStrength, "NEAR BLUR"},
     {Kind::Value, kDofFarStrength, "DISTANT BLUR"},
@@ -327,10 +329,11 @@ bool* ToggleFlag(Settings& s, int id) {
 
 bool DisplayRow(int id) { return id == kMonitor || id == kDisplayMode || id == kResolution; }
 
-// shown dimmed and left as it is: unsupported HDR or preview without Modern DOF
+// shown dimmed and left as it is: unsupported HDR or an unavailable DOF control
 bool Greyed(int id) {
     if (id == kHdrOutput) return !game::g_hdr_display;
     if (id == kDofPreview) return !game::Opt().reload_blur || !game::Opt().modern_reload_dof;
+    if (id == kDofQuality) return ReloadBlurMode(game::Opt()) != 3;
     return false;
 }
 
@@ -480,6 +483,10 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
             std::snprintf(text, sizeof(text), "%s", kReloadBlurNames[index]);
             return true;
         }
+        case kDofQuality:
+            if (step) o.dof_cinematic_quality = !o.dof_cinematic_quality;
+            std::snprintf(text, sizeof(text), "%s", kDofQualityNames[o.dof_cinematic_quality ? 1 : 0]);
+            return true;
         case kDofFocusDistance:
             if (step) o.dof_focus_distance = uint32_t(StepDofRange(o.dof_focus_distance, 1, 30, 1, step));
             std::snprintf(text, sizeof(text), "%u UNITS", o.dof_focus_distance);
@@ -508,6 +515,7 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
                 o.dof_far_strength = defaults.dof_far_strength;
                 o.dof_bokeh_radius = defaults.dof_bokeh_radius;
                 o.dof_weapon_blur = defaults.dof_weapon_blur;
+                o.dof_cinematic_quality = defaults.dof_cinematic_quality;
             }
             std::snprintf(text, sizeof(text), "DEFAULTS");
             return true;
@@ -557,8 +565,8 @@ void StepInputRow(int id, int step, char (&text)[64]) {
 // steps the value first when step is not zero
 std::string RowText(int id, int step, Settings& s = Get()) {
     if (Greyed(id)) {
-        if (id != kDofPreview) return "NOT SUPPORTED";
-        step = 0;  // the disabled preview still shows OFF, but cannot toggle
+        if (id != kDofPreview && id != kDofQuality) return "NOT SUPPORTED";
+        step = 0;  // unavailable DOF controls show their value but cannot change
     }
     char text[64] = "";
     if (bool* on = ToggleFlag(s, id)) {
@@ -893,6 +901,30 @@ void DrawDofPanel() {
         }
         ImGui::BeginDisabled(!o.reload_blur || !o.modern_reload_dof);
         if (ImGui::Checkbox(Ui("Preview reload DOF", false).c_str(), &o.dof_preview)) {
+            Changed(false);
+            g_dof_dirty = false;
+        }
+        ImGui::EndDisabled();
+        ImGui::TextUnformatted(Ui("DOF QUALITY").c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(Ui("Cinematic uses a higher-resolution, denser filter.", false).c_str());
+            ImGui::TextUnformatted(Ui("It may cost more performance. Bokeh size sets radius separately.", false).c_str());
+            ImGui::EndTooltip();
+        }
+        int quality = o.dof_cinematic_quality ? 1 : 0;
+        std::string quality_labels[std::size(kDofQualityNames)];
+        const char* quality_items[std::size(kDofQualityNames)];
+        for (size_t i = 0; i < std::size(kDofQualityNames); i++) {
+            quality_labels[i] = Ui(kDofQualityNames[i]);
+            quality_items[i] = quality_labels[i].c_str();
+        }
+        ImGui::BeginDisabled(ReloadBlurMode(o) != 3);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##dof_quality", &quality, quality_items, int(std::size(quality_items)))) {
+            o.dof_cinematic_quality = quality == 1;
             Changed(false);
             g_dof_dirty = false;
         }

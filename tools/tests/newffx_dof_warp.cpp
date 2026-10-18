@@ -24,6 +24,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "d3d/fidelityfx_dof.h"
@@ -327,10 +328,13 @@ public:
     }
 
     AdapterResult RunAdapter(gpu::FidelityFxDof& dof, const Fixture& fixture,
-                             const D3D12_RECT& rect) {
-        const auto processing=gpu::FidelityFxDofProcessingSize(fixture.width,fixture.height);
+                             const D3D12_RECT& rect, uint32_t scale=1,
+                             float visible_radius=8.0f, float near_scale=1.0f,
+                             float far_scale=0.45f,uint32_t rings=4,
+                             bool no_merge=false) {
+        const auto processing=gpu::FidelityFxDofProcessingSize(fixture.width,fixture.height,scale);
         Check(processing.width && processing.height &&
-              dof.Matches(processing.width,processing.height),
+              dof.Matches(processing.width,processing.height,rings,no_merge),
               "adapter DoF processing extent mismatch");
         Check(rect.left >= 0 && rect.top >= 0 && rect.right <= LONG(fixture.width) &&
               rect.bottom <= LONG(fixture.height) && rect.right>rect.left &&
@@ -416,9 +420,9 @@ public:
 
         auto constants=NewBuffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
         constexpr float projection_x=-0.1001001f, projection_y=1.001001f;
-        const float cb[12]={projection_x,projection_y,5.0f,8.0f,
+        const float cb[12]={projection_x,projection_y,5.0f,visible_radius*scale,
             float(rect.left),float(rect.top),float(rect.right-rect.left),float(rect.bottom-rect.top),
-            1.0f,0.45f,fixture.bound,0.0f};
+            near_scale,far_scale,fixture.bound*scale,float(scale)};
         uint8_t* cb_mapped=nullptr;
         D3D12_RANGE no_read{0,0};
         Hr(constants->Map(0,&no_read,reinterpret_cast<void**>(&cb_mapped)),"Map adapter constants");
@@ -460,7 +464,7 @@ public:
             Transition(encoded.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(2,for_compute);
-        if (!dof.Dispatch(list.Get(),prepared.Get(),encoded.Get(),filtered.Get(),fixture.bound))
+        if (!dof.Dispatch(list.Get(),prepared.Get(),encoded.Get(),filtered.Get(),fixture.bound*scale))
             throw std::runtime_error(std::string("adapter FidelityFX Dispatch: ")+dof.Failure());
         // The SDK changes heaps/root bindings, so the caller must explicitly restore them.
         list->SetDescriptorHeaps(1,heaps);
@@ -1079,10 +1083,12 @@ float RawDepth(float view_z) {
     return 1.001001f - 0.1001001f/view_z;
 }
 
-void CheckAdapterFlow(Warp& warp, gpu::FidelityFxDof& dof) {
+void CheckAdapterFlow(Warp& warp, gpu::FidelityFxDof& dof, uint32_t scale=1) {
     auto f=MakeFixture(96,64,8.0f);
-    const auto processing=gpu::FidelityFxDofProcessingSize(f.width,f.height);
-    const auto at_processed=[&](uint32_t x,uint32_t y){return size_t(y)*processing.width+x;};
+    const auto processing=gpu::FidelityFxDofProcessingSize(f.width,f.height,scale);
+    const auto at_processed=[&](uint32_t x,uint32_t y){
+        return size_t(y*scale)*processing.width+x*scale;
+    };
     const D3D12_RECT rect{7,9,89,55};
     for(uint32_t y=0;y<f.height;++y)
         for(uint32_t x=0;x<f.width;++x) {
@@ -1096,7 +1102,8 @@ void CheckAdapterFlow(Warp& warp, gpu::FidelityFxDof& dof) {
             f.depth[i]=RawDepth(z);
         }
     f.depth[At(f,48,32)]=-1.0f; // invalid raw depth: present must discard.
-    const auto result=warp.RunAdapter(dof,f,rect);
+    const auto result=warp.RunAdapter(dof,f,rect,scale,8.0f,1.0f,0.45f,
+                                      scale==2?8u:4u,scale==2);
     CheckFiniteAndBounded(result.destination);
     double max_alpha_error=0, max_outside_error=0;
     for(uint32_t y=0;y<f.height;++y)
@@ -1120,9 +1127,9 @@ void CheckAdapterFlow(Warp& warp, gpu::FidelityFxDof& dof) {
     const float near_d=result.encoded_depth[at_processed(20,32)];
     const float focus_d=result.encoded_depth[at_processed(48,31)];
     const float far_d=result.encoded_depth[at_processed(75,32)];
-    std::printf("adapter prepare depth: near %.4f, focus %.4f, far %.4f; "
+    std::printf("adapter %ux prepare depth: near %.4f, focus %.4f, far %.4f; "
                 "max alpha error %.6f, outside RGB error %.6f\n",
-                near_d,focus_d,far_d,max_alpha_error,max_outside_error);
+                scale,near_d,focus_d,far_d,max_alpha_error,max_outside_error);
     Check(near_d<0.48f && std::fabs(focus_d-0.5f)<0.005f && far_d>0.52f,
           "prepare did not encode signed near/focus/far CoC");
     Check(max_alpha_error<0.001 && max_outside_error<0.001,
@@ -1131,10 +1138,13 @@ void CheckAdapterFlow(Warp& warp, gpu::FidelityFxDof& dof) {
           "prepare did not extend clamped viewport across SDK input");
 }
 
-void CheckOddAdapter(Warp& warp, gpu::FidelityFxDof& dof) {
+void CheckOddAdapter(Warp& warp, gpu::FidelityFxDof& dof, uint32_t scale=1) {
     auto f=MakeFixture(79,65,8.0f);
-    const auto processing=gpu::FidelityFxDofProcessingSize(f.width,f.height);
-    Check(processing.width==128 && processing.height==128 && dof.Matches(128,128),
+    const auto processing=gpu::FidelityFxDofProcessingSize(f.width,f.height,scale);
+    Check(processing.width==(scale==1?128u:192u) &&
+          processing.height==(scale==1?128u:192u) &&
+          dof.Matches(processing.width,processing.height,
+                      scale==2?8u:4u,scale==2),
           "odd logical extent did not use the production 64-aligned processing size");
     const D3D12_RECT full{0,0,LONG(f.width),LONG(f.height)};
     for(uint32_t y=0;y<f.height;++y)
@@ -1144,7 +1154,8 @@ void CheckOddAdapter(Warp& warp, gpu::FidelityFxDof& dof) {
             f.color[i]={v,1-v,0.5f,0.375f};
             f.depth[i]=RawDepth(5.0f);
         }
-    auto focus=warp.RunAdapter(dof,f,full);
+    auto focus=warp.RunAdapter(dof,f,full,scale,8.0f,1.0f,0.45f,
+                               scale==2?8u:4u,scale==2);
     CheckFiniteAndBounded(focus.destination);
     double max_focus_error=0,max_alpha_error=0;
     for(size_t i=0;i<f.color.size();++i) {
@@ -1152,15 +1163,16 @@ void CheckOddAdapter(Warp& warp, gpu::FidelityFxDof& dof) {
         max_focus_error=std::max(max_focus_error,double(std::fabs(focus.destination[i].g-f.color[i].g)));
         max_alpha_error=std::max(max_alpha_error,double(std::fabs(focus.destination[i].a-f.color[i].a)));
     }
-    std::printf("odd 79x65 padded 128x128 focus: max RGB error %.6f, alpha %.6f\n",
-                max_focus_error,max_alpha_error);
+    std::printf("odd 79x65 %ux padded %ux%u focus: max RGB error %.6f, alpha %.6f\n",
+                scale,processing.width,processing.height,max_focus_error,max_alpha_error);
     Check(max_focus_error<0.02 && max_alpha_error<0.001,
           "odd logical focus or destination alpha changed through padded adapter");
     std::fill(f.color.begin(),f.color.end(),Pixel{0.25f,0.5f,0.75f,0.375f});
     for(uint32_t y=0;y<f.height;++y)
         for(uint32_t x=0;x<f.width;++x)
             f.depth[At(f,x,y)]=RawDepth(x<f.width/3?3.0f:x<2*f.width/3?5.0f:15.0f);
-    auto uniform=warp.RunAdapter(dof,f,full);
+    auto uniform=warp.RunAdapter(dof,f,full,scale,8.0f,1.0f,0.45f,
+                                 scale==2?8u:4u,scale==2);
     CheckFiniteAndBounded(uniform.destination);
     double max_uniform_error=0;
     for(const Pixel& p:uniform.destination) {
@@ -1171,15 +1183,336 @@ void CheckOddAdapter(Warp& warp, gpu::FidelityFxDof& dof) {
     }
     const Pixel padded_corner=uniform.prepared_color[size_t(processing.height-1)*processing.width+
                                                      processing.width-1];
-    std::printf("odd 79x65 padded 128x128 uniform: max RGB error %.6f, alpha %.6f, "
+    std::printf("odd 79x65 %ux padded %ux%u uniform: max RGB error %.6f, alpha %.6f, "
                 "prepared padded corner %.4f/%.4f/%.4f validity %.4f\n",
-                max_uniform_error,max_alpha_error,padded_corner.r,padded_corner.g,
+                scale,processing.width,processing.height,max_uniform_error,max_alpha_error,
+                padded_corner.r,padded_corner.g,
                 padded_corner.b,padded_corner.a);
     Check(padded_corner.a>0.99f && std::fabs(padded_corner.r-0.25f)<0.002f &&
           std::fabs(padded_corner.b-0.75f)<0.002f,
           "prepare failed to extend logical edge into aligned padding");
     Check(max_uniform_error<0.035 && max_alpha_error<0.001,
           "odd logical uniform scene gained blur energy or changed destination alpha");
+}
+
+void CheckCinematicOddBottomEdge(Warp& warp, gpu::FidelityFxDof& dof) {
+    auto f=MakeFixture(79,65,8.0f);
+    const uint32_t edge=f.width/2;
+    for(uint32_t y=0;y<f.height;++y)
+        for(uint32_t x=0;x<f.width;++x) {
+            const size_t i=At(f,x,y);
+            f.color[i]=x<edge?Pixel{0.9f,0.1f,0.05f,0.375f}
+                              :Pixel{0.05f,0.1f,0.9f,0.375f};
+            f.depth[i]=RawDepth(x<edge?3.0f:90.0f);
+        }
+    const D3D12_RECT full{0,0,LONG(f.width),LONG(f.height)};
+    const auto output=warp.RunAdapter(dof,f,full,2,8.0f,1.0f,0.45f,8,true).destination;
+    CheckFiniteAndBounded(output);
+    double seam=0;
+    for(uint32_t y=f.height-4;y<f.height;++y)
+        for(uint32_t x=edge-8;x<edge+8;++x) {
+            const Pixel& bottom=output[At(f,x,y)];
+            const Pixel& middle=output[At(f,x,f.height/2)];
+            seam=std::max(seam,double(std::fabs(bottom.r-middle.r)));
+            seam=std::max(seam,double(std::fabs(bottom.g-middle.g)));
+            seam=std::max(seam,double(std::fabs(bottom.b-middle.b)));
+        }
+    std::printf("Cinematic 2x odd 79x65 foreground bottom seam %.5f\n",seam);
+    Check(seam<0.10,"Cinematic scale2 odd viewport gained a bottom-edge tile seam");
+}
+
+enum class QualityKind { Texture, StripePhases, SlantedEdge, Highlight };
+
+const char* QualityName(QualityKind kind) {
+    switch(kind) {
+    case QualityKind::Texture: return "texture";
+    case QualityKind::StripePhases: return "stripe-phases";
+    case QualityKind::SlantedEdge: return "slanted-edge";
+    case QualityKind::Highlight: return "highlight";
+    }
+    return "unknown";
+}
+
+Fixture QualityFixture(QualityKind kind) {
+    auto f=MakeFixture(128,384,30.0f);
+    for(uint32_t y=0;y<f.height;++y)
+        for(uint32_t x=0;x<f.width;++x) {
+            float v=0;
+            switch(kind) {
+            case QualityKind::Texture: {
+                // Nonperiodic high-frequency texture exposes half-resolution grid phase.
+                uint32_t hash=x*0x9E3779B1u ^ y*0x85EBCA77u;
+                hash^=hash>>16; hash*=0x7FEB352Du;
+                hash^=hash>>15; hash*=0x846CA68Bu;
+                hash^=hash>>16;
+                v=0.2f+0.6f*float(hash&255u)/255.0f;
+                break;
+            }
+            case QualityKind::StripePhases:
+                // Two isolated 1px vertical features differing only by pixel phase.
+                v=(y>=32 && y<160 && x==63) || (y>=224 && y<352 && x==64)
+                    ? 0.98f : 0.02f;
+                break;
+            case QualityKind::SlantedEdge: v=x<32+y/6 ? 0.1f:0.9f; break;
+            case QualityKind::Highlight: v=x==64 && y==192 ? 0.98f:0.01f; break;
+            }
+            const size_t i=At(f,x,y);
+            f.color[i]={v,v,v,0.625f};
+            f.depth[i]=RawDepth(90.0f);
+        }
+    return f;
+}
+
+float VisibleFarCoc(float radius) {
+    // Same depth/focus/focus-band/far-scale input as the production adapter.
+    return radius * 0.45f * (90.0f-5.0f-5.0f*0.15f)/90.0f;
+}
+
+std::vector<Pixel> CpuDiscReference(const Fixture& f, float radius) {
+    struct Offset { int dx,dy; };
+    std::vector<Offset> aperture;
+    const int reach=int(std::ceil(radius));
+    for(int dy=-reach;dy<=reach;++dy)
+        for(int dx=-reach;dx<=reach;++dx)
+            if(float(dx*dx+dy*dy)<=radius*radius)
+                aperture.push_back({dx,dy});
+    Check(!aperture.empty(),"empty CPU aperture reference");
+    std::vector<Pixel> reference(f.color.size());
+    for(uint32_t y=0;y<f.height;++y)
+        for(uint32_t x=0;x<f.width;++x) {
+            double red=0,green=0,blue=0;
+            for(const auto& tap:aperture) {
+                const auto sx=uint32_t(std::clamp(int(x)+tap.dx,0,int(f.width)-1));
+                const auto sy=uint32_t(std::clamp(int(y)+tap.dy,0,int(f.height)-1));
+                const Pixel& sample=f.color[At(f,sx,sy)];
+                red+=sample.r; green+=sample.g; blue+=sample.b;
+            }
+            const double normalization=1.0/double(aperture.size());
+            reference[At(f,x,y)]={float(red*normalization),float(green*normalization),
+                                  float(blue*normalization),f.color[At(f,x,y)].a};
+        }
+    return reference;
+}
+
+double DiscRmse(const Fixture& f, const std::vector<Pixel>& output,
+                const std::vector<Pixel>& reference) {
+    double squared=0;
+    uint64_t count=0;
+    for(uint32_t y=16;y<f.height-16;++y)
+        for(uint32_t x=16;x<f.width-16;++x) {
+            const double difference=double(output[At(f,x,y)].r)-reference[At(f,x,y)].r;
+            squared+=difference*difference;
+            ++count;
+        }
+    return std::sqrt(squared/count);
+}
+
+struct QualityMetrics {
+    double rmse=0, detail=0, texture_mean=0, texture_stddev=0;
+    double stripe_even_energy=0, stripe_odd_energy=0, stripe_phase_error=0;
+    double edge_max_step=0, edge_left=0, edge_right=0, edge_width=0;
+    double highlight_peak=0, highlight_energy=0, highlight_background=0;
+};
+
+QualityMetrics MeasureQuality(QualityKind kind, const Fixture& f,
+                              const std::vector<Pixel>& output,
+                              const std::vector<Pixel>& reference,float visible_coc) {
+    CheckFiniteAndBounded(output);
+    QualityMetrics metric;
+    metric.rmse=DiscRmse(f,output,reference);
+    double max_alpha_error=0;
+    for(size_t i=0;i<output.size();++i)
+        max_alpha_error=std::max(max_alpha_error,
+            double(std::fabs(output[i].a-f.color[i].a)));
+    Check(max_alpha_error<0.001,"FidelityFX present changed destination alpha");
+    switch(kind) {
+    case QualityKind::Texture: {
+        metric.detail=VerticalContrast(f,output,48,80);
+        double sum=0,sum_squared=0; uint64_t n=0;
+        for(uint32_t y=32;y<f.height-32;++y)
+            for(uint32_t x=32;x<f.width-32;++x) {
+                const double v=output[At(f,x,y)].r;
+                sum+=v; sum_squared+=v*v; ++n;
+            }
+        metric.texture_mean=sum/n;
+        metric.texture_stddev=std::sqrt(std::max(0.0,sum_squared/n-
+                                                metric.texture_mean*metric.texture_mean));
+        Check(metric.detail<0.30,"defocused far texture retained excessive one-pixel detail");
+        Check(metric.texture_mean>0.43 && metric.texture_mean<0.57 &&
+              metric.texture_stddev>0.003,
+              "defocused far texture lost its mean or all spatial structure");
+        break;
+    }
+    case QualityKind::StripePhases: {
+        double phase_difference=0;
+        for(uint32_t x=24;x<103;++x) {
+            metric.stripe_even_energy+=std::max(0.0,double(output[At(f,x,96)].r)-0.02);
+            metric.stripe_odd_energy+=std::max(0.0,double(output[At(f,x,288)].r)-0.02);
+            if(x<102) phase_difference+=std::fabs(double(output[At(f,x,96)].r)-
+                                                   output[At(f,x+1,288)].r);
+        }
+        metric.stripe_phase_error=phase_difference/
+            std::max(0.001,0.5*(metric.stripe_even_energy+metric.stripe_odd_energy));
+        Check(metric.stripe_even_energy>0.20 && metric.stripe_even_energy<2.50 &&
+              metric.stripe_odd_energy>0.20 && metric.stripe_odd_energy<2.50,
+              "one-pixel far stripes lost or amplified most of their energy");
+        break;
+    }
+    case QualityKind::SlantedEdge:
+        for(uint32_t y=40;y<f.height-40;y+=16)
+            for(uint32_t x=24;x<104;++x)
+                metric.edge_max_step=std::max(metric.edge_max_step,
+                    double(std::fabs(output[At(f,x+1,y)].r-output[At(f,x,y)].r)));
+        Check(metric.edge_max_step<0.72,
+              "defocused slanted edge stayed near an unblurred one-pixel step");
+        metric.edge_left=output[At(f,24,192)].r;
+        metric.edge_right=output[At(f,104,192)].r;
+        Check(metric.edge_left<0.25 && metric.edge_right>0.75,
+              "slanted-edge blur flattened the foreground/background contrast");
+        {
+            int low=-1,high=-1;
+            for(uint32_t x=24;x<104;++x) {
+                const float value=output[At(f,x,192)].r;
+                if(low<0 && value>=0.18f) low=int(x);
+                if(high<0 && value>=0.82f) high=int(x);
+            }
+            Check(low>=0 && high>=low,"slanted-edge 10-90 crossings missing");
+            metric.edge_width=high-low;
+            Check(metric.edge_width>=2 && metric.edge_width<=2*visible_coc+8,
+                  "slanted-edge transition width is too sharp or too broad");
+        }
+        break;
+    case QualityKind::Highlight:
+        // Use the actual FP16/SDK floor away from the impulse. Subtracting
+        // decimal 0.01 over 49k pixels adds false positive energy.
+        metric.highlight_background=output[At(f,12,12)].r;
+        for(uint32_t y=128;y<256;++y)
+            for(uint32_t x=16;x<112;++x) {
+                const Pixel& p=output[At(f,x,y)];
+                metric.highlight_peak=std::max(metric.highlight_peak,double(p.r));
+                metric.highlight_energy+=std::max(0.0,
+                    double(p.r)-metric.highlight_background);
+            }
+        Check(metric.highlight_peak<0.60 && metric.highlight_energy>0.20 &&
+              metric.highlight_energy<2.50,
+              "isolated far highlight did not spread with bounded energy");
+        break;
+    }
+    return metric;
+}
+
+Fixture ShiftFixture(const Fixture& original,int dx,int dy) {
+    Fixture shifted=original;
+    for(uint32_t y=0;y<original.height;++y)
+        for(uint32_t x=0;x<original.width;++x) {
+            const uint32_t sx=uint32_t(std::clamp(int(x)-dx,0,int(original.width)-1));
+            const uint32_t sy=uint32_t(std::clamp(int(y)-dy,0,int(original.height)-1));
+            shifted.color[At(original,x,y)]=original.color[At(original,sx,sy)];
+        }
+    return shifted;
+}
+
+double PhaseRms(const Fixture& f, const std::vector<Pixel>& original,
+                const std::vector<Pixel>& shifted, int dx,int dy,
+                std::vector<Pixel>* difference_image=nullptr) {
+    // Exclude more than the visible aperture plus reconstruction footprint.
+    constexpr uint32_t margin=24;
+    double squared=0; uint64_t count=0;
+    if(difference_image)
+        difference_image->assign(f.color.size(),Pixel{0,0,0,1});
+    for(uint32_t y=margin;y<f.height-margin;++y)
+        for(uint32_t x=margin;x<f.width-margin;++x) {
+            const Pixel& a=original[At(f,x,y)];
+            const Pixel& b=shifted[At(f,uint32_t(int(x)+dx),uint32_t(int(y)+dy))];
+            const double dr=double(a.r)-b.r,dg=double(a.g)-b.g,db=double(a.b)-b.b;
+            squared+=dr*dr+dg*dg+db*db;
+            count+=3;
+            if(difference_image)
+                (*difference_image)[At(f,x,y)]={float(std::min(1.0,std::fabs(dr)*8)),
+                    float(std::min(1.0,std::fabs(dg)*8)),float(std::min(1.0,std::fabs(db)*8)),1};
+        }
+    return std::sqrt(squared/count);
+}
+
+void CompareQualityModes(Warp& warp, gpu::FidelityFxDof& dof) {
+    struct Mode { const char* name; uint32_t scale,rings; bool no_merge; };
+    constexpr Mode modes[]={
+        {"native4-merge",1,4,false}, {"native4-no-merge",1,4,true},
+        {"native8-no-merge",1,8,true}, {"scale2-8-no-merge",2,8,true},
+    };
+    struct Scene { QualityKind kind; float visible_radius; const char* band; };
+    constexpr Scene scenes[]={
+        {QualityKind::Texture,30.0f,"large"},
+        {QualityKind::StripePhases,30.0f,"large"},
+        {QualityKind::SlantedEdge,30.0f,"large"},
+        {QualityKind::Highlight,30.0f,"large"},
+        {QualityKind::Texture,9.5f,"small"},
+        {QualityKind::SlantedEdge,9.5f,"small"},
+    };
+    struct Case { Scene scene; Fixture fixture; std::vector<Pixel> reference; };
+    std::vector<Case> cases;
+    cases.reserve(std::size(scenes));
+    for(const Scene& scene:scenes) {
+        auto fixture=QualityFixture(scene.kind);
+        auto reference=CpuDiscReference(fixture,VisibleFarCoc(scene.visible_radius));
+        const std::string common=std::string("quality-")+scene.band+"-"+
+                                 QualityName(scene.kind);
+        WriteBmp((common+"-input.bmp").c_str(),fixture.width,fixture.height,fixture.color);
+        WriteBmp((common+"-cpu-disc.bmp").c_str(),fixture.width,fixture.height,reference);
+        cases.push_back({scene,std::move(fixture),std::move(reference)});
+    }
+    for(const Mode& mode:modes) {
+        const auto processing=gpu::FidelityFxDofProcessingSize(128,384,mode.scale);
+        dof.Reset();
+        Check(dof.Create(warp.Device(),processing.width,processing.height,
+                         mode.rings,mode.no_merge),dof.Failure());
+        Check(dof.Matches(processing.width,processing.height,mode.rings,mode.no_merge),
+              "FidelityFX quality configuration did not match requested mode");
+        const D3D12_RECT full{0,0,128,384};
+        for(const Case& test:cases) {
+            const Scene& scene=test.scene;
+            const Fixture& fixture=test.fixture;
+            const auto& reference=test.reference;
+            const auto output=warp.RunAdapter(dof,fixture,full,mode.scale,
+                                              scene.visible_radius,1.0f,0.45f,
+                                              mode.rings,mode.no_merge).destination;
+            const std::string prefix=std::string("quality-")+mode.name+"-"+
+                                     scene.band+"-"+QualityName(scene.kind);
+            WriteBmp((prefix+"-output.bmp").c_str(),fixture.width,fixture.height,output);
+            const float coc=VisibleFarCoc(scene.visible_radius);
+            const auto m=MeasureQuality(scene.kind,fixture,output,reference,coc);
+            std::printf("quality %s %s %s CoC %.3fpx: discRMSE %.5f detail %.5f "
+                        "textureMean %.4f stddev %.4f stripeEnergy %.4f/%.4f "
+                        "phaseError %.4f edgeStep %.4f edgeWidth %.1f "
+                        "highlightPeak %.4f energy %.4f background %.6f\n",
+                mode.name,scene.band,QualityName(scene.kind),coc,
+                m.rmse,m.detail,m.texture_mean,m.texture_stddev,
+                m.stripe_even_energy,m.stripe_odd_energy,m.stripe_phase_error,
+                m.edge_max_step,m.edge_width,m.highlight_peak,m.highlight_energy,
+                m.highlight_background);
+            if(scene.kind==QualityKind::Texture && scene.visible_radius==9.5f) {
+                constexpr int shifts[3][2]={{1,0},{0,1},{1,1}};
+                double rms[3]{};
+                for(int j=0;j<3;++j) {
+                    const auto shifted_fixture=ShiftFixture(fixture,shifts[j][0],shifts[j][1]);
+                    const auto shifted_output=warp.RunAdapter(dof,shifted_fixture,full,
+                                                              mode.scale,scene.visible_radius,
+                                                              1.0f,0.45f,mode.rings,
+                                                              mode.no_merge).destination;
+                    CheckFiniteAndBounded(shifted_output);
+                    std::vector<Pixel> heatmap;
+                    rms[j]=PhaseRms(fixture,output,shifted_output,
+                                    shifts[j][0],shifts[j][1],j==2?&heatmap:nullptr);
+                    if(j==2)
+                        WriteBmp((prefix+"-phase-difference-8x.bmp").c_str(),
+                                 fixture.width,fixture.height,heatmap);
+                }
+                std::printf("phase %s %.3fpx CoC: shiftX %.6f shiftY %.6f shiftXY %.6f RMS RGB\n",
+                            mode.name,coc,rms[0],rms[1],rms[2]);
+            }
+        }
+    }
+    dof.Reset();
 }
 
 } // namespace
@@ -1212,6 +1545,20 @@ int main() {
               "odd-resolution recreation retained stale extent");
         CheckOddAdapter(warp,dof);
         dof.Reset();
+        const auto cinematic_adapter=gpu::FidelityFxDofProcessingSize(96,64,2);
+        Check(dof.Create(warp.Device(),cinematic_adapter.width,cinematic_adapter.height,8,true),
+              dof.Failure());
+        Check(dof.Matches(cinematic_adapter.width,cinematic_adapter.height,8,true),
+              "Cinematic adapter context did not retain 8 rings without merge");
+        CheckAdapterFlow(warp,dof,2);
+        dof.Reset();
+        const auto cinematic_odd=gpu::FidelityFxDofProcessingSize(79,65,2);
+        Check(dof.Create(warp.Device(),cinematic_odd.width,cinematic_odd.height,8,true),
+              dof.Failure());
+        CheckOddAdapter(warp,dof,2);
+        CheckCinematicOddBottomEdge(warp,dof);
+        dof.Reset();
+        CompareQualityModes(warp,dof);
         std::puts("PASS: production FidelityFX DoF on D3D12 WARP");
         return 0;
     } catch (const std::exception& error) {

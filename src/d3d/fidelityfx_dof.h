@@ -12,11 +12,12 @@ namespace gpu {
 struct FidelityFxDofSize { uint32_t width, height; };
 
 // Keep partial 64-pixel SDK workgroups outside the visible image. The adapter edge-extends the logical
-// viewport over this processing extent, then copies back only the original viewport without rescaling CoC.
+// viewport over this processing extent. A 2x profile replicates native inputs and averages each output 2x2;
+// CoC is expressed in processing pixels, so the caller scales both CoC and its encoding bound by the same factor.
 // 16384 is D3D12's maximum 2D texture dimension; reject zero/oversized inputs without arithmetic overflow.
-constexpr FidelityFxDofSize FidelityFxDofProcessingSize(uint32_t width, uint32_t height) {
-    if (!width || !height || width > 16384 || height > 16384) return {};
-    return {(width + 63u) & ~63u, (height + 63u) & ~63u};
+constexpr FidelityFxDofSize FidelityFxDofProcessingSize(uint32_t width, uint32_t height, uint32_t scale = 1) {
+    if ((scale != 1 && scale != 2) || !width || !height || width > 16384 / scale || height > 16384 / scale) return {};
+    return {(width * scale + 63u) & ~63u, (height * scale + 63u) & ~63u};
 }
 
 // Owns the official SDK context, not the caller's command list or input/output resources.
@@ -30,15 +31,16 @@ public:
     FidelityFxDof& operator=(const FidelityFxDof&) = delete;
 
     // Production callers pass FidelityFxDofProcessingSize, not the unpadded logical target size.
-    bool Create(ID3D12Device* device, uint32_t width, uint32_t height);
+    bool Create(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t rings = 4,
+                bool disable_ring_merge = false);
     // Single-sample RGBA16F color and R32F encoded depth enter in NON_PIXEL_SHADER_RESOURCE; a distinct
     // RGBA16F ALLOW_UNORDERED_ACCESS output enters in UNORDERED_ACCESS. All three have the context extent.
-    // For our signed full-resolution CoC c (near negative), depth = .5+c/(2*bound), bound >= abs(c).
+    // For signed CoC c in processing pixels (near negative), depth = .5+c/(2*bound), bound >= abs(c).
     bool Dispatch(ID3D12GraphicsCommandList* command_list, ID3D12Resource* color, ID3D12Resource* encoded_depth,
                   ID3D12Resource* output, float coc_bound);
     void Reset();
     bool Ready() const;
-    bool Matches(uint32_t width, uint32_t height) const;
+    bool Matches(uint32_t width, uint32_t height, uint32_t rings = 4, bool disable_ring_merge = false) const;
     const char* Failure() const;
 
 private:

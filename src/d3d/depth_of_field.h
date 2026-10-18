@@ -1,7 +1,8 @@
 #pragma once
 #include <cstdint>
 
-// Two rects carry projection z, reload strength, focus, near/far strength, radius and backend (0 Balanced, 1 FFX).
+// Two rects carry projection z, strength, focus, near/far strength, radius and backend:
+// 0 Balanced, 1 FidelityFX Standard, 2 FidelityFX Cinematic.
 namespace gpu {
 constexpr uint32_t kClearDepthOfField = 0x200;
 constexpr uint32_t kDepthOfFieldRects = 2;
