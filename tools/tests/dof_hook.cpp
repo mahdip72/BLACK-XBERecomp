@@ -17,6 +17,7 @@ using namespace kernel;
 
 void ReloadAnimationDof(X86Context& ctx, uint8_t* base);
 void ReloadDepthOfField(X86Context& ctx, uint8_t* base);
+void ObserveIdleDof(X86Context& ctx, uint8_t* base);
 void BeginWeaponDepthOfField(X86Context& ctx, uint8_t* base);
 void EndWeaponDepthOfField(X86Context& ctx, uint8_t* base);
 void BeginPreviewWeaponDepthOfField(X86Context& ctx, uint8_t* base);
@@ -738,6 +739,217 @@ void TestPreviewWeaponGuards() {
     }
     std::puts("PASS preview weapon full-sharp/reload priority, mode and stale-token guards");
 }
+
+constexpr uint32_t kIdlePlayer = 0x500000 + layout::kWorldPlayer;
+constexpr uint32_t kIdleWeapon = 0x700000;
+constexpr uint32_t kIdleController = 0x710000;
+constexpr uint32_t kIdleInstance = 0x711000;
+constexpr uint32_t kIdleCache = 0x712000;
+constexpr uint32_t kIdleRoot = 0x713000;
+constexpr uint32_t kIdleSequence = 0x713040;
+constexpr uint32_t kIdleLead = 0x713100;
+constexpr uint32_t kIdleStretch = 0x713140;
+constexpr uint32_t kIdleTail = 0x713180;
+constexpr uint32_t kIdleParams = 0x713200;
+
+void IdleFixture() {
+    R32(kIdlePlayer + 0x29C) = kIdleWeapon;
+    R32(kIdlePlayer + 0x328) = kIdleController;
+    R32(kIdleWeapon + 0xF0) = kIdlePlayer;
+    R32(kIdleController) = kIdlePlayer;
+    R32(kIdleController + 0x54) = kIdleInstance;
+    const char name[] = "FP_SMG_S_001";
+    std::memcpy(&G<char>(kIdleController + 0x5C), name, sizeof(name));
+    R32(kIdleInstance + 0x10) = 0x72E8A37E; // native 9CD30 key for FP_SMG_S_001
+    R32(kIdleInstance + 0xC) = kIdleRoot;
+    R32(kIdleInstance + 0x98C) = kIdleCache;
+    R32(kIdleInstance + 0x970) = R32(kIdleInstance + 0x980) = 7;
+    G<float>(kIdleInstance + 0x1C) = 60;
+    // Deliberately unrelated to the normalized native sample; fade offsets make raw time unsuitable.
+    G<float>(kIdleInstance + 0x14) = 12345;
+    R32(kIdleCache + 0x118) = 4;
+    G<float>(kIdleCache) = G<float>(kIdleCache + 4) = 60;
+    G<float>(kIdleCache + 12) = 10;
+    G<uint8_t>(kIdleRoot) = G<uint8_t>(kIdleSequence) = 2;
+    G<int8_t>(kIdleRoot + 1) = 1;
+    R32(kIdleRoot + 0x10) = kIdleSequence;
+    G<int16_t>(kIdleSequence + 2) = 1;
+    G<int8_t>(kIdleSequence + 1) = 3;
+    R32(kIdleSequence + 0x10) = kIdleLead;
+    R32(kIdleSequence + 0x14) = kIdleStretch;
+    R32(kIdleSequence + 0x18) = kIdleTail;
+    G<uint8_t>(kIdleLead) = G<uint8_t>(kIdleTail) = 0x16;
+    G<int16_t>(kIdleLead + 2) = 3;
+    G<int16_t>(kIdleTail + 2) = 71;
+    G<float>(kIdleTail + 4) = 20;
+    R32(kIdleLead + 0x10) = 0x720000;
+    R32(kIdleTail + 0x10) = 0x730000;
+    G<uint8_t>(kIdleStretch) = 8;
+    G<int8_t>(kIdleStretch + 1) = 1;
+    G<int16_t>(kIdleStretch + 2) = 70;
+    G<float>(kIdleStretch + 4) = 30;
+    R32(kIdleStretch + 8) = kIdleParams;
+    G<float>(kIdleParams) = 3;
+    R32(kIdleStretch + 0x10) = kIdleLead;
+}
+
+void SampleIdle(float time, uint32_t flags = 0, uint32_t instance = kIdleInstance,
+                uint32_t root = kIdleRoot, uint32_t cache = kIdleCache) {
+    R32(kStack + 4) = instance;
+    R32(kStack + 8) = root;
+    R32(kStack + 12) = cache;
+    G<float>(kStack + 16) = time;
+    G<float>(kStack + 20) = time - 1;
+    R32(kStack + 24) = flags;
+    auto ctx = Context();
+    const auto saved = ctx;
+    const auto before = GuestSnapshot();
+    ObserveIdleDof(ctx, nullptr);
+    SameGuest(before, "idle observer changed guest animation or timing");
+    Check(std::memcmp(&ctx, &saved, sizeof(ctx)) == 0,
+          "idle observer changed registers or flags");
+    R32(kStack + 4) = kEffect;
+}
+
+void AdvanceIdle(unsigned frames, float sample_time) {
+    for (unsigned i = 0; i < frames; ++i) {
+        ++R32(kFrameCount);
+        SampleIdle(sample_time);
+        TickPreview(0.1f);
+    }
+}
+
+void TestIdlePhaseAndLoop() {
+    Reset(); IdleFixture();
+    SampleIdle(39.999f); TickPreview(0.1f);
+    Check(!DeferPreview(), "ordinary idle lead-in enabled world focus");
+    BeginGun(); EndGun();
+    Check(weapon_begin_calls == 1 && weapon_end_calls == 1,
+          "ordinary idle lost normal weapon blur");
+    SampleIdle(40); TickPreview(0.1f);
+    Check(DeferPreview(), "exact cumulative boundary did not enter the inspection tail");
+    PreviewRenderFrame();
+    Check(std::abs(queued_strength - CinematicDofStrength(0.125f)) < 1e-6f,
+          "inspection did not start the shared 0.8-second focus ramp");
+    Check(DrawPreview(), "inspection lost deferred gun draw");
+    BeginPreviewGun(); EndPreviewGun();
+    Check(std::abs(weapon_end_strength - 0.25f * (1 - queued_strength)) < 1e-6f,
+          "inspection gun blur did not fade inversely to world focus");
+    AdvanceIdle(7, 45);
+    Check(DeferPreview(), "inspection did not hold the late weapon route");
+    PreviewRenderFrame();
+    Check(queued_strength == 1, "inspection did not reach full world focus");
+    Check(DrawPreview(), "full inspection lost gun draw");
+    const int previous_begin = weapon_begin_calls;
+    BeginPreviewGun(); EndPreviewGun();
+    Check(weapon_begin_calls == previous_begin, "full inspection blurred the gun");
+    Effect(false); // authored inspection must never claim reload suppression.
+    AdvanceIdle(1, 0); // native root time wraps at the loop, even though instance raw time is large.
+    Check(DeferPreview(), "inspection loop wrap snapped off the late route");
+    PreviewRenderFrame();
+    Check(queued_strength > 0 && queued_strength < 1, "loop wrap did not fade world focus out");
+    Check(DrawPreview(), "inspection fade lost gun draw");
+    AdvanceIdle(8, 0);
+    Check(!DeferPreview(), "inspection focus survived the completed 0.9-second fade");
+    std::puts("PASS authored idle lead-in/tail boundary, native sample time, sharp gun and loop fade");
+}
+
+void TestIdleRejectsUnknownAndInvalid() {
+    auto denied = [](auto change, const char* message) {
+        Reset(); IdleFixture(); change(); SampleIdle(45); TickPreview(0.1f);
+        Check(!DeferPreview(), message);
+    };
+    denied([] { ++R32(kIdleInstance + 0x10); }, "failed name lookup relabeled old playback as idle");
+    denied([] { G<char>(kIdleController + 0x5C + 10) = '2'; }, "non-idle action enabled focus");
+    denied([] { R32(kIdleController) += 4; }, "foreign controller owner enabled idle focus");
+    denied([] { R32(kIdleWeapon + 0xF0) += 4; }, "foreign weapon enabled idle focus");
+    denied([] { R32(kIdleInstance) = 0x02000000; }, "completed animation enabled idle focus");
+    denied([] { G<uint8_t>(kIdleController + 0xB4) = 1; }, "completed controller enabled idle focus");
+    denied([] { G<float>(kIdleInstance + 0x1C) = NAN; }, "nonfinite playback duration enabled focus");
+    denied([] { G<float>(kIdleInstance + 0x1C) = 1; }, "terminal-pose duration enabled focus");
+    denied([] { ++R32(kIdleInstance + 0x980); }, "outgoing fade generation enabled idle focus");
+    denied([] { G<uint8_t>(kIdleSequence) = 0; }, "unknown selector graph enabled idle focus");
+    denied([] { G<int8_t>(kIdleSequence + 1) = 17; }, "unbounded sequence enabled idle focus");
+    denied([] { R32(kIdleRoot + 0x10) = kIdleRoot; }, "cyclic root graph enabled idle focus");
+    denied([] { R32(kIdleStretch + 0x10) = kIdleStretch; }, "cyclic duration wrapper enabled focus");
+    denied([] { R32(kIdleStretch + 0x10) = kIdleTail; }, "different lead-in leaf enabled focus");
+    denied([] { R32(kIdleTail + 0x10) = R32(kIdleLead + 0x10); }, "ordinary idle-only graph enabled focus");
+    denied([] { R32(kIdleCache + 0x118) = 3; }, "uninitialized native duration cache enabled focus");
+    denied([] { R32(kIdleCache + 0x118) = 71; }, "oversize native duration cache enabled focus");
+    denied([] { G<int16_t>(kIdleLead + 2) = -1; }, "negative native duration cache id enabled focus");
+    denied([] { G<float>(kIdleStretch + 4) = NAN; }, "nonfinite child duration enabled focus");
+    denied([] { G<float>(kIdleTail + 4) = 0; }, "zero child duration enabled focus");
+    denied([] { G<float>(kIdleParams) = -1; }, "invalid duration wrapper enabled focus");
+    for (float time : {-1.0f, 60.0f, INFINITY, NAN}) {
+        Reset(); IdleFixture(); SampleIdle(time); TickPreview(0.1f);
+        Check(!DeferPreview(), "invalid/un-normalized sample time enabled focus");
+    }
+    Reset(); IdleFixture(); SampleIdle(45, 8); TickPreview(0.1f);
+    Check(!DeferPreview(), "outgoing root sampler flags enabled focus");
+    Reset(); IdleFixture(); SampleIdle(45, 0, kIdleInstance + 4); TickPreview(0.1f);
+    Check(!DeferPreview(), "foreign animation instance enabled focus");
+    Reset(); IdleFixture(); SampleIdle(45, 0, kIdleInstance, kIdleSequence); TickPreview(0.1f);
+    Check(!DeferPreview(), "child sample was mistaken for normalized root time");
+    Reset(); IdleFixture(); SampleIdle(45, 0, kIdleInstance, kIdleRoot, kIdleCache + 4); TickPreview(0.1f);
+    Check(!DeferPreview(), "foreign animation cache enabled focus");
+    std::puts("PASS idle graph, failed-start, owner, completion, cache and outgoing-sample guards");
+}
+
+void TestIdleInterruptionAndOverlap() {
+    for (int change = 0; change < 7; ++change) {
+        Reset(); IdleFixture(); AdvanceIdle(8, 45);
+        if (change == 0) ++R32(kIdleInstance + 0x970);
+        if (change == 1) R32(kIdlePlayer + 0x29C) = kIdleWeapon + 4;
+        if (change == 2) R32(kIdlePlayer + 0x328) = kIdleController + 4;
+        if (change == 3) R32(kIdleInstance + 0xC) = kIdleRoot + 4;
+        if (change == 4) R32(kIdleInstance + 0x98C) = kIdleCache + 4;
+        if (change == 5) R32(kIdleInstance) |= 1;
+        if (change == 6) R32(kFrameCount) += 2;
+        TickPreview(0.1f);
+        Check(DeferPreview(), "idle interruption snapped instead of fading");
+        PreviewRenderFrame();
+        Check(queued_strength > 0 && queued_strength < 1, "stale idle identity continued holding focus");
+        Check(DrawPreview(), "idle interruption lost already deferred gun");
+        AdvancePreview(8, false);
+        Check(!DeferPreview(), "interrupted idle focus failed to settle");
+    }
+    Reset(); IdleFixture(); SampleIdle(45); ++R32(kFrameCount); TickPreview(0.1f);
+    Check(DeferPreview(), "previous-frame native sample was rejected");
+    Check(DrawPreview(), "previous-frame idle sample lost gun");
+
+    Reset(); IdleFixture(); AdvanceIdle(4, 45);
+    Check(DeferPreview(), "partial inspection failed to route"); PreviewRenderFrame();
+    const float half = queued_strength;
+    Check(DrawPreview(), "partial inspection lost gun");
+    AdvanceIdle(1, 0);
+    Check(DeferPreview(), "idle fade lost route"); PreviewRenderFrame();
+    Check(queued_strength < half, "idle completion failed to reverse the current phase");
+    Check(DrawPreview(), "idle fade lost gun");
+    options.dof_preview = true;
+    AdvanceIdle(1, 0);
+    Check(DeferPreview(), "manual preview did not overlap idle fade"); PreviewRenderFrame();
+    Check(queued_strength > half, "manual preview failed to reverse the current fade without reset");
+    Check(DrawPreview(), "manual/idle overlap lost gun");
+    AdvanceIdle(8, 0);
+    options.dof_preview = false;
+    AdvanceIdle(1, 45);
+    Check(DeferPreview(), "active inspection failed after manual preview disabled"); PreviewRenderFrame();
+    Check(queued_strength == 1, "manual disable faded an active inspection");
+    Check(DrawPreview(), "overlap handoff lost gun");
+
+    Reset(); IdleFixture(); AdvanceIdle(8, 45);
+    Check(DeferPreview(), "idle failed to defer before reload");
+    StartReload(); TickPreview(0.1f); RenderFrame();
+    Check(std::abs(queued_strength - CinematicDofStrength(0.45f)) < 1e-6f,
+          "idle focus overrode native reload strength");
+    Check(!DrawPreview(), "idle drew a duplicate reload weapon");
+    BeginGun(); EndGun(); BeginPreviewGun(); EndPreviewGun();
+    Check(weapon_begin_calls == 0, "actual reload gun received idle weapon blur");
+    Effect(true);
+    R32(kEffect + 0x34) = 0; TickPreview(0);
+    Check(!DeferPreview(), "actual reload retained stale idle focus");
+    std::puts("PASS idle interruption fade, sample freshness, manual overlap/reversal and reload priority");
+}
 } // namespace
 
 namespace kernel {
@@ -803,6 +1015,9 @@ int main() {
         TestPreviewWeaponContinuity();
         TestPreviewWeaponSnapshot();
         TestPreviewWeaponGuards();
+        TestIdlePhaseAndLoop();
+        TestIdleRejectsUnknownAndInvalid();
+        TestIdleInterruptionAndOverlap();
         std::puts("PASS production reload DOF hook checks");
         return 0;
     } catch (const std::exception& error) {

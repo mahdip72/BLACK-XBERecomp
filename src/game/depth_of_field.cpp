@@ -1,4 +1,4 @@
-// Reload DOF follows the native timer; its session preview routes only rendering through the late weapon draw.
+// Reload DOF follows the native timer. Preview and authored idle inspections share a render-only focus fade.
 #include <array>
 #include <algorithm>
 #include <chrono>
@@ -54,6 +54,123 @@ uint32_t g_preview_tick_frame = 0;
 bool g_preview_clock_started = false;
 std::chrono::steady_clock::time_point g_preview_clock;
 
+struct IdleSample {
+    uint32_t player = 0, weapon = 0, controller = 0, instance = 0;
+    uint32_t root = 0, cache = 0, generation = 0, key = 0, frame = 0;
+    bool inspection = false;
+};
+IdleSample g_idle;
+
+// 92B60/9CD30 resolve the controller name to this lowercase SDBM key. 96FD0 stores
+// it in the active instance, so a name copied by a failed 17B130 lookup cannot tag an old clip.
+bool IdleNameMatches(uint32_t controller, uint32_t key) {
+    std::array<char, 26> name{};
+    size_t length = 0;
+    uint32_t hash = 0;
+    for (; length < name.size(); ++length) {
+        char c = G<char>(controller + 0x5C + uint32_t(length));
+        if (!c) break;
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return false;
+        name[length] = c;
+        hash = hash * 0x1003Fu + uint8_t(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+    }
+    constexpr std::array<char, 6> suffix{'_', 'S', '_', '0', '0', '1'};
+    return length >= 10 && length < name.size() && name[0] == 'F' && name[1] == 'P' && name[2] == '_' &&
+           std::equal(suffix.begin(), suffix.end(), name.begin() + length - suffix.size()) && hash == key;
+}
+
+bool IdleIdentity(IdleSample& sample) {
+    uint32_t world = R32(layout::kWorld);
+    if (!world) return false;
+    sample.player = world + layout::kWorldPlayer;
+    sample.weapon = R32(sample.player + 0x29C);
+    sample.controller = R32(sample.player + 0x328);
+    if (!sample.weapon || R32(sample.weapon + 0xF0) != sample.player || !sample.controller ||
+        R32(sample.controller) != sample.player || G<uint8_t>(sample.controller + 0xB4)) return false;
+    sample.instance = R32(sample.controller + 0x54);
+    if (!sample.instance || (R32(sample.instance) & 0x02000001u)) return false;
+    float duration = G<float>(sample.instance + 0x1C);
+    if (!std::isfinite(duration) || duration <= 1) return false;
+    sample.root = R32(sample.instance + 0x0C);
+    sample.cache = R32(sample.instance + 0x98C);
+    sample.generation = R32(sample.instance + 0x970);
+    sample.key = R32(sample.instance + 0x10);
+    return sample.root && sample.cache && IdleNameMatches(sample.controller, sample.key);
+}
+
+bool SameIdleIdentity(const IdleSample& a, const IdleSample& b) {
+    return a.player == b.player && a.weapon == b.weapon && a.controller == b.controller &&
+           a.instance == b.instance && a.root == b.root && a.cache == b.cache &&
+           a.generation == b.generation && a.key == b.key;
+}
+
+bool IdleFocusActive() {
+    IdleSample live;
+    // Allow one frame-counter boundary between pose sampling and rendering. Never reuse an
+    // older sample or one belonging to an interrupted/replaced playback instance.
+    return g_idle.inspection && uint32_t(R32(kFrameCount) - g_idle.frame) <= 1 &&
+           IdleIdentity(live) && SameIdleIdentity(live, g_idle);
+}
+
+bool NodeDuration(uint32_t node, uint32_t cache, float& duration) {
+    int id = G<int16_t>(node + 2);
+    uint32_t count = R32(cache + 0x118);
+    if (id < 0 || count > 70 || (id < 70 && uint32_t(id) >= count)) return false;
+    // Mirror 98CB0's reads, without invoking 9B3B0 (which can initialize guest cache entries).
+    duration = G<float>(id < 70 ? cache + uint32_t(id) * 4 : node + 4);
+    return std::isfinite(duration) && duration > 0;
+}
+
+uint32_t IdleLeaf(uint32_t node) {
+    // Only the duration wrappers and terminal animation leaves present in the authored FP idle
+    // graphs are accepted. The depth limit also terminates cyclic/malformed graphs.
+    for (unsigned depth = 0; node && depth < 8; ++depth) {
+        unsigned type = G<uint8_t>(node) & 0x3F;
+        int count = G<int8_t>(node + 1);
+        if (type == 0x16 && count == 0) return R32(node + 0x10);
+        if (type != 8 || count != 1) return 0;
+        uint32_t params = R32(node + 8);
+        if (!params || !std::isfinite(G<float>(params)) || G<float>(params) <= 0) return 0;
+        node = R32(node + 0x10);
+    }
+    return 0;
+}
+
+bool InspectionPhase(uint32_t root, uint32_t cache, float time, bool& inspection) {
+    if (!std::isfinite(time) || time < 0) return false;
+    uint32_t sequence = root;
+    unsigned depth = 0;
+    for (; sequence && depth < 8; ++depth) {
+        if ((G<uint8_t>(sequence) & 0x3F) != 2) return false;
+        int count = G<int8_t>(sequence + 1);
+        if (count != 1) break;
+        sequence = R32(sequence + 0x10);
+    }
+    if (!sequence || depth == 8) return false;
+    int count = G<int8_t>(sequence + 1);
+    if (count < 2 || count > 16) return false;
+    uint32_t ordinary = 0;
+    float total = 0, tail_start = 0;
+    for (int i = 0; i < count; ++i) {
+        uint32_t child = R32(sequence + 0x10 + uint32_t(i) * 4);
+        if (!child) return false;
+        uint32_t leaf = IdleLeaf(child);
+        float duration = 0;
+        if (!leaf || !NodeDuration(child, cache, duration)) return false;
+        if (!i) ordinary = leaf;
+        if (i == count - 1) {
+            if (leaf == ordinary) return false;
+            tail_start = total;
+        } else if (leaf != ordinary) return false;
+        total += duration;
+        if (!std::isfinite(total)) return false;
+    }
+    if (time >= total) return false;
+    // 98CB0 selects the first cumulative duration strictly greater than current time.
+    inspection = time >= tail_start;
+    return true;
+}
+
 std::array<uint32_t, 4> Timing(uint32_t effect) {
     return {R32(effect + kPeak), R32(effect + kRamp), R32(effect + kHold), R32(effect + kFade)};
 }
@@ -67,7 +184,7 @@ bool WeaponDofAllowed() {
 
 bool WeaponDofEligible() {
     const auto& options = game::Opt();
-    return WeaponDofAllowed() && !options.dof_preview && g_preview_phase == 0 &&
+    return WeaponDofAllowed() && !options.dof_preview && !IdleFocusActive() && g_preview_phase == 0 &&
            !g_preview.serial && options.dof_weapon_blur;
 }
 
@@ -109,6 +226,25 @@ void EndWeaponDof(bool preview) {
 }
 }  // namespace
 
+// Entry to 98450 sees the native root time after fade offsets and 98040 loop normalization.
+// Reading instance+14 directly would misidentify the inspection phase during a transition.
+void ObserveIdleDof(X86Context& ctx, uint8_t*) {
+    if (!PreviewAllowed()) return;
+    uint32_t player = R32(layout::kWorld) + layout::kWorldPlayer;
+    uint32_t controller = R32(player + 0x328);
+    if (!controller || R32(ctx.esp + 4) != R32(controller + 0x54)) return;
+    IdleSample sample;
+    if (!IdleIdentity(sample) || R32(ctx.esp + 4) != sample.instance ||
+        R32(ctx.esp + 8) != sample.root || R32(ctx.esp + 0xC) != sample.cache ||
+        (R32(ctx.esp + 0x18) & 8) || sample.generation != R32(sample.instance + 0x980)) return;
+    sample.frame = R32(kFrameCount);
+    if (!InspectionPhase(sample.root, sample.cache, G<float>(ctx.esp + 0x10), sample.inspection)) {
+        g_idle = {};
+        return;
+    }
+    g_idle = sample;
+}
+
 float CinematicDofStrength(float strength) {
     if (!std::isfinite(strength)) return 0;
     float s = std::clamp(strength, 0.0f, 1.0f);
@@ -128,8 +264,9 @@ float StepDofPreview(float phase, float seconds, bool enabled) {
 // The render hook supplies bounded host time. This step also provides a deterministic phase update for tests.
 void TickDofPreview(float seconds) {
     if (PreviewAllowed()) {
-        g_preview_phase = StepDofPreview(g_preview_phase, seconds, game::Opt().dof_preview);
+        g_preview_phase = StepDofPreview(g_preview_phase, seconds, game::Opt().dof_preview || IdleFocusActive());
     } else {
+        g_idle = {};
         g_preview_phase = 0;
         g_preview = {};
         g_preview_weapon = {};
@@ -149,7 +286,7 @@ bool DeferPreviewWeapon(X86Context&, uint8_t*) {
         float seconds = g_preview_clock_started ? std::chrono::duration<float>(now - g_preview_clock).count() : 0;
         TickDofPreview(seconds);
     }
-    if (!PreviewAllowed() || (!game::Opt().dof_preview && g_preview_phase == 0)) return false;
+    if (!PreviewAllowed() || (!game::Opt().dof_preview && !IdleFocusActive() && g_preview_phase == 0)) return false;
     if (++g_preview_serial == 0) ++g_preview_serial;
     g_preview = {R32(kEffects), R32(layout::kDisplay), R32(kFrameCount), g_preview_serial,
                  CinematicDofStrength(g_preview_phase)};

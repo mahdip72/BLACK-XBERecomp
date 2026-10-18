@@ -565,6 +565,11 @@ on_false = 0x213A0
 at = 0x1EE9A5
 call = "AmbientOcclusion"
 
+# Observe the current first-person idle graph's native normalized sample time without changing animation.
+[[hook]]
+at = 0x98450
+call = "ObserveIdleDof"
+
 # src/game/depth_of_field.cpp: after world geometry, before post-effect capture and the deferred reload weapon
 [[hook]]
 at = 0x178CB7
