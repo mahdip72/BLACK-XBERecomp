@@ -472,6 +472,9 @@ void StepSensitivity(float& value, int step, char (&text)[64]) {
     std::snprintf(text, sizeof(text), "%.1f", value);
 }
 
+// the setting of kLanguageNames[i]
+const char* LanguageCode(int i) { return i ? game::kLanguages[i - 1] : "auto"; }
+
 // the general, mouse and keyboard and controller rows that are no ON / OFF, stepped first
 void StepInputRow(int id, int step, char (&text)[64]) {
     game::Options& o = game::Opt();
@@ -501,10 +504,10 @@ void StepInputRow(int id, int step, char (&text)[64]) {
         case kLanguage: {
             int count = int(std::size(kLanguageNames));
             int i = 0;
-            while (i < count - 1 && o.language != (i ? game::kLanguages[i - 1] : "auto")) i++;
+            while (i < count - 1 && o.language != LanguageCode(i)) i++;
             if (step) {
                 i = StepIndex(i, step, count);
-                o.language = i ? game::kLanguages[i - 1] : "auto";
+                o.language = LanguageCode(i);
             }
             bool restart = game::ResolveLanguage(o.language) != game::BootLanguage();
             const char* format = restart ? "%s (RESTART)" : "%s";
@@ -541,39 +544,40 @@ constexpr int kSettingsPage = 0;
 constexpr int kKeyboardPage = 1;
 constexpr int kControllerPage = 2;
 
+// the MOUSE AND KEYBOARD page's values, its binds aside
+void CopyKeyboardValues(game::Options& to, const game::Options& from) {
+    to.mouse_sensitivity = from.mouse_sensitivity;
+    to.invert_mouse = from.invert_mouse;
+    to.hold_aim = from.hold_aim;
+    to.walk_speed = from.walk_speed;
+}
+
+void CopyControllerValues(game::Options& to, const game::Options& from) {
+    to.controller_hold_aim = from.controller_hold_aim;
+    to.aim_assist = from.aim_assist;
+    to.controller_sensitivity = from.controller_sensitivity;
+    to.rumble_intensity = from.rumble_intensity;
+    to.gyro_aiming = from.gyro_aiming;
+    to.gyro_sensitivity = from.gyro_sensitivity;
+}
+
 void RestoreDefaults(int page) {
     game::Options& o = game::Opt();
     if (page == kControllerPage) {
-        o.controller_hold_aim = false;
-        o.aim_assist = true;
-        o.controller_sensitivity = game::Options{}.controller_sensitivity;
-        o.rumble_intensity = game::Options{}.rumble_intensity;
-        o.gyro_aiming = false;
-        o.gyro_sensitivity = game::Options{}.gyro_sensitivity;
+        CopyControllerValues(o, game::Options{});
         Save();
         return;
     }
     if (page == kKeyboardPage) {
-        o.mouse_sensitivity = game::Options{}.mouse_sensitivity;
-        o.invert_mouse = false;
-        o.hold_aim = true;
-        o.walk_speed = game::Options{}.walk_speed;
+        CopyKeyboardValues(o, game::Options{});
         input::ResetBindings();
         return;
     }
     game::Options keep = o;
     Get() = Settings{};
     o = game::Options{};
-    o.mouse_sensitivity = keep.mouse_sensitivity;
-    o.invert_mouse = keep.invert_mouse;
-    o.hold_aim = keep.hold_aim;
-    o.walk_speed = keep.walk_speed;
-    o.controller_hold_aim = keep.controller_hold_aim;
-    o.aim_assist = keep.aim_assist;
-    o.controller_sensitivity = keep.controller_sensitivity;
-    o.rumble_intensity = keep.rumble_intensity;
-    o.gyro_aiming = keep.gyro_aiming;
-    o.gyro_sensitivity = keep.gyro_sensitivity;
+    CopyKeyboardValues(o, keep);
+    CopyControllerValues(o, keep);
     o.keys = keep.keys;
     Changed(true);
 }

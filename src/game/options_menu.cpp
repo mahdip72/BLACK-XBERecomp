@@ -41,6 +41,7 @@ constexpr int kEntries = int(std::size(kCaptions));
 constexpr int kSlots = 8;
 constexpr int kDepth = 100;
 constexpr int kEscape = 0x1B;
+constexpr int kSettingsMode = 1;  // a page's mode: 0 our buttons, else the caption shown plus one
 constexpr int kPrompts = 2;
 
 // the selection bar, Main.ButtonSelector: its parts by depth; once shown it stops on frame 10, its data's frame 9
@@ -251,7 +252,7 @@ bool Entries(X86Context& ctx, uint32_t root, uint32_t holder) {
 }
 
 // the settings' categories, each a row
-bool Listing(const Page& p) { return p.mode == 1 && !g_group; }
+bool Listing(const Page& p) { return p.mode == kSettingsMode && !g_group; }
 
 // the rows of the page's mode
 void Fill(Page& p) {
@@ -265,7 +266,7 @@ void Fill(Page& p) {
         if (g_group && heading) inside = &list[i] == g_group;
         if (heading == listing && inside) p.rows.push_back(&list[i]);
     }
-    if (p.mode > 1) p.rows.push_back(nullptr);
+    if (p.mode > kSettingsMode) p.rows.push_back(nullptr);
     p.slots = std::min(p.slots, p.rows.size());
     p.top = 0;
 }
@@ -427,10 +428,10 @@ void Build(X86Context& ctx, const Host& host, uint32_t root, uint32_t holder, ui
     g_next = 0;
     // back from a category is its list
     const Row* back = nullptr;
-    if (!p.mode && g_last == 1 && g_group) {
+    if (!p.mode && g_last == kSettingsMode && g_group) {
         back = g_group;
         g_group = nullptr;
-        p.mode = 1;
+        p.mode = kSettingsMode;
     }
     p.failed = !(p.mode ? Rows(ctx, root, holder, menu) : Entries(ctx, root, holder));
     const char* shown = p.mode ? kCaptions[p.mode - 1] : "buttons";
@@ -491,7 +492,7 @@ void ApplyRowInput(size_t slot, uint32_t id, bool locked) {
         if (!locked) app::rows::Value(*row, id == kInputLeft ? -1 : 1);
     } else if (id == kInputConfirm && row && row->kind == app::rows::Kind::Heading) {
         g_group = row;
-        g_next = 1;
+        g_next = kSettingsMode;
     } else if (id == kInputConfirm && row) {
         p.capture = 1;
         p.bind = p.top + slot;
