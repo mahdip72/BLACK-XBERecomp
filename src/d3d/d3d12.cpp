@@ -40,6 +40,8 @@
 #include "d3d/fidelityfx_dof.h"
 #include "d3d/fidelityfx_dof_shader.h"
 #include "d3d/viewmodel_dof_shader.h"
+#include "d3d/particle_dof_geometry.h"
+#include "d3d/particle_dof_wrapper.h"
 #include "d3d/occlusion.h"
 #include "d3d/smaa_shader.h"
 #include "d3d/smaa_textures.h"
@@ -781,6 +783,7 @@ struct DrawTextures {
 
 // a draw's shaders: what they are made from, their cache keys, the hashes Compile returned and the compiled blobs
 struct DrawShaders {
+    uint32_t particle_samples = 0;  // only the verified, late native smoke variant
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
     FixedKey fk;
@@ -933,6 +936,9 @@ private:
     void OcclusionViews(uint32_t slot, const AoPass& a);
     bool OcclusionPass(const AoPass& a, float c[kAoConstants], const D3D12_RECT& rect, uint32_t w, uint32_t h);
     void DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]);
+    void ParticleDofWorld(const Target& rt, const float c[12]);
+    bool PrepareParticleDof(const State& s, Assembled& a, const PixelKey& pk, DrawShaders& sh, DrawTextures& stages);
+    void ParticleDofSkipped(uint32_t reason, const char* message);
     bool FidelityFxDepthOfField(Target& rt, Target& ds, const float c[12], const D3D12_RECT& rect, bool cinematic);
     bool EnsureFidelityFxTargets(uint32_t w, uint32_t h);
     void FidelityFxViews(uint32_t slot, ID3D12Resource* first, DXGI_FORMAT first_format, bool first_ms,
@@ -1000,7 +1006,7 @@ private:
     void CaptureInputs(const State& s, const Assembled& a, const DrawConstants& c);
     void CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk);
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
-    void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
+    void SetTextureViewsAndSamplers(const State& s, DrawTextures& stages, bool clamp);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
     void SetViewportScissor(const State& s, uint32_t gw);
     void SetBlendFactorStencilRef(const State& s);
@@ -1180,6 +1186,27 @@ private:
     D3D12_RESOURCE_STATES dof_layer_states_[kDofTargets] = {};
     uint32_t dof_skip_reported_ = 0;
     bool dof_reported_ = false;
+    struct ParticleDof {
+        bool marker = false;
+        bool world_valid = false;
+        uint64_t world_frame = 0;
+        uint32_t world_w = 0, world_h = 0;
+        float optics[4] = {};
+        ParticleDofGlobals globals{};
+        std::vector<NativeParticleVertex> vertices;
+        std::vector<ParticleDofQuad> quads;
+        struct Snapshot {
+            ComPtr<ID3D12Resource> depth;
+            D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+            uint64_t used = 0;
+        } snapshots[3];  // native full-resolution bucket and its two small-target buckets
+        uint64_t copies = 0;
+        uint64_t batches = 0, active = 0, focused = 0, invalid = 0, early = 0, rejected = 0;
+        uint32_t draw_active = 0;
+        uint32_t reported = 0;
+        bool active_reported = false;
+        bool previous_world = false;
+    } particle_dof_;
     FidelityFxDof ffx_dof_;
     ComPtr<ID3D12Resource> ffx_dof_targets_[3];  // prepared color, encoded CoC depth, official output
     D3D12_RESOURCE_STATES ffx_dof_states_[3] = {};
@@ -1999,10 +2026,10 @@ void D3D12Backend::DepthOfFieldMipState(uint32_t mip, D3D12_RESOURCE_STATES stat
 
 D3D12Backend::~D3D12Backend() {
     // The SDK owns resources referenced by recorded/in-flight commands, including a failed dispatch.
-    if (ffx_dof_.Ready()) {
-        Flush();
-        ffx_dof_.Reset();
-    }
+    bool particle_resources = false;
+    for (const auto& snapshot : particle_dof_.snapshots) particle_resources |= bool(snapshot.depth);
+    if (ffx_dof_.Ready() || particle_resources) Flush();
+    if (ffx_dof_.Ready()) ffx_dof_.Reset();
 }
 
 bool D3D12Backend::EnsureFidelityFxTargets(uint32_t w, uint32_t h) {
@@ -2128,6 +2155,7 @@ void D3D12Backend::DepthOfFieldSkipped(uint32_t reason, const char* message) {
 // Queued after world rendering during reloads, when the game defers the weapon until after its effects.
 // p: projection m14/m10, eased strength, focus, near/far scales, radius at 1080p, FidelityFX selector.
 void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldRects]) {
+    particle_dof_.world_valid = false;
     for (int i = 0; i < 4 * kDepthOfFieldRects; i++) if (!std::isfinite(p[i])) {
         DepthOfFieldSkipped(0, "non-finite projection, strength or focus");
         return;
@@ -2165,7 +2193,10 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
         DepthOfFieldSkipped(0, "non-finite derived shader constants");
         return;
     }
-    if (p[7] >= 0.5f && FidelityFxDepthOfField(*rt, *ds, c, rect, p[7] >= 1.5f)) return;
+    if (p[7] >= 0.5f && FidelityFxDepthOfField(*rt, *ds, c, rect, p[7] >= 1.5f)) {
+        ParticleDofWorld(*rt, c);
+        return;
+    }
     uint32_t samples = Ms(*rt);
     ID3D12PipelineState* pso = EnsureDepthOfFieldPipeline("depth_of_field", rt->fmt, samples);
     ID3D12PipelineState* gather_pso = EnsureDepthOfFieldPipeline("depth_of_field_gather", kDofFormats[0], 1);
@@ -2234,6 +2265,155 @@ void D3D12Backend::DepthOfField(const State& s, const float p[4 * kDepthOfFieldR
              rt->w, rt->h, samples, c[2], radius, p[2], c[0], c[1], near_scale, far_scale, half_w, half_h, dof_levels_);
     }
     if (cap_) fprintf(cap_, "%04u depth of field rt %08X ds %08X strength %.3f\n", cap_i_++, s.rt.data, s.zs.data, p[2]);
+    ParticleDofWorld(*rt, c);
+}
+
+void D3D12Backend::ParticleDofWorld(const Target& rt, const float c[12]) {
+    auto& p = particle_dof_;
+    p.world_valid = true;
+    p.world_frame = frame_;
+    p.world_w = rt.w;
+    p.world_h = rt.h;
+    p.optics[0] = c[2]; p.optics[1] = c[3]; p.optics[2] = c[8]; p.optics[3] = c[9];
+}
+
+void D3D12Backend::ParticleDofSkipped(uint32_t reason, const char* message) {
+    auto& p = particle_dof_;
+    ++p.rejected;
+    if (p.reported & (1u << reason)) return;
+    p.reported |= 1u << reason;
+    LOGR("Particle DOF native fallback: %s", message);
+}
+
+// Begin is only provenance. Deferred D3D8 state is latched by DrawUp after that marker, so validate
+// the ACTUAL assembled draw and targets here. Early bucket 3 cannot pass the successful-world epoch.
+bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelKey& pk,
+                                     DrawShaders& sh, DrawTextures& stages) {
+    auto& p = particle_dof_;
+    if (!p.marker) return false;
+    p.marker = false;  // a marker authorizes exactly one draw
+    ++p.batches;
+    if (!p.world_valid || p.world_frame != frame_) { ++p.early; return false; }
+    if (!sh.prog || !s.vs || s.vs->program.size() != kParticleDofNativeProgram.size() ||
+        !std::equal(s.vs->program.begin(), s.vs->program.end(), kParticleDofNativeProgram.begin()) ||
+        s.vs->decl.size() != kParticleDofNativeDeclaration.size() ||
+        !std::equal(s.vs->decl.begin(), s.vs->decl.end(), kParticleDofNativeDeclaration.begin()) ||
+        !IsParticleDofNativePixel(pk) || !stages.res[0]) {
+        ParticleDofSkipped(0, "unrecognized native VS/material/texture"); return false;
+    }
+    if (a.regs != 0x209 || a.decode || !a.vertices.empty() || a.buffer_count != 1 ||
+        a.base_vertex || a.strip || a.topology != Topology::Triangles || a.vertex_count == 0 ||
+        a.vertex_count > 4096 || a.vertex_count % 4 || a.buffers[0].stride != sizeof(NativeParticleVertex) ||
+        !a.buffers[0].src || a.buffers[0].bytes < a.vertex_count * sizeof(NativeParticleVertex)) {
+        ParticleDofSkipped(1, "unsupported native vertex assembly"); return false;
+    }
+    if (a.index16 || a.index_count != (a.vertex_count / 4) * 6 || a.indices.size() != a.index_count) {
+        ParticleDofSkipped(1, "unsupported native quad indices"); return false;
+    }
+    constexpr uint32_t quad_indices[6] = {0, 1, 2, 0, 2, 3};
+    for (uint32_t i = 0; i < a.index_count; ++i) if (a.indices[i] != (i / 6) * 4 + quad_indices[i % 6]) {
+        ParticleDofSkipped(1, "unsupported native quad order"); return false;
+    }
+    for (int r : {0, 3, 9}) {
+        const auto& e = a.elements[r];
+        const uint32_t offset = r == 0 ? 0 : r == 3 ? 16 : 20;
+        const DXGI_FORMAT format = r == 0 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+            r == 3 ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R32G32_FLOAT;
+        if (e.buffer || e.offset != offset || e.format != format) {
+            ParticleDofSkipped(1, "unsupported native input layout"); return false;
+        }
+    }
+    Target* rt = bound_rt_;
+    Target* ds = bound_ds_;
+    PsoKey k;
+    BuildPipelineKey(s, a, 0, 0, k);
+    if (!rt || !ds || !ds->drawn || rt->w != ds->w || rt->h != ds->h || Ms(*rt) != Ms(*ds) ||
+        ds->res->GetDesc().Format != DXGI_FORMAT_R24G8_TYPELESS || !k.zen || k.zwrite || k.sten ||
+        (Cmp(k.zfunc) != D3D12_COMPARISON_FUNC_LESS && Cmp(k.zfunc) != D3D12_COMPARISON_FUNC_LESS_EQUAL) ||
+        k.zbias || k.zslope != 0 || !k.blend || k.src != 0x302 || k.dst != 0x303 ||
+        BlendOp(k.op) != D3D12_BLEND_OP_ADD) {
+        ParticleDofSkipped(2, "unsupported depth/alpha-blend state or unmatched depth surface"); return false;
+    }
+    const float sx = float(rt->w) / p.world_w, sy = float(rt->h) / p.world_h;
+    // Native small targets may round an eighth-resolution width by one pixel; reject real anisotropy.
+    if (std::abs(sx - sy) * std::max(p.world_w, p.world_h) > 1.0f) {
+        ParticleDofSkipped(3, "anisotropic particle target"); return false;
+    }
+    GuestExtent guest{};
+    SurfaceSize(s.rt, guest.w, guest.h);
+    if (!guest.w || !guest.h || !std::isfinite(s.zscale) || s.zscale <= 0) {
+        ParticleDofSkipped(3, "invalid particle viewport/guest size"); return false;
+    }
+    D3D12_RECT rect = ViewRect(s.viewport, *rt);
+    const float sc = float(rt->w) / guest.w;
+    if (s.scissor_count) {
+        rect.left = std::max(rect.left, LONG(s.scissors[0] * sc));
+        rect.top = std::max(rect.top, LONG(s.scissors[1] * sc));
+        rect.right = std::min(rect.right, LONG(s.scissors[2] * sc));
+        rect.bottom = std::min(rect.bottom, LONG(s.scissors[3] * sc));
+    }
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return false;
+    ParticleDofGeometryParams params{};
+    std::copy(std::begin(p.optics), std::end(p.optics), params.globals.optics);
+    params.globals.optics[1] *= sy;
+    params.globals.viewport[0] = float(rect.left); params.globals.viewport[1] = float(rect.top);
+    params.globals.viewport[2] = float(rect.right - rect.left); params.globals.viewport[3] = float(rect.bottom - rect.top);
+    params.globals.target[0] = float(rt->w); params.globals.target[1] = float(rt->h);
+    params.globals.target[2] = float(a.vertex_count / 4);
+    params.globals.target[3] = Cmp(k.zfunc) == D3D12_COMPARISON_FUNC_LESS_EQUAL ? 1.0f : 0.0f;
+    std::memcpy(params.c97, s.vsc[97].data(), sizeof(params.c97));
+    std::memcpy(params.c98, s.vsc[98].data(), sizeof(params.c98));
+    params.guest_size[0] = float(guest.w); params.guest_size[1] = float(guest.h);
+    ParticleDofGeometryStats stats{};
+    const auto vertices = std::span(reinterpret_cast<const NativeParticleVertex*>(a.buffers[0].src), a.vertex_count);
+    bool active = BuildParticleDofGeometry(vertices, params, p.vertices, p.quads, stats);
+    p.focused += stats.focused; p.invalid += stats.invalid;
+    if (stats.invalid && !(p.reported & (1u << 4))) {
+        p.reported |= 1u << 4;
+        LOGR("Particle DOF: unsupported/non-finite quads stay native; counts are reported periodically");
+    }
+    if (!active) return false;
+    const auto desc = ds->res->GetDesc();
+    ParticleDof::Snapshot* snapshot = nullptr;
+    for (auto& candidate : p.snapshots) {
+        if (!candidate.depth) continue;
+        const auto old = candidate.depth->GetDesc();
+        if (old.Width == desc.Width && old.Height == desc.Height && old.Format == desc.Format &&
+            old.SampleDesc.Count == desc.SampleDesc.Count && old.SampleDesc.Quality == desc.SampleDesc.Quality) {
+            snapshot = &candidate; break;
+        }
+    }
+    if (!snapshot) {
+        snapshot = &*std::min_element(std::begin(p.snapshots), std::end(p.snapshots),
+            [](const auto& a, const auto& b) { return a.used < b.used; });
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        ComPtr<ID3D12Resource> depth;
+        if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&depth)))) {
+            ParticleDofSkipped(5, "opaque depth snapshot allocation failed"); return false;
+        }
+        if (snapshot->depth) Release(std::move(snapshot->depth));
+        snapshot->depth = std::move(depth);
+        snapshot->state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    snapshot->used = ++p.copies;
+    // Copy each eligible batch's current DS, including every MSAA sample. No frame-global stale-depth cache.
+    Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(snapshot->depth.Get(), snapshot->state, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl_->CopyResource(snapshot->depth.Get(), ds->res.Get());
+    Transition(snapshot->depth.Get(), snapshot->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    stages.res[3] = snapshot->depth.Get();
+    stages.sv[3] = {};
+    stages.sv[3].Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    stages.sv[3].Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    stages.sv[3].ViewDimension = Ms(*ds) > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+    if (Ms(*ds) == 1) stages.sv[3].Texture2D.MipLevels = 1;
+    p.globals = params.globals;
+    a.buffers[0].src = reinterpret_cast<const uint8_t*>(p.vertices.data());
+    sh.particle_samples = Ms(*ds);
+    p.draw_active = stats.active;
+    return true;
 }
 
 bool D3D12Backend::EnsureWeaponDofTargets(uint32_t w, uint32_t h) {
@@ -3098,7 +3278,10 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
 }
 
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
-    if (sh.prog) return VertexProgram(*s.vs, a.regs, a.decode);
+    if (sh.prog) {
+        auto source = VertexProgram(*s.vs, a.regs, a.decode);
+        return sh.particle_samples ? MakeParticleDofVertexShader(std::move(source)) : source;
+    }
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
 }
 
@@ -3138,7 +3321,9 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
         sh.ps_code = blobs_[sh.ph].Get();
         return;
     }
-    sh.ps_code = Compile(PixelHlsl(pk), "main", "ps_5_0", sh.ph);
+    auto source = PixelHlsl(pk);
+    if (sh.particle_samples) source = MakeParticleDofPixelShader(std::move(source), sh.particle_samples);
+    sh.ps_code = Compile(source, "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
 
@@ -3395,7 +3580,9 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
                                    GuestExtent size, DrawConstants& c) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
-    Alloc dc = Upload(sizeof(DrawConstants), 256);
+    static_assert(sizeof(DrawConstants) == 2080);
+    const size_t tail = sh.particle_samples ? sizeof(ParticleDofGlobals) + particle_dof_.quads.size() * sizeof(ParticleDofQuad) : 0;
+    Alloc dc = Upload(sizeof(DrawConstants) + tail, 256);
     FillSurfaceConstants(s, size, c);
     FillFogConstants(s, c);
     FillCombinerConstants(s, c);
@@ -3406,6 +3593,12 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
         FillLightConstants(s, sh.fk, c);
     }
     std::memcpy(dc.cpu, &c, sizeof(c));
+    if (sh.particle_samples) {
+        auto* tail_ptr = static_cast<uint8_t*>(dc.cpu) + sizeof(c);
+        std::memcpy(tail_ptr, &particle_dof_.globals, sizeof(ParticleDofGlobals));
+        std::memcpy(tail_ptr + sizeof(ParticleDofGlobals), particle_dof_.quads.data(),
+                    particle_dof_.quads.size() * sizeof(ParticleDofQuad));
+    }
     cl_->SetGraphicsRootConstantBufferView(0, vc.gpu);
     cl_->SetGraphicsRootConstantBufferView(1, dc.gpu);
 }
@@ -3480,7 +3673,9 @@ void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::stri
 
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
     CaptureShader("vs", sh.vkey, VertexHlsl(s, a, sh));
-    CaptureShader("ps", sh.pkey, PixelHlsl(pk));
+    auto source = PixelHlsl(pk);
+    if (sh.particle_samples) source = MakeParticleDofPixelShader(std::move(source), sh.particle_samples);
+    CaptureShader("ps", sh.pkey, source);
 }
 
 D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
@@ -3490,7 +3685,7 @@ D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
 }
 
 // a stage without a texture gets a null view of its kind; the samplers read the views after
-void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages) {
+void D3D12Backend::SetTextureViewsAndSamplers(const State& s, DrawTextures& stages, bool clamp) {
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[i];
@@ -3501,7 +3696,7 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
         dev_->CreateShaderResourceView(stages.res[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
     cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), slot, srv_inc_));
-    uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a));
+    uint32_t samplers = EnsureStageSamplers(s, stages, clamp);
     cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
 }
 
@@ -3590,6 +3785,10 @@ bool D3D12Backend::AssembleDraw(const State& s, uint32_t prim, uint32_t start, u
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
+    if (particle_dof_.marker && (prim != 8 || start || indices || count == 0 || count > 4096 || count % 4)) {
+        particle_dof_.marker = false;
+        ParticleDofSkipped(1, "marker did not precede a native quad draw");
+    }
     if (cap_) CapStep(s.rt);
     if (DepthCopy(s)) return;
     DrawEnd draw_end{ext_};
@@ -3602,21 +3801,39 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // vertex shader
     DrawShaders sh = ClassifyShaders(s, a);
     if (sh.prog) EnsureProgramHash(s);
-    sh.vkey = VertexKey(s, a, sh);
-    EnsureVertexShader(s, a, sh);
-
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
     if (!BindStageTexturesAndTargets(s, stages)) return;
     PixelKey pk = MakePixelKey(s, stages.info);
-    sh.pkey = Hash(&pk, sizeof(pk));
-    EnsurePixelShader(pk, sh);
-    if (!sh.vs_code || !sh.ps_code) return;
-
-    // pipeline
+    // Preserve the native sampler heuristic: expanded UV support intentionally extends outside 0..1.
+    const bool native_clamp = AnyStageWraps(s) && UnitTexcoords(a);
+    const uint8_t* native_vertices = a.buffers[0].src;
+    ID3D12Resource* native_t3 = stages.res[3];
+    const auto native_t3_view = stages.sv[3];
+    PrepareParticleDof(s, a, pk, sh, stages);
     PsoKey k;
-    BuildPipelineKey(s, a, sh.vh, sh.ph, k);
-    ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+    auto pipeline = [&]() -> ID3D12PipelineState* {
+        sh.vkey = VertexKey(s, a, sh);
+        sh.pkey = Hash(&pk, sizeof(pk));
+        if (sh.particle_samples) {
+            sh.vkey ^= 0x50444F4656530001ull;
+            sh.pkey ^= 0x50444F4650530001ull ^ (uint64_t(sh.particle_samples) << 48);
+        }
+        EnsureVertexShader(s, a, sh);
+        EnsurePixelShader(pk, sh);
+        if (!sh.vs_code || !sh.ps_code) return nullptr;
+        BuildPipelineKey(s, a, sh.vh, sh.ph, k);
+        return EnsurePipeline(k, sh.vs_code, sh.ps_code);
+    };
+    ID3D12PipelineState* pso = pipeline();
+    if (!pso && sh.particle_samples) {
+        ParticleDofSkipped(6, "native shader wrapper compilation/pipeline failed");
+        a.buffers[0].src = native_vertices;
+        stages.res[3] = native_t3;
+        stages.sv[3] = native_t3_view;
+        sh.particle_samples = 0;
+        pso = pipeline();
+    }
     if (!pso) return;
     cl_->SetPipelineState(pso);
 
@@ -3633,12 +3850,21 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
-    SetTextureViewsAndSamplers(s, a, stages);
+    SetTextureViewsAndSamplers(s, stages, native_clamp);
     SetViewportScissor(s, size.w);
     SetBlendFactorStencilRef(s);
 
     // geometry
     DrawGeometry(a);
+    if (sh.particle_samples) {
+        particle_dof_.active += particle_dof_.draw_active;
+        if (!particle_dof_.active_reported) {
+            particle_dof_.active_reported = true;
+            LOGR("Particle DOF active: native D660/D6A0 late alpha quads, %ux%u target, %ux MSAA, "
+                 "64 source-visible aperture taps; early particles keep the world pass", bound_rt_->w, bound_rt_->h,
+                 sh.particle_samples);
+        }
+    }
 }
 
 // a guest rect scaled to the target and clamped to it
@@ -3681,6 +3907,10 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
+    if (flags & (kClearParticleDofBegin | kClearParticleDofEnd)) {
+        particle_dof_.marker = flags == kClearParticleDofBegin && count == 0 && !rects;
+        return;
+    }
     if (flags & (kClearWeaponDofBegin | kClearWeaponDofEnd)) {
         if (count != kWeaponDofRects || !rects) { weapon_dof_.pending = false; return; }
         float p[4 * kWeaponDofRects];
@@ -3930,6 +4160,7 @@ void D3D12Backend::ResizeSwap() {
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
     bool hdr = hdr_display_ && game::Opt().hdr_output;
     if (w == bb_w_ && h == bb_h_ && hdr == hdr_want_) return;
+    particle_dof_.marker = particle_dof_.world_valid = false;
     Flush();
     for (auto& f : frames_) {
         if (f.fence) WaitFence(f.fence);
@@ -4311,6 +4542,17 @@ void LogPerf() {
 }
 
 void D3D12Backend::Present(const Surface& front) {
+    auto& particle = particle_dof_;
+    if (particle.batches && ((particle.world_valid && frame_ % 120 == 0) ||
+        (particle.previous_world && !particle.world_valid))) {
+        LOGR("Particle DOF totals: %llu batches, %llu filtered quads, %llu focused, %llu invalid quads, "
+             "%llu early/no-world batches, %llu rejected batches",
+             (unsigned long long)particle.batches, (unsigned long long)particle.active,
+             (unsigned long long)particle.focused, (unsigned long long)particle.invalid,
+             (unsigned long long)particle.early, (unsigned long long)particle.rejected);
+    }
+    particle.previous_world = particle.world_valid;
+    particle.marker = particle.world_valid = false;
     weapon_dof_.pending = false;
     PerfScope perf_present{g_perf.present};
     if (cap_) {
@@ -4350,6 +4592,7 @@ void D3D12Backend::ApplySettings() {
     bool remake = ext_ && ext_->Settings();
     uint32_t msaa = game::Opt().msaa;
     if (std::fabs(want - scale_) > 1e-4f || remake || msaa != msaa_set_) {
+        particle_dof_.marker = particle_dof_.world_valid = false;
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
         targets_.clear();

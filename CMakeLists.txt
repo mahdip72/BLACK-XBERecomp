@@ -85,6 +85,14 @@ if(BLACK_FIDELITYFX_DOF)
     target_include_directories(newffx_dof_warp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_definitions(newffx_dof_warp PRIVATE BLACK_FIDELITYFX_DOF=1)
     target_link_libraries(newffx_dof_warp PRIVATE ffx_dof_x64 ffx_backend_dx12_x64 d3d12 dxgi dxguid d3dcompiler)
+
+    # Offscreen software-adapter checks of the production native particle wrapper.
+    add_executable(new_smoke_dof_warp
+        tools/tests/new_smoke_dof_warp.cpp
+        ${SDK}/runtime/gpu/shaders.cpp)
+    target_include_directories(new_smoke_dof_warp PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
+    target_link_libraries(new_smoke_dof_warp PRIVATE d3d12 dxgi dxguid d3dcompiler)
 endif()
 
 # build_info.h for the version resource, rewritten only when the commit changes

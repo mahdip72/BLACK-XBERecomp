@@ -16,6 +16,7 @@
 #include "d3d/depth_of_field.h"
 #include "d3d/gpu_frame.h"
 #include "d3d/occlusion.h"
+#include "d3d/particle_dof.h"
 #include "gpu/backend.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
@@ -1318,7 +1319,13 @@ void Walk(uint32_t end) {
 
 HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    // Only BLACK's native particle emitter buffer carries this provenance marker.
+    // The renderer additionally checks the late DOF epoch, material and quad layout.
+    bool particle = g_backend && a[0] == 8 && a[2] == 0x53CAE0 && a[3] == 32 &&
+                    a[1] && a[1] <= 4096 && a[1] % 4 == 0;
+    if (particle) g_backend->Clear(g_state, 0, nullptr, gpu::kClearParticleDofBegin, 0, 0, 0);
     DrawUp(a[0], a[1], HostPtr(a[2]), a[3]);
+    if (particle) g_backend->Clear(g_state, 0, nullptr, gpu::kClearParticleDofEnd, 0, 0, 0);
     return 0;
 }
 

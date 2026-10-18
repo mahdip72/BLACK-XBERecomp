@@ -1,0 +1,127 @@
+#pragma once
+#include <algorithm>
+#include <array>
+#include <string>
+#include <string_view>
+
+#include "gpu/shaders.h"
+#include "particle_dof_shader.h"
+
+namespace gpu {
+
+// D660/D6A0, installed by 178A00 and selected by 15BB00. Match the translated program,
+// not a runtime handle: handles change while these native instructions do not.
+inline constexpr std::array<uint32_t, 16> kParticleDofNativeProgram = {
+    0x00000000, 0x0020121B, 0x0836106C, 0x2070F848,
+    0x00000000, 0x004C401B, 0x0836186C, 0x2F200FF8,
+    0x00000000, 0x006C201B, 0x2436106C, 0x3070F800,
+    0x00000000, 0x0020061B, 0x0836106C, 0x2070F819};
+inline constexpr std::array<uint32_t, 5> kParticleDofNativeDeclaration = {
+    0x20000000, 0x40420000, 0x40400003, 0x40220009, 0xFFFFFFFF};
+
+inline PixelKey ParticleDofNativePixelKey(TexInfo texture) {
+    PixelKey k{};
+    k.programmable = 1;
+    k.count = 0x00011101;
+    k.a_in[0] = 0xD8D41010;
+    k.a_out[0] = 0xC0;
+    k.rgb_in[0] = 0xC8C40000;
+    k.rgb_out[0] = 0xC0;
+    k.tex_modes = 1;
+    k.tex[0] = texture;
+    return k;
+}
+
+inline bool IsParticleDofNativePixel(const PixelKey& k) {
+    if (k.tex[0].kind != kTex2D || k.tex[0].rect || k.tex[0].shadow ||
+        (k.tex[0].flags & kTexWide) || k.flat || k.two_sided || k.quad || k.proj || (k.alphakill & ~1u)) return false;
+    auto expected = ParticleDofNativePixelKey(k.tex[0]);
+    expected.alphakill = k.alphakill;
+    // Bound unused textures do not affect this program; only stage zero is sampled.
+    std::copy(std::begin(k.tex), std::end(k.tex), std::begin(expected.tex));
+    return expected == k;
+}
+
+namespace particle_dof_detail {
+inline bool ReplaceOne(std::string& s, std::string_view from, std::string_view to) {
+    auto at = s.find(from);
+    if (at == std::string::npos || s.find(from, at + from.size()) != std::string::npos) return false;
+    s.replace(at, from.size(), to);
+    return true;
+}
+inline bool Common(std::string& s) {
+    if (!ReplaceOne(s, "    float fogamt : TEXCOORD4;", "    float fogamt : TEXCOORD4;\n"
+        "    nointerpolation uint particleQuad : TEXCOORD5;\n"
+        "    nointerpolation float particleViewZ : TEXCOORD6;")) return false;
+    if (!ReplaceOne(s, "    float4 lt[56];\n};", std::string("    float4 lt[56];\n") +
+        kParticleDofCbufferFields + "};")) return false;
+    s.insert(0, "struct ParticleDofQuad { float4 uv_bounds; uint4 argb; };\n");
+    return true;
+}
+} // namespace particle_dof_detail
+
+// Empty means that the translator changed its contract; the renderer must use native geometry/shaders.
+inline std::string MakeParticleDofVertexShader(std::string s) {
+    using namespace particle_dof_detail;
+    if (!Common(s)) return {};
+    if (!ReplaceOne(s, "VOut main(VIn i)", "VOut main(VIn i, uint vertexId : SV_VertexID)") &&
+        !ReplaceOne(s, "VOut main(VRaw ri)", "VOut main(VRaw ri, uint vertexId : SV_VertexID)")) return {};
+    if (!ReplaceOne(s, "    return o;", "    o.particleQuad = vertexId / 4;\n"
+        "    o.particleViewZ = 1.0 / i.v0.z;\n    return o;")) return {};
+    return s;
+}
+
+inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples) {
+    using namespace particle_dof_detail;
+    if (samples != 1 && samples != 2 && samples != 4 && samples != 8) return {};
+    if (!Common(s)) return {};
+    // The game's unused stage 3 may retain a stale 2D/cube/shadow texture binding. Its declaration
+    // is unused by this exact PS and must make room for our depth-copy view of any sample count.
+    auto t3 = s.find(" tex3 : register(t3);");
+    if (t3 == std::string::npos) return {};
+    auto line = s.rfind('\n', t3);
+    if (line == std::string::npos) return {};
+    auto line_end = s.find('\n', t3);
+    if (line_end == std::string::npos) return {};
+    s.erase(line + 1, line_end - line);
+    const std::string entry = "float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target";
+    auto at = s.find(entry);
+    if (at == std::string::npos || s.find(entry, at + entry.size()) != std::string::npos) return {};
+    std::string body = s.substr(at + entry.size());
+    // The translated native main is last. Reject added functions or unexpected texture accesses.
+    if (body.find("tex1.") != std::string::npos || body.find("tex2.") != std::string::npos ||
+        body.find("tex3.") != std::string::npos || body.find("spreadtap(") != std::string::npos) return {};
+    std::string tap = body;
+    const std::string sample = "tex0.Sample(smp0, ";
+    auto fetch = tap.find(sample);
+    if (fetch == std::string::npos || tap.find(sample, fetch + sample.size()) != std::string::npos) return {};
+    size_t end = fetch + sample.size();
+    int nested = 0;
+    for (; end < tap.size(); ++end) {
+        if (tap[end] == '(') ++nested;
+        if (tap[end] == ')') { if (nested == 0) break; --nested; }
+    }
+    if (end == tap.size()) return {};
+    tap.insert(end, ", uvDx, uvDy");
+    tap.replace(fetch, sample.size(), "tex0.SampleGrad(smp0, ");
+    // A rejected SOURCE texel contributes transparent, rather than discarding the destination aperture.
+    ReplaceOne(tap, "if (t0.a == 0) discard;", "if (t0.a == 0) return float4(0, 0, 0, 0);");
+    if (!ReplaceOne(tap, "alphatest(outc.a);", "if (!ParticleNativeAlphaPass(outc.a)) return float4(0, 0, 0, 0);")) return {};
+    if (tap.find("discard") != std::string::npos) return {};
+    s.resize(at);
+    s += "float4 ParticleNativeExact(VOut i, bool front)" + body;
+    s += R"(
+bool ParticleNativeAlphaPass(float a) {
+    int f = (int)misc.y;
+    int v = (int)round(a * 255), r = (int)misc.x;
+    return f == 0 ? false : f == 1 ? v < r : f == 2 ? v == r : f == 3 ? v <= r :
+        f == 4 ? v > r : f == 5 ? v != r : f == 6 ? v >= r : true;
+}
+)";
+    s += "float4 ParticleNativeTap(VOut i, bool front, float2 uvDx, float2 uvDy)" + tap;
+    s += "\n#define PARTICLE_DOF_SAMPLES " + std::to_string(samples) + "\n";
+    s += kParticleDofHlsl;
+    return s;
+}
+
+} // namespace gpu
