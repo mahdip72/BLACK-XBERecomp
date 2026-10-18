@@ -34,7 +34,8 @@ inline PixelKey ParticleDofNativePixelKey(TexInfo texture) {
 
 inline bool IsParticleDofNativePixel(const PixelKey& k) {
     if (k.tex[0].kind != kTex2D || k.tex[0].rect || k.tex[0].shadow ||
-        (k.tex[0].flags & kTexWide) || k.flat || k.two_sided || k.quad || k.proj || (k.alphakill & ~1u)) return false;
+        (k.tex[0].flags & (kTexWide | kTexTarget)) || k.flat || k.two_sided || k.quad || k.proj ||
+        (k.alphakill & ~1u)) return false;
     auto expected = ParticleDofNativePixelKey(k.tex[0]);
     expected.alphakill = k.alphakill;
     // Bound unused textures do not affect this program; only stage zero is sampled.
@@ -61,7 +62,8 @@ inline bool Common(std::string& s) {
     if (!ReplaceOne(s, "    float fogamt : TEXCOORD4;", "    float fogamt : TEXCOORD4;\n"
         "    nointerpolation uint particleQuad : TEXCOORD5;\n"
         "    nointerpolation float particleViewZ : TEXCOORD6;")) return false;
-    if (!ReplaceOne(s, "    float4 lt[56];\n};", std::string("    float4 lt[56];\n") +
+    if (!ReplaceOne(s, "    float4 lt[56];\n    float4 rtshift;\n};",
+        std::string("    float4 lt[56];\n    float4 rtshift;\n") +
         kParticleDofCbufferFields + "};")) return false;
     s.insert(0, kParticleDofQuadHlsl);
     return true;

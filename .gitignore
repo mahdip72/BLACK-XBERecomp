@@ -19,6 +19,7 @@ black.toml
 /hdd/
 /CrashDumps/
 /cache/
+/textures/
 
 # editors
 .vs/

@@ -8,7 +8,7 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 ## Installation
 - Put your game files in the `assets` folder. This can be an ISO, or the extracted data files, of the USA or Europe release.
-- Run `BLACK.exe`.
+- Run `BLACK.exe`. The first start compiles the game's code for your PC; updates may require recompilation.
 - Recomp settings can be adjusted in the in-game options menu while the game is running, or through the Settings overlay, which is opened with F10 by default.
 <img width="1920" height="1080" alt="{5852D359-24A0-48C8-9319-07C3A619E355}" src="https://github.com/user-attachments/assets/e0156eb8-c1b5-49d9-ab93-3abb46bf5f47" />
 
@@ -28,17 +28,19 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 - **FMV Scale** - Choose between Fill, which zooms the 4:3 FMVs to fill widescreen displays, and 4:3, which keeps them at their original aspect ratio.
 
 ### Graphics
+- **HD Textures** - [Download the pack](https://drive.google.com/file/d/1IxcP0awSq-Rgo59FOhcuNJBAYMnl6X9Y/view?usp=sharing), extract its `textures` folder beside `BLACK.exe` and restart the game. No ISO changes are needed.
 - **Multisample Antialiasing (MSAA)** - Enables 2x, 4x or 8x MSAA to smooth jagged edges while preserving a sharp image.
 - **Subpixel Morphological Antialiasing (SMAA)** - Enables SMAA to smooth jagged edges across the whole frame with a softer image. SMAA also smooths alpha-tested edges such as fences and foliage, and can be combined with MSAA.
 - **Anisotropic Filtering** - Forces the selected anisotropic filtering level on all textures.
-- **Draw Distance** - Increases the level of detail and draw distances past the game's values: 2x, 4x or 8x.
+- **Draw Distance** - Increases the level of detail and draw distances past the game's values: 2x, 4x, 8x, 12x or 16x.
 - **Ambient Occlusion** - Adds screen space ambient occlusion, creating soft contact shadows where surfaces meet. Choose between SSAO and GTAO.
 - **Reload Blur** - Off, Original, Balanced DOF, or FidelityFX DOF. FidelityFX uses AMD's official DOF component. Both modern modes keep the reload weapon and HUD sharp and share eased transitions; normal gameplay can use a separate light weapon blur. F10 opens a compact right-side tuner with live sliders and a reload preview toggle.
 - **DOF Quality** - FidelityFX Standard retains the half-resolution filter. Cinematic uses native-resolution gathering, up to eight sample rings, and disables ring merging. It uses substantially more GPU time and memory. Bokeh Size changes the blur radius independently of quality; focus and blur-strength tuning are shared between modes.
 
 ### Input
 - **Mouse and Keyboard** - Full keyboard and mouse support with raw input, adjustable sensitivity, inverted look and rebindable controls.
-- **Controller** - Controller with SDL3 support. 
+- **Controller** - Controller with SDL3 support and additional features.
+- **Gyro Aiming** - Adds gyro aiming for controllers with motion sensors, such as the DualSense, DualShock 4 and Switch Pro Controller, with adjustable sensitivity. Works together with the right stick.
 
 ### General
 - **Skip Intro** - Skips the intro logos.
@@ -61,7 +63,7 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 - **Memory**
   - 4 GB
 - **Storage**
-  - 2 GB for the game files and saves
+  - 3 GB for the game files, the compiled game code and saves
 
 ## Building
 ### 1. Clone the Repository

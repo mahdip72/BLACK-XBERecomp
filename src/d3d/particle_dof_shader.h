@@ -328,7 +328,7 @@ float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target { return ParticleLe
 inline std::string ParticleDofAtlasFilterSource(bool small_radius, bool interior) {
     return std::string(kParticleDofQuadHlsl) + R"(
 cbuffer ParticleAtlasRadii : register(b0) { float4 particleRadii[256]; };
-cbuffer ParticleAtlasDraw : register(b1) { float4 drawPadding[130];
+cbuffer ParticleAtlasDraw : register(b1) { float4 drawPadding[131];
 )" + kParticleDofCbufferFields + R"(
 };
 )" + kParticleDofDiskHlsl + R"(

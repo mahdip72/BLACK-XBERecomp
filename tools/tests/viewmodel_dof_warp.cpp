@@ -310,7 +310,7 @@ public:
                 O o; o.a = pre.Load(int3(p.xy,0)); o.b = post.Load(int3(p.xy,0));
                 o.c = col.Load(int3(p.xy,0)); return o;
             })", "main");
-        D3D11_BUFFER_DESC cb{}; cb.ByteWidth = 48; cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_BUFFER_DESC cb{}; cb.ByteWidth = 64; cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         Hr(device->CreateBuffer(&cb, nullptr, &constants), "Create constants");
         ID3D11Buffer* buffer = constants.Get(); context->PSSetConstantBuffers(1, 1, &buffer);
         context->VSSetConstantBuffers(1, 1, &buffer);
@@ -350,6 +350,22 @@ public:
         context->VSSetShader(geometry_vs.Get(), nullptr, 0);
     }
     void GeometryCoverage() {
+        gpu::WeaponDofDepthEncoding encoding;
+        encoding.Begin(10); Check(!encoding.Complete(10), "missing encoding did not retain native rendering");
+        encoding.Observe(10, true, true, .08f);
+        Check(encoding.Complete(11) && encoding.plane == .08f, "near encoding was not captured without ROI");
+        encoding.Observe(11, true, true, .08f); Check(encoding.Complete(12), "consistent near encoding rejected");
+        encoding.Observe(12, true, false, 0); Check(!encoding.Complete(13), "mixed near/legacy encoding accepted");
+        encoding.Begin(20); encoding.Observe(20, true, false, 0); Check(encoding.Complete(21), "legacy encoding rejected");
+        encoding.Observe(21, true, true, .08f); Check(!encoding.Complete(22), "mixed legacy/near encoding accepted");
+        encoding.Begin(30); encoding.Observe(30, true, true, .08f); encoding.Observe(31, true, true, .1f);
+        Check(!encoding.Complete(32), "mixed near planes accepted");
+        encoding.Begin(40); encoding.Observe(40, false, true, .08f); Check(!encoding.Complete(41), "unmatched draw accepted");
+        encoding.Begin(50); encoding.Observe(51, true, true, .08f); Check(!encoding.Complete(52), "untracked depth mutation accepted");
+        for (float plane : {0.f, -1.f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+            encoding.Begin(60); encoding.Observe(60, true, true, plane);
+            Check(!encoding.Complete(61), "invalid near plane accepted");
+        }
         // This is the production serial state machine, including the fallback
         // when any copy/clear/raw-list mutation was not a replayed native draw.
         gpu::WeaponDofRegion region;
@@ -568,7 +584,7 @@ public:
                 Texture scene = make(DXGI_FORMAT_B8G8R8A8_UNORM);
                 Texture packed = make(DXGI_FORMAT_R16G16B16A16_FLOAT), depth = make(DXGI_FORMAT_R16_FLOAT);
                 Texture tiles = Make(DXGI_FORMAT_R8_UNORM, 1, nullptr, 0, columns, rows);
-                const float cb[12] = {-.01f, 1.001f, .25f, float(draw_height) / 1080,
+                const float cb[16] = {-.01f, 1.001f, .25f, float(draw_height) / 1080,
                                      0, 0, float(draw_width), float(draw_height), 1, .75f,
                                      float(draw_width), float(draw_height)};
                 context->UpdateSubresource(constants.Get(), 0, nullptr, cb, 0, 0);
@@ -700,11 +716,18 @@ public:
     // x=8 is a single covered sample; x=9..23 fully covered. The remaining samples are bright blue world.
     Result Run(unsigned samples, float amount, float z = .1f, bool invalid = false, bool cropped = false,
                bool constant_color = false, bool unchanged = false, float focus = 1.0f,
-               float width = .75f, bool depth_ramp = false, bool sparse_edges = false, bool ms_context = false) {
+               float width = .75f, bool depth_ramp = false, bool sparse_edges = false, bool ms_context = false,
+               float near_plane = 0, float projection_numerator = -.01f) {
         CompilePack(samples);
+        const auto projected_depth = [&](float view_z) { return 1.001f + projection_numerator / view_z; };
+        const auto native_depth = [&](float view_z) {
+            constexpr float front_share = 1.f / 4096;
+            return near_plane > 0 ? (view_z < near_plane ? front_share * view_z / near_plane :
+                                     front_share + (1 - front_share) * projected_depth(view_z)) : projected_depth(view_z);
+        };
         Texture pre = Make(R, samples), post = Make(R, samples), color = Make(RGBA, samples);
         for (unsigned sample = 0; sample < samples; ++sample) {
-            std::vector<float> before(W * H, Raw(5)), after = before;
+            std::vector<float> before(W * H, projected_depth(5)), after = before;
             std::vector<Pixel> pixels(W * H);
             for (unsigned y = 0; y < H; ++y) for (unsigned x = 0; x < W; ++x) {
                 size_t i = At(x,y);
@@ -716,7 +739,7 @@ public:
                     : (x >= 8 && x < 24 && y >= 4 && y < 28 && (x > 8 || sample == 0));
                 if (covered) {
                     float gun_z = depth_ramp ? (y < 12 ? .1f : y < 20 ? .8f : 1.0f) : z;
-                    after[i] = unchanged ? before[i] : Raw(gun_z);
+                    after[i] = unchanged ? before[i] : native_depth(gun_z);
                     pixels[i] = {constant_color ? .5f : float((x + y) % 2), .125f, 0, pixels[i].a};
                 }
             }
@@ -738,9 +761,9 @@ public:
         else context->CopyResource(scene.tex.Get(), color.tex.Get());
         context->CopyResource(output.tex.Get(), scene.tex.Get());
         Texture packed = Make(DXGI_FORMAT_R16G16B16A16_FLOAT), depth = Make(DXGI_FORMAT_R16_FLOAT);
-        const float cb[12] = {-.01f, 1.001f, amount, 1,
+        const float cb[16] = {projection_numerator, 1.001f, amount, 1,
                               cropped ? 10.f : 0.f, 0, cropped ? 12.f : float(W), float(H),
-                              focus, width, float(W), float(H)};
+                              focus, width, float(W), float(H), near_plane, 0, 0, 0};
         context->UpdateSubresource(constants.Get(), 0, nullptr, cb, 0, 0);
         Draw(packs.at(samples).Get(), {packed.rtv.Get(), depth.rtv.Get()},
              {post.srv.Get(), pre.srv.Get(), color.srv.Get()});
@@ -915,6 +938,27 @@ int main(int argc, char** argv) {
             auto zero = warp.Run(n, 0);
             ExactIdentity(zero, "zero amount is not exact identity");
             auto normal = warp.Run(n, .25f); Invariants(normal);
+            // The widened-viewmodel path keeps the original projection's Z
+            // coefficients (near=.08 here); its XY scaling does not enter the
+            // depth inverse. Encode the exact native front/rear piecewise map.
+            for (float z : {.03f, .08f, .1f, .25f, .8f}) {
+                const auto remapped = warp.Run(n, .25f, z, false, false, false, false,
+                                              .25f, .25f, false, false, false, .08f, -.08008f);
+                Invariants(remapped);
+                Check(std::abs(remapped.depth[At(9,16)] - z) < std::max(.0001f, z * .001f),
+                      "native near-depth encoding reconstructed the wrong focus distance");
+                Check(remapped.packed[At(8,16)].a == 1.f / n && remapped.packed[At(9,16)].a == 1,
+                      "near-depth mapping changed MSAA coverage");
+                const auto legacy = warp.Run(n, .25f, z, false, false, false, false, .25f, .25f);
+                float maximum_difference = 0;
+                for (size_t i = 0; i < legacy.output.size(); ++i)
+                    maximum_difference = std::max(maximum_difference, std::abs(remapped.output[i].r - legacy.output[i].r));
+                Check(maximum_difference < .003f, "near-depth mapping changed the physical-depth focus curve");
+                if (z >= .25f) ExactIdentity(remapped, "remapped weapon at/beyond focus did not remain sharp");
+                std::printf("PASS near-depth %ux z=%.3g plane=.08 focus=.25 maxRGBdifference=%.7g\n", n, z, maximum_difference);
+            }
+            ExactIdentity(warp.Run(n, 0, .03f, false, false, false, false, .25f, .25f,
+                                   false, false, false, .08f, -.08008f), "near-depth zero amount changed native output");
             Check(normal.packed[At(8,16)].a == 1.f / n, "incorrect single-sample gun coverage");
             Check(normal.packed[At(9,16)].a == 1, "full gun coverage missing");
             Check(normal.depth[At(9,16)] > .099f && normal.depth[At(9,16)] < .101f, "wrong packed depth");

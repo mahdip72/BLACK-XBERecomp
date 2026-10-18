@@ -30,4 +30,21 @@ struct WeaponDofRegion {
     }
 };
 
+// Independent of coverage availability: even full-screen packing needs one
+// unambiguous encoding for every depth mutation between the paired snapshots.
+struct WeaponDofDepthEncoding {
+    uint64_t expected_serial = 0;
+    float plane = 0;
+    bool valid = false, seen = false;
+    void Begin(uint64_t serial) { expected_serial = serial; plane = 0; valid = true; seen = false; }
+    void Observe(uint64_t serial, bool matched, bool near_depth, float draw_plane) {
+        const float encoding = near_depth ? draw_plane : 0;
+        valid = valid && matched && serial == expected_serial && std::isfinite(draw_plane) &&
+                (near_depth ? draw_plane > 0 : draw_plane == 0) && (!seen || plane == encoding);
+        if (!valid) return;
+        plane = encoding; seen = true; ++expected_serial;
+    }
+    bool Complete(uint64_t serial) const { return valid && seen && serial == expected_serial; }
+};
+
 } // namespace gpu

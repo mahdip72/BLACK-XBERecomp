@@ -11,7 +11,8 @@ inline constexpr char kViewmodelDofHlsl[] = R"(
 // The projection numerator uses the renderer's view-depth scale; these depths do not claim physical metres.
 // vp = viewport origin and size. Sparse pack requires both complete targets cleared to zero first.
 // focus = sharp depth, transition width, target width, target height. Depths use the reconstructed view scale.
-cbuffer ViewmodelDof : register(b1) { float4 zp; float4 vp; float4 focus; };
+// encoding.x = captured native NearDepth plane, or zero for legacy depth.
+cbuffer ViewmodelDof : register(b1) { float4 zp; float4 vp; float4 focus; float4 encoding; };
 #ifdef MS
 Texture2DMS<float> after_depth : register(t0);
 Texture2DMS<float> before_depth : register(t1);
@@ -89,6 +90,15 @@ float ChangedDepth(int2 p, int sample_index) {
     float before = Before(p, sample_index);
     if (!isfinite(raw) || !isfinite(before) || raw < 0 || raw >= 1 || before < 0 || before > 1 || raw == before)
         return 0;
+    if ((asuint(encoding.x) & 0x7f800000u) == 0x7f800000u || encoding.x < 0) return 0;
+    if (encoding.x > 0) {
+        const float front_share = 1.0 / 4096;
+        if (raw < front_share) {
+            float front_z = encoding.x * (raw / front_share);
+            return front_z > 0 && front_z <= 60000 ? front_z : 0;
+        }
+        raw = (raw - front_share) / (1 - front_share);
+    }
     float denominator = raw - zp.y;
     if (abs(denominator) < 1e-7) return 0;
     float z = zp.x / denominator;
