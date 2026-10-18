@@ -21,19 +21,26 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
-def wait_for_game(root):
+def wait_for_game(root, allow_game=False, device='cuda'):
     import psutil
     waiting = False
     while True:
         games = [p.info['name'] for p in psutil.process_iter(['name'])
                  if (p.info['name'] or '').lower().startswith('black')
                  and (p.info['name'] or '').lower().endswith('.exe')]
-        if not games and not (root / 'PAUSE').exists():
+        available_mib = None
+        if allow_game and device == 'cuda':
+            import torch
+            free, _ = torch.cuda.mem_get_info()
+            reusable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            available_mib = (free + reusable) / 1024**2
+        enough_memory = available_mib is None or available_mib >= 1536
+        if (not games or allow_game) and enough_memory and not (root / 'PAUSE').exists():
             if waiting:
-                print('Resuming: game closed and PAUSE absent', flush=True)
+                print('Resuming: resources available and PAUSE absent', flush=True)
             return
         if not waiting:
-            print(f'Waiting for BLACK to close or PAUSE to be removed: {games}', flush=True)
+            print(f'Waiting: games={games}, available VRAM MiB={available_mib}, PAUSE={(root / "PAUSE").exists()}', flush=True)
             # Return the allocator's unused VRAM while another game is active.
             import sys
             torch = sys.modules.get('torch')
@@ -116,8 +123,7 @@ def run(args, manifest):
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; use a CUDA-enabled PyTorch installation')
     if args.device == 'cuda':
-        # Leave room for the desktop; the benchmark and batch use the same cap.
-        torch.cuda.set_per_process_memory_fraction(0.55)
+        torch.cuda.set_per_process_memory_fraction(0.35 if args.allow_game else 0.55)
     torch.set_num_threads(2)
     torch.set_num_interop_threads(1)
     for name in ('textures', 'upscaled', 'records'):
@@ -126,7 +132,8 @@ def run(args, manifest):
     print(f'{len(manifest["textures"])-len(remaining)} complete, {len(remaining)} remaining', flush=True)
     if not remaining:
         return
-    wait_for_game(args.output)
+    gate = lambda: wait_for_game(args.output, args.allow_game, args.device)
+    gate()
     model = ModelLoader().load_from_file(args.model)
     if not isinstance(model, ImageModelDescriptor) or model.scale != 4:
         raise ValueError('Expected a 4x image model')
@@ -136,14 +143,26 @@ def run(args, manifest):
     atomic_json(args.output / 'recipe.json', RECIPE)
     count, total = len(manifest['textures']) - len(remaining), len(manifest['textures'])
     for entry in sorted(remaining, key=lambda e: (e['width'] * e['height'], e['key'])):
-        wait_for_game(args.output)
+        gate()
         started = time.perf_counter()
         key = entry['key']
         original = args.output / 'originals' / f'{key}.png'
         if sha256(original) != entry['png_sha256']:
             raise ValueError(f'Original PNG changed: {key}')
         image = Image.open(original).convert('RGBA')
-        result = upscale(model, image, args.device, lambda: wait_for_game(args.output))
+        for attempt in range(3):
+            try:
+                result = upscale(model, image, args.device, gate)
+            except torch.cuda.OutOfMemoryError:
+                if not args.allow_game or args.device != 'cuda' or attempt == 2:
+                    raise
+                print(f'VRAM allocation failed for {key}; releasing cache before retry', flush=True)
+            else:
+                break
+            torch.cuda.empty_cache()
+            time.sleep(5)
+        if args.allow_game and args.device == 'cuda':
+            torch.cuda.empty_cache()
         png = args.output / 'upscaled' / f'{key}.png'
         dds = args.output / 'textures' / f'{key}.dds'
         temporary = png.with_suffix('.tmp')
@@ -154,7 +173,7 @@ def run(args, manifest):
         temporary.replace(dds)
         record = dict(key=key, recipe=RECIPE, source_sha256=entry['source_sha256'],
                       png_sha256=sha256(png), dds_sha256=sha256(dds),
-                      device=args.device, torch_version=torch.__version__,
+                      device=args.device, torch_version=torch.__version__, allow_game=args.allow_game,
                       seconds=round(time.perf_counter() - started, 3),
                       output_size=list(result.size))
         atomic_json(args.output / 'records' / f'{key}.json', record)
@@ -203,6 +222,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--model', type=Path)
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda')
+    parser.add_argument('--allow-game', action='store_true', help='Share the GPU with BLACK; wait when VRAM is low')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if args.action == 'extract':

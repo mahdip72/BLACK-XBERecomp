@@ -33,6 +33,11 @@ source, recipe and output hashes. The batch pauses while a `BLACK*.exe`
 process runs, or while an empty `PAUSE` file exists in the output folder.
 An error stops the batch without silently skipping an asset.
 
+Add `--allow-game` to run alongside BLACK. This mode checks for 1.5 GiB of
+available/reusable VRAM before inference, limits the allocator, and releases
+unused cached VRAM after each image. GPU sharing can reduce game FPS and
+increase processing time. The image model, precision and output recipe stay the same.
+
 Put the generated `textures` directory beside the newly built executable.
 The renderer replaces matching host textures and keeps the original game
 files untouched. Missing or malformed replacements fall back to originals.
