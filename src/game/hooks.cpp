@@ -522,7 +522,7 @@ void ShardStep(X86Context& ctx, uint8_t*) {
 
 // LOD and draw distances reach this many times farther: each compare sees a distance that much shorter or a
 // limit that much longer. Characters, props, pickups, ground cover, particles and bullet holes
-static float Reach() { return float(std::clamp(game::Opt().draw_distance, 1u, 8u)); }
+static float Reach() { return float(std::clamp(game::Opt().draw_distance, 1u, 16u)); }
 void DistanceShorter(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] /= Reach(); }
 void DistanceShorterSquared(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] /= Reach() * Reach(); }
 void LimitLonger(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] *= Reach(); }
