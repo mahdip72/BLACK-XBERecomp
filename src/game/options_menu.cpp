@@ -132,6 +132,7 @@ struct Page {
 Page g_page;     // game thread
 int g_next = 0;  // the mode of the page being loaded
 int g_last = 0;  // the mode before it, whose button takes the focus back
+const Row* g_group = nullptr;  // the settings' category shown, null for the list of them
 
 // the id of a string by its name
 uint32_t Hash(const char* text) {
@@ -249,13 +250,21 @@ bool Entries(X86Context& ctx, uint32_t root, uint32_t holder) {
     return true;
 }
 
+// the settings' categories, each a row
+bool Listing(const Page& p) { return p.mode == 1 && !g_group; }
+
 // the rows of the page's mode
 void Fill(Page& p) {
     p.rows.clear();
     size_t count = 0;
     const Row* list = app::rows::Page(p.mode - 1, &count);
-    for (size_t i = 0; i < count; i++)
-        if (list[i].kind != app::rows::Kind::Heading) p.rows.push_back(&list[i]);
+    bool listing = Listing(p);
+    bool inside = !g_group;
+    for (size_t i = 0; i < count; i++) {
+        bool heading = list[i].kind == app::rows::Kind::Heading;
+        if (g_group && heading) inside = &list[i] == g_group;
+        if (heading == listing && inside) p.rows.push_back(&list[i]);
+    }
     if (p.mode > 1) p.rows.push_back(nullptr);
     p.slots = std::min(p.slots, p.rows.size());
     p.top = 0;
@@ -289,7 +298,11 @@ bool Rows(X86Context& ctx, uint32_t root, uint32_t holder, uint32_t menu) {
     CallGuest(ctx, flash::kRunActions, {R32(flash::kPlayer)});
     for (size_t i = 0; i < p.slots; i++) {
         // a confirm on a button with no action is a back
-        if (!Button(ctx, p.name[i], like) || !Set(ctx, p.name[i], "actionSelectFunction", nothing)) return false;
+        if (!Button(ctx, p.name[i], like)) return false;
+        // a category loads the page again, with its rows
+        bool set = Listing(p) ? Set(ctx, p.name[i], "actionSelectPage", String(ctx, h.page))
+                              : Set(ctx, p.name[i], "actionSelectFunction", nothing);
+        if (!set) return false;
         if (i) Link(ctx, p.name[i - 1], p.name[i]);
     }
     for (const char* stock : h.stock)
@@ -306,7 +319,7 @@ bool Rows(X86Context& ctx, uint32_t root, uint32_t holder, uint32_t menu) {
 std::string ValueText(const Page& p, size_t i) {
     const Row* row = p.rows[i];
     if ((p.capture == 1 || p.capture == 2) && p.bind == i) return app::Ui("PRESS A KEY");
-    if (!row) return " ";
+    if (!row || row->kind == app::rows::Kind::Heading) return " ";
     std::string value = app::rows::Value(*row);
     // key names as they are
     if (row->kind == app::rows::Kind::Bind && value != "UNBOUND") return value;
@@ -412,10 +425,19 @@ void Build(X86Context& ctx, const Host& host, uint32_t root, uint32_t holder, ui
     p.host = &host;
     p.mode = g_next;
     g_next = 0;
+    // back from a category is its list
+    const Row* back = nullptr;
+    if (!p.mode && g_last == 1 && g_group) {
+        back = g_group;
+        g_group = nullptr;
+        p.mode = 1;
+    }
     p.failed = !(p.mode ? Rows(ctx, root, holder, menu) : Entries(ctx, root, holder));
     const char* shown = p.mode ? kCaptions[p.mode - 1] : "buttons";
     LOGI("options menu: %s, %s%s", host.page, shown, p.failed ? ", failed" : "");
     if (!p.failed && !p.mode && g_last) Focus(ctx, p.entry[g_last - 1]);
+    size_t at = size_t(std::find(p.rows.begin(), p.rows.end(), back) - p.rows.begin());
+    if (!p.failed && back && at < p.slots) Focus(ctx, p.name[at]);
     g_last = p.mode;
 }
 
@@ -467,6 +489,9 @@ void ApplyRowInput(size_t slot, uint32_t id, bool locked) {
     bool changes = id >= kInputLeft && id <= kInputConfirm;
     if (value && changes) {
         if (!locked) app::rows::Value(*row, id == kInputLeft ? -1 : 1);
+    } else if (id == kInputConfirm && row && row->kind == app::rows::Kind::Heading) {
+        g_group = row;
+        g_next = 1;
     } else if (id == kInputConfirm && row) {
         p.capture = 1;
         p.bind = p.top + slot;
@@ -494,7 +519,7 @@ void UpdateRow(X86Context& ctx, uint32_t ui, size_t slot, uint32_t id, bool clea
 void UpdateTexts(const Page& p) {
     // a value lights up with its name: a clip's matrix, then its colours
     constexpr uint32_t kMatrixAndColours = 0x38;
-    Write(g_fields[kTitle], app::Ui(kCaptions[p.mode - 1]));
+    Write(g_fields[kTitle], app::Ui(g_group ? g_group->label : kCaptions[p.mode - 1]));
     for (size_t i = 0; i < p.slots; i++) {
         const Row* row = p.rows[p.top + i];
         Write(g_fields[kName + i], app::Ui(row ? row->label : "RESTORE DEFAULTS"));
@@ -514,7 +539,10 @@ void Tick(X86Context& ctx, uint32_t ui) {
     const Host* host = FindHost(name);
     bool running = host && R32(flash::kPlayerReady) == 1 && R32(flash::kPlayer) && R32(ui + kPageReady) == kPageRunning;
     if (!running) {
-        if (*name && !host) g_next = g_last = 0;
+        if (*name && !host) {
+            g_next = g_last = 0;
+            g_group = nullptr;
+        }
         p = {};
         return;
     }
@@ -540,7 +568,10 @@ void Tick(X86Context& ctx, uint32_t ui) {
     uint32_t focus = Member(ctx, menu, "mFocusButton");
     if (!p.mode) {
         const uint32_t* at = std::find(std::begin(p.entry), std::end(p.entry), focus);
-        if (id == kInputConfirm && at != std::end(p.entry)) g_next = int(at - p.entry) + 1;
+        if (id == kInputConfirm && at != std::end(p.entry)) {
+            g_next = int(at - p.entry) + 1;
+            g_group = nullptr;
+        }
         return;
     }
     size_t slot = size_t(std::find(p.name, p.name + p.slots, focus) - p.name);
