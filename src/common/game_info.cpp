@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -17,6 +18,7 @@
 #include "common/monitor.h"
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
+#include "core/log.h"
 
 namespace game {
 
@@ -84,8 +86,31 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
     return false;
 }
 
+// A pad that has not reported yet can read its triggers half pressed (Proton, Steam Deck): fire held.
+// A trigger counts once seen released.
+void UpdateTriggerRest(int port, input::Pad& pad) {
+    constexpr uint8_t kReleased = 0x20;
+    constexpr int kLeftTrigger = 6;
+    static std::atomic<uint8_t> rested[4];  // bit 0 left trigger, bit 1 right
+    static std::atomic<bool> logged;
+    if (port < 0 || port > 3) return;
+    if (!pad.connected) {
+        rested[port] = 0;
+        return;
+    }
+    for (int t = 0; t < 2; t++) {
+        uint8_t& value = pad.analog[kLeftTrigger + t];
+        uint8_t bit = uint8_t(1u << t);
+        if (value <= kReleased) rested[port] |= bit;
+        if (rested[port] & bit) continue;
+        if (!logged.exchange(true)) LOGR("input: controller %d trigger pressed before a release, ignored", port + 1);
+        value = 0;
+    }
+}
+
 // port 0 has the keyboard; the game sees no input while the panel is open
 void Pad(int port, input::Pad& pad) {
+    UpdateTriggerRest(port, pad);
     input::SeenPad(pad);
     if (port == 0) pad.connected = true;
     if (app::MenuOpen()) pad = input::Pad{.connected = pad.connected};
