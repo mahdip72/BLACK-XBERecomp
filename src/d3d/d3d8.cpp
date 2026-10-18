@@ -249,9 +249,10 @@ float ZScale(const gpu::Surface& zs) {
 }
 
 float g_view_scale = 1.0f;
-bool g_view_near = false;
+float g_near_depth = 0.0f;
 
-// c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them
+// c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them.
+// The scale's unused w carries NearDepth's plane to the host shaders
 constexpr uint32_t kViewportScale = 58;
 constexpr uint32_t kViewportOffset = 59;
 
@@ -260,18 +261,11 @@ void UpdateViewportConstants() {
     g_state.zscale = ZScale(g_state.zs);
     float hw = v.w * 0.5f;
     float hh = v.h * 0.5f;
-    g_state.vsc[kViewportScale] = {hw * g_view_scale, -hh * g_view_scale, (v.max_z - v.min_z) * g_state.zscale, 0};
+    g_state.vsc[kViewportScale] = {hw * g_view_scale, -hh * g_view_scale, (v.max_z - v.min_z) * g_state.zscale,
+                                     g_near_depth};
     float x = v.x + g_state.ss_offset_x + hw;
     float y = v.y + g_state.ss_offset_y + hh;
     g_state.vsc[kViewportOffset] = {x, y, v.min_z * g_state.zscale, 0};
-    if (g_view_near) {
-        // Keep weapons in front of the scene, with a closer near plane and distinct depths.
-        constexpr float kNearScale = 0.008f;
-        constexpr float kDepthRange = 0.1f;
-        float depth = g_state.vsc[kViewportScale][2] * kDepthRange;
-        g_state.vsc[kViewportOffset][2] = g_state.vsc[kViewportOffset][2] * kDepthRange + depth * (1 - kNearScale);
-        g_state.vsc[kViewportScale][2] = depth * kNearScale;
-    }
 }
 
 void SetComplex(uint32_t rs, uint32_t v) {
@@ -294,11 +288,17 @@ void ApplyDefaultStates(X86Context& ctx) {
 gpu::State& State() { return g_state; }
 std::recursive_mutex& Lock() { return g_lock; }
 
-// draws grow about the viewport's centre; weapons can use a closer near plane
-void ViewScale(float xy, bool close_near) {
+// draws grow about the viewport's centre; depth keeps the game's projection
+void ViewScale(float xy) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_view_scale = xy;
-    g_view_near = close_near;
+    UpdateViewportConstants();
+}
+
+// draws keep what lies nearer than the plane at this view depth (0 off), in order, in front of what lies past it
+void NearDepth(float plane) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_near_depth = plane;
     UpdateViewportConstants();
 }
 

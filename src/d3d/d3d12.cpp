@@ -737,6 +737,7 @@ struct PsoKey {
     uint32_t cull;
     uint32_t ccw;
     uint32_t fill;
+    uint32_t unclipped;  // no clipping at the near and far planes: NearDepthHlsl draws
     int32_t zbias;
     float zslope;
     uint32_t rtfmt;
@@ -785,6 +786,7 @@ struct DrawShaders {
     uint64_t vh = 0;
     uint64_t pkey = 0;
     uint64_t ph = 0;
+    bool near_depth = false;  // the pixel shader writes the depth: NearDepthHlsl
     ID3DBlob* vs_code = nullptr;
     ID3DBlob* ps_code = nullptr;
 };
@@ -913,9 +915,9 @@ private:
         const char* entry;
         DXGI_FORMAT out = kAoFormat;
         uint32_t samples = 1;   // of the target written
-        bool multiply = false;  // onto that target
+        bool blend = false;  // onto that target, OcclusionBlend
         D3D12_CPU_DESCRIPTOR_HANDLE rtv;
-        ID3D12Resource* depth = nullptr;  // the scene's, read by the first pass
+        ID3D12Resource* depth = nullptr;  // the scene's depth and stencil, read by the first pass
         bool ms_depth = false;
         ID3D12Resource* src = nullptr;  // the pass before
         float step_x = 0;
@@ -1677,7 +1679,7 @@ void D3D12Backend::Occlusion(const State& s, const float p[4 * kOcclusionRects])
     AoPass raw{.entry = entry, .rtv = OcclusionView(0), .depth = ds->res.Get(), .ms_depth = samples > 1};
     AoPass across{.entry = "occlusion_blur", .rtv = OcclusionView(1), .src = ao_[0].Get(), .step_x = 1};
     D3D12_CPU_DESCRIPTOR_HANDLE scene = Cpu(rtv_heap_.Get(), rt->view, rtv_inc_);
-    AoPass down{.entry = "occlusion_apply", .out = rt->fmt, .samples = Ms(*rt), .multiply = true, .rtv = scene,
+    AoPass down{.entry = "occlusion_apply", .out = rt->fmt, .samples = Ms(*rt), .blend = true, .rtv = scene,
                 .src = ao_[1].Get(), .step_y = 1};
     bound_rt_ = bound_ds_ = nullptr;
     Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1731,7 +1733,7 @@ ID3D12PipelineState* D3D12Backend::EnsureOcclusionPipeline(const AoPass& a) {
     ID3DBlob* ps = Compile(text, a.entry, "ps_5_0", h);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, a.out);
-    if (a.multiply) OcclusionBlend(d.BlendState.RenderTarget[0]);
+    if (a.blend) OcclusionBlend(d.BlendState.RenderTarget[0]);
     d.SampleDesc.Count = a.samples;
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
@@ -2132,7 +2134,7 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.RasterizerState.FrontCounterClockwise = k.ccw;
     d.RasterizerState.DepthBias = k.zbias;
     d.RasterizerState.SlopeScaledDepthBias = k.zslope;
-    d.RasterizerState.DepthClipEnable = TRUE;
+    d.RasterizerState.DepthClipEnable = !k.unclipped;
     d.RasterizerState.MultisampleEnable = k.msaa != 0;
     FillDepthStencilDesc(k, d.DepthStencilState);
     d.PrimitiveTopologyType = TopologyType(k.topo);
@@ -2572,6 +2574,38 @@ float4 glowtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
 )" + source;
 }
 
+constexpr uint64_t kNearDepthSalt = 0xC2B2AE3D27D4EB4Full;
+
+// c-38, the viewport scale; its w the plane d3d8.cpp NearDepth set, 0 without
+constexpr uint32_t kViewportScaleRow = 58;
+
+bool NearDepth(const State& s) { return s.vsc[kViewportScaleRow][3] > 0; }
+
+// The pixel shader writes the depth. Past the near plane it is the rasterizer's, squeezed behind a small front share
+// of the range; nearer, the parts the plane would clip fill that share linearly in view depth (pos.w), in order
+std::string NearDepthHlsl(std::string src) {
+    const std::string head = "float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n";
+    const std::string with_depth =
+        "float4 main(VOut i, bool front : SV_IsFrontFace, out float depth : SV_Depth) : SV_Target {\n"
+        "    const float front_share = 1.0 / 4096;\n"
+        "    float plane = c[" + std::to_string(kViewportScaleRow) + "].w;\n"
+        "    float past = front_share + (1 - front_share) * i.pos.z;\n"
+        "    depth = i.pos.w < plane ? front_share * i.pos.w / plane : past;\n";
+    size_t at = src.find(head);
+    if (at == std::string::npos || src.find(head, at + 1) != std::string::npos) {
+        LOGE("d3d12: near-depth entry point not found in translated shader");
+        return {};
+    }
+    src.replace(at, head.size(), with_depth);
+    return src;
+}
+
+// Compilation and diagnostic captures use the same composed local shader variants.
+std::string DrawPixelHlsl(const PixelKey& pk, bool near_depth) {
+    std::string src = GlowPixelHlsl(pk);
+    return near_depth ? NearDepthHlsl(std::move(src)) : src;
+}
+
 // sets sh.ph and sh.ps_code, compiling the shader on a cache miss
 void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
     // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
@@ -2581,7 +2615,7 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
         sh.ps_code = blobs_[sh.ph].Get();
         return;
     }
-    sh.ps_code = Compile(GlowPixelHlsl(pk), "main", "ps_5_0", sh.ph);
+    sh.ps_code = Compile(DrawPixelHlsl(pk, sh.near_depth), "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
 
@@ -2658,6 +2692,7 @@ void KeyRasterizer(const State& s, const Assembled& a, PsoKey& k) {
     k.cull = cull != 0 && a.topology == Topology::Triangles;
     k.ccw = cull == kCullCw;  // culling clockwise leaves counter clockwise as the front
     k.fill = s.rs[kRsFillMode];
+    k.unclipped = NearDepth(s);
 }
 
 void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k) {
@@ -2976,7 +3011,7 @@ void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::stri
 
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
     CaptureShader("vs", sh.vkey, VertexHlsl(s, a, sh));
-    CaptureShader("ps", sh.pkey, GlowPixelHlsl(pk));
+    CaptureShader("ps", sh.pkey, DrawPixelHlsl(pk, sh.near_depth));
 }
 
 D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
@@ -3122,7 +3157,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         stages.info[0].flags |= kTexWide | kTexGlowSmooth;
         pk = MakePixelKey(s, stages.info);
     }
-    sh.pkey = Hash(&pk, sizeof(pk));
+    sh.near_depth = NearDepth(s);
+    sh.pkey = Hash(&pk, sizeof(pk)) ^ (sh.near_depth ? kNearDepthSalt : 0);
     EnsurePixelShader(pk, sh);
     if (!sh.vs_code || !sh.ps_code) return;
 

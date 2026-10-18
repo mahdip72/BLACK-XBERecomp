@@ -103,8 +103,9 @@ bool AimAssist(X86Context&, uint8_t*) { return game::Opt().aim_assist && !input:
 // the look update: xmm3 the stick's yaw speed, xmm0 its pitch speed, before the zoom scale and frame time
 void StickLook(X86Context& ctx, uint8_t*) {
     if (input::KeyboardActive()) return;
-    ctx.xmm[3].f[0] *= game::Opt().controller_sensitivity;
-    ctx.xmm[0].f[0] *= game::Opt().controller_sensitivity;
+    float sensitivity = game::Opt().controller_sensitivity;
+    ctx.xmm[3].f[0] *= sensitivity;
+    ctx.xmm[0].f[0] *= sensitivity;
 }
 
 // the game drops the aim of a weapon whose zoom is 1 each frame (0x1BB143)
@@ -113,11 +114,13 @@ static bool CanAim(uint32_t weapon) {
     return data && G<float>(data + kDataAimZoom) != 1.0f;
 }
 
-// ebx the player's controller past the game's toggle aim, scopes and all, [esp+0x18] the weapon.
+constexpr uint32_t kHoldAimWeapon = 0x18;  // esp offset of the weapon at the hook
+
+// ebx the player's controller past the game's toggle aim, scopes and all.
 // A toggle on a weapon that cannot aim would stay on and aim the next weapon.
 void HoldAim(X86Context& ctx, uint8_t*) {
     bool hold = input::KeyboardActive() ? game::Opt().hold_aim : game::Opt().controller_hold_aim;
-    if (!hold && CanAim(R32(ctx.esp + 0x18))) return;
+    if (!hold && CanAim(R32(ctx.esp + kHoldAimWeapon))) return;
     G<uint8_t>(ctx.ebx + kControllerAimWanted) = G<uint8_t>(ctx.ebx + kControllerAimHeld);
 }
 
