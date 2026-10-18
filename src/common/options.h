@@ -27,7 +27,7 @@ struct Options {
     uint32_t viewmodel_fov = 70;  // the gun and arms, the same measure
     uint32_t walk_speed = 50;  // percent of running, while the walk key is held
     uint32_t audio_output = 0;  // audio::kOutputAuto, kOutputStereo, kOutputSurround or kOutputMono
-    std::string language = "int";  // one of kLanguages
+    std::string language = "auto";  // "auto" (the Windows display language) or one of kLanguages
     bool smaa = false;  // over the finished frame, HUD included; combines with msaa
     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
     bool aim_assist = true;  // the game's pull to targets on a controller, never on the keyboard and mouse
@@ -40,7 +40,9 @@ struct Options {
     std::map<std::string, std::string> keys;  // action id to key names, absent is the default
 };
 Options& Opt();
-// the language setting as this run started, the language the game boots in
+// one of kLanguages for a language setting: "auto" is the Windows display language, English when the game lacks it
+std::string ResolveLanguage(const std::string& setting);
+// the language setting as this run started, resolved: the language the game boots in
 const std::string& BootLanguage();
 bool HasLanguages();  // language.cpp
 inline std::atomic<float> g_fps{0};  // from the host, for the game's own counter

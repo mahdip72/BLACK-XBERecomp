@@ -100,6 +100,17 @@ void Rumble(int port, uint16_t& left, uint16_t& right) {
     right = uint16_t(std::min(right * percent / 100, 0xFFFFu));
 }
 
+// the Windows display language when the game has it, else English
+std::string SystemLanguage() {
+    switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+        case LANG_FRENCH: return "fra";
+        case LANG_GERMAN: return "deu";
+        case LANG_ITALIAN: return "ita";
+        case LANG_SPANISH: return "esp";
+        default: return "int";
+    }
+}
+
 // what the options list cannot hold
 void Load(const void* table) {
     const toml::table& t = *static_cast<const toml::table*>(table);
@@ -112,7 +123,7 @@ void Load(const void* table) {
     o.gyro_sensitivity = float(t["gyro_sensitivity"].value_or(double(o.gyro_sensitivity)));
     std::string language = t["language"].value_or(o.language);
     bool known = std::find(std::begin(kLanguages), std::end(kLanguages), language) != std::end(kLanguages);
-    if (known) o.language = language;
+    if (known || language == "auto") o.language = language;
     if (const toml::table* keys = t["keys"].as_table())
         for (auto&& [id, value] : *keys)
             if (auto v = value.value<std::string>()) o.keys[std::string(id.str())] = *v;
@@ -145,8 +156,10 @@ Options& Opt() {
     return o;
 }
 
+std::string ResolveLanguage(const std::string& setting) { return setting == "auto" ? SystemLanguage() : setting; }
+
 const std::string& BootLanguage() {
-    static const std::string language = Opt().language;
+    static const std::string language = ResolveLanguage(Opt().language);
     return language;
 }
 

@@ -71,7 +71,8 @@ const char* const kFmvScaleNames[] = {"FILL", "4:3"};
 constexpr uint32_t kAudioOutputs[] = {audio::kOutputAuto, audio::kOutputMono, audio::kOutputStereo,
                                       audio::kOutputSurround};
 const char* const kAudioOutputNames[] = {"AUTOMATIC", "MONO", "2.0 STEREO", "5.1 SURROUND"};
-const char* const kLanguageNames[] = {"ENGLISH", "FRENCH", "GERMAN", "ITALIAN", "SPANISH"};  // as game::kLanguages
+// "auto" then game::kLanguages
+const char* const kLanguageNames[] = {"AUTOMATIC", "ENGLISH", "FRENCH", "GERMAN", "ITALIAN", "SPANISH"};
 constexpr uint32_t kFpsCaps[] = {30, 60, 75, 90, 120, 144, 165, 240, 360, kFpsCapRefresh, 0};
 
 int StepIndex(int index, int step, int count) {
@@ -498,14 +499,15 @@ void StepInputRow(int id, int step, char (&text)[64]) {
             std::snprintf(text, sizeof(text), "%u%%", o.walk_speed);
             break;
         case kLanguage: {
-            int count = int(std::size(game::kLanguages));
+            int count = int(std::size(kLanguageNames));
             int i = 0;
-            while (i < count - 1 && o.language != game::kLanguages[i]) i++;
+            while (i < count - 1 && o.language != (i ? game::kLanguages[i - 1] : "auto")) i++;
             if (step) {
                 i = StepIndex(i, step, count);
-                o.language = game::kLanguages[i];
+                o.language = i ? game::kLanguages[i - 1] : "auto";
             }
-            const char* format = o.language == game::BootLanguage() ? "%s" : "%s (RESTART)";
+            bool restart = game::ResolveLanguage(o.language) != game::BootLanguage();
+            const char* format = restart ? "%s (RESTART)" : "%s";
             std::snprintf(text, sizeof(text), format, kLanguageNames[i]);
             break;
         }
