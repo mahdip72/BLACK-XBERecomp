@@ -55,31 +55,44 @@ inline bool Common(std::string& s) {
         "    nointerpolation float particleViewZ : TEXCOORD6;")) return false;
     if (!ReplaceOne(s, "    float4 lt[56];\n};", std::string("    float4 lt[56];\n") +
         kParticleDofCbufferFields + "};")) return false;
-    s.insert(0, "struct ParticleDofQuad { float4 uv_bounds; uint4 argb; };\n");
+    s.insert(0, kParticleDofQuadHlsl);
     return true;
 }
 } // namespace particle_dof_detail
 
 // Empty means that the translator changed its contract; the renderer must use native geometry/shaders.
-inline std::string MakeParticleDofVertexShader(std::string s) {
+inline std::string MakeParticleDofVertexShader(std::string s, uint32_t pass = 0) {
     using namespace particle_dof_detail;
-    if (!Common(s)) return {};
+    if (pass > 2 || !Common(s)) return {};
     if (!ReplaceOne(s, "VOut main(VIn i)", "VOut main(VIn i, uint vertexId : SV_VertexID)") &&
         !ReplaceOne(s, "VOut main(VRaw ri)", "VOut main(VRaw ri, uint vertexId : SV_VertexID)")) return {};
-    if (!ReplaceOne(s, "    return o;", "    o.particleQuad = vertexId / 4;\n"
-        "    o.particleViewZ = 1.0 / i.v0.z;\n    return o;")) return {};
+    std::string finish = "    o.particleQuad = vertexId / 4;\n"
+        "    o.particleViewZ = 1.0 / i.v0.z;\n";
+    if (pass == 1) finish += R"(
+    ParticleDofQuad quad = particleQuads[o.particleQuad];
+    if (quad.atlas_scale <= 0) o.pos = float4(2, 2, 0, 1);
+    else {
+        float2 screen = (o.pos.xy / o.pos.w * float2(.5, -.5) + .5) * particleTarget.xy;
+        float2 origin = float2(quad.atlas_xy & 65535u, quad.atlas_xy >> 16);
+        float2 screenOrigin = float2(quad.screen_xy & 65535u, quad.screen_xy >> 16);
+        float2 atlas = origin + 2 + (screen - screenOrigin) * quad.atlas_scale;
+        o.pos.xy = (atlas / particleAtlasTarget.xy * float2(2, -2) + float2(-1, 1)) * o.pos.w;
+    }
+)";
+    finish += "    return o;";
+    if (!ReplaceOne(s, "    return o;", finish)) return {};
     return s;
 }
 
 inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples, uint32_t blend = 0,
-                                             int alphaFunction = -1) {
+                                             int alphaFunction = -1, uint32_t pass = 0) {
     using namespace particle_dof_detail;
     if ((samples != 1 && samples != 2 && samples != 4 && samples != 8) || blend > 1 ||
-        alphaFunction < -1 || alphaFunction > 7) return {};
+        alphaFunction < -1 || alphaFunction > 7 || pass > 2) return {};
     if (!Common(s)) return {};
     // Unused native stages can retain stale 2D/cube/shadow bindings. Remove their declarations
     // to make room for the exact MSAA bounds at t2 and original-sample depth copy at t3.
-    for (int stage : {2, 3}) {
+    for (int stage = pass == 2 ? 1 : 2; stage < 4; ++stage) {
         const auto declaration = " tex" + std::to_string(stage) + " : register(t" + std::to_string(stage) + ");";
         auto at = s.find(declaration);
         if (at == std::string::npos) return {};
@@ -136,6 +149,8 @@ bool ParticleNativeAlphaPass(float a) {
     s += "float4 ParticleNativeTap(VOut i, bool front, float2 uvDx, float2 uvDy)" + tap;
     s += "\n#define PARTICLE_DOF_SAMPLES " + std::to_string(samples) + "\n";
     s += "#define PARTICLE_DOF_BLEND " + std::to_string(blend) + "\n";
+    s += "#define PARTICLE_DOF_PASS " + std::to_string(pass) + "\n";
+    s += kParticleDofDiskHlsl;
     s += kParticleDofHlsl;
     return s;
 }

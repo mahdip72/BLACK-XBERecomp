@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 
 namespace gpu {
 
@@ -24,32 +25,17 @@ float2 range_ps(float4 pos : SV_Position) : SV_Target {
 }
 )";
 
-// Appended to the existing b1 layout only by the verified native-particle shader wrapper. The wrapper
-// declares ParticleDofQuad { float4 uv_bounds; uint4 argb; } before the common constant buffer.
-inline constexpr char kParticleDofCbufferFields[] = R"(
-    float4 particleOptics;
-    float4 particleViewport;
-    float4 particleTarget;
-    ParticleDofQuad particleQuads[1024];
+inline constexpr char kParticleDofQuadHlsl[] = R"(
+struct ParticleDofQuad {
+    float4 uv_bounds; uint4 argb;
+    uint atlas_xy; uint screen_xy; uint atlas_size; float atlas_scale;
+};
 )";
 
-// Wrapper contract: ParticleNativeExact preserves the complete original PS; ParticleNativeTap evaluates
-// it with explicit original UV gradients and returns transparent for an alpha-test failure (no discard).
-// Both take VOut and front-facing state. The VS passes a flat particleQuad and particleViewZ=1/input.z.
-inline constexpr char kParticleDofHlsl[] = R"(
+inline constexpr char kParticleDofDiskHlsl[] = R"(
+#ifndef PARTICLE_DOF_TAPS
 #define PARTICLE_DOF_TAPS 64
-#ifndef PARTICLE_DOF_BLEND
-#define PARTICLE_DOF_BLEND 0
 #endif
-#if PARTICLE_DOF_SAMPLES > 1
-Texture2DMS<float> particleSceneDepth : register(t3);
-// Exact R32 min/max of every sample in the current R24 depth snapshot. Never a resolved/half-float depth.
-Texture2D<float2> particleDepthBounds : register(t2);
-#else
-Texture2D<float> particleSceneDepth : register(t3);
-#endif
-
-bool ParticleFinite(float x) { return (asuint(x) & 0x7f800000u) != 0x7f800000u; }
 // The original 64-tap golden-angle disk, evaluated in float32 once instead of sin/cos/sqrt per fragment.
 // Float32 transcendental implementations can differ by a few ulps; sample count, radii and weights match.
 static const float2 particleDisk[PARTICLE_DOF_TAPS] = {
@@ -118,6 +104,37 @@ static const float2 particleDisk[PARTICLE_DOF_TAPS] = {
     float2(-0.410102487, -0.899098635),
     float2(0.916978121, 0.389022589)
 };
+)";
+
+// Appended to the existing b1 layout only by the verified native-particle shader wrapper. The wrapper
+// declares ParticleDofQuad { float4 uv_bounds; uint4 argb; } before the common constant buffer.
+inline constexpr char kParticleDofCbufferFields[] = R"(
+    float4 particleOptics;
+    float4 particleViewport;
+    float4 particleTarget;
+    float4 particleAtlasTarget;
+    ParticleDofQuad particleQuads[1024];
+)";
+
+// Wrapper contract: ParticleNativeExact preserves the complete original PS; ParticleNativeTap evaluates
+// it with explicit original UV gradients and returns transparent for an alpha-test failure (no discard).
+// Both take VOut and front-facing state. The VS passes a flat particleQuad and particleViewZ=1/input.z.
+inline constexpr char kParticleDofHlsl[] = R"(
+#ifndef PARTICLE_DOF_PASS
+#define PARTICLE_DOF_PASS 0
+#endif
+#ifndef PARTICLE_DOF_BLEND
+#define PARTICLE_DOF_BLEND 0
+#endif
+#if PARTICLE_DOF_SAMPLES > 1
+Texture2DMS<float> particleSceneDepth : register(t3);
+// Exact R32 min/max of every sample in the current R24 depth snapshot. Never a resolved/half-float depth.
+Texture2D<float2> particleDepthBounds : register(t2);
+#else
+Texture2D<float> particleSceneDepth : register(t3);
+#endif
+
+bool ParticleFinite(float x) { return (asuint(x) & 0x7f800000u) != 0x7f800000u; }
 float ParticleRadius(float z) {
     float d = z - particleOptics.x;
     float c = min(max(abs(d) - particleOptics.x * .15, 0) / z, 1);
@@ -162,7 +179,7 @@ float ParticleVisible(float2 sourcePixel, float particleDepth, float2 low, float
     }
     return visible / PARTICLE_DOF_SAMPLES;
 }
-float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
+float4 ParticleLegacy(VOut i, bool front) {
     // Derivatives precede divergent branches. Native tc0.w is constant on the accepted affine quads.
     float2 uv = i.tc0.xy / i.tc0.w;
     float2 uvDx = ddx(uv), uvDy = ddy(uv);
@@ -219,6 +236,135 @@ float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
     // Zero alpha carries zero RGB, including expanded support with no surviving source contribution.
     return sum.a > 0 ? float4(sum.rgb / sum.a, sum.a / PARTICLE_DOF_TAPS) : float4(0, 0, 0, 0);
 #endif
+}
+
+float2 ParticleUnpack(uint packed) { return float2(packed & 65535u, packed >> 16); }
+
+#if PARTICLE_DOF_PASS == 1
+float4 ParticleAtlasSourceTap(VOut i, bool front, ParticleDofQuad quad,
+                              float2 uv, float2 uvDx, float2 uvDy, float2 screen) {
+    float2 extent = quad.uv_bounds.zw - quad.uv_bounds.xy;
+    if (any(extent == 0)) return 0;
+    float2 local = (uv - quad.uv_bounds.xy) / extent;
+    if (any(local < 0) || any(local > 1)) return 0;
+    float visible = ParticleVisible(screen, i.pos.z, max(particleViewport.xy, 0),
+        min(particleViewport.xy + particleViewport.zw, particleTarget.xy), particleTarget.w > .5);
+    if (visible == 0) return 0;
+    i.pos.xy = screen;
+    i.tc0.xy = uv * i.tc0.w;
+    i.d0 = ParticleDiffuse(quad.argb, local);
+    float4 color = ParticleNativeTap(i, front, uvDx, uvDy);
+    if (any((asuint(color) & 0x7f800000u) == 0x7f800000u)) return 0;
+    float alpha = saturate(color.a);
+    float4 contribution = float4(color.rgb * alpha, alpha) * visible;
+#if PARTICLE_DOF_BLEND == 1
+    contribution.a *= alpha;
+#endif
+    return contribution;
+}
+
+float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
+    // Atlas derivatives are coarser than native screen derivatives when the source is reduced.
+    float2 uv = i.tc0.xy / i.tc0.w;
+    float2 atlasDx = ddx(uv), atlasDy = ddy(uv);
+    if (i.particleQuad >= 1024 || i.particleQuad >= (uint)particleTarget.z) discard;
+    ParticleDofQuad quad = particleQuads[i.particleQuad];
+    float scale = quad.atlas_scale;
+    if ((scale != 1 && scale != .5) || !ParticleFinite(i.particleViewZ) || i.particleViewZ <= 0) discard;
+    float2 origin = ParticleUnpack(quad.atlas_xy), size = ParticleUnpack(quad.atlas_size);
+    // A clipped screen rectangle can leave the original projected quad outside its allocated cell.
+    // Discard there; writing transparent would overwrite a neighboring particle's source image.
+    if (any(i.pos.xy < origin + 2) || any(i.pos.xy >= origin + size - 2)) discard;
+    float2 screen = ParticleUnpack(quad.screen_xy) + (i.pos.xy - origin - 2) / scale;
+    float2 uvDx = atlasDx * scale, uvDy = atlasDy * scale;
+    if (scale == 1) return ParticleAtlasSourceTap(i, front, quad, uv, uvDx, uvDy, screen);
+    float4 sum = 0;
+    [unroll] for (int y = 0; y < 2; ++y) {
+        [unroll] for (int x = 0; x < 2; ++x) {
+            float2 offset = float2(x, y) - .5;
+            sum += ParticleAtlasSourceTap(i, front, quad, uv + uvDx * offset.x + uvDy * offset.y,
+                uvDx, uvDy, screen + offset);
+        }
+    }
+    // Four actual native pixel centers, each individually clipped and depth-tested. Missing contributors
+    // keep their area, including odd-width/height cells and viewport edges.
+    return sum * .25;
+}
+#elif PARTICLE_DOF_PASS == 2
+Texture2D<float4> particleFilteredAtlas : register(t1);
+float4 ParticleAtlasLoad(int2 p, int2 low, int2 high) {
+    return all(p >= low) && all(p < high) ? particleFilteredAtlas.Load(int3(p, 0)) : 0;
+}
+float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
+    if (i.particleQuad >= 1024 || i.particleQuad >= (uint)particleTarget.z)
+        return ParticleLegacy(i, front);
+    ParticleDofQuad quad = particleQuads[i.particleQuad];
+    if (quad.atlas_scale != 1 && quad.atlas_scale != .5) return ParticleLegacy(i, front);
+    int2 origin = int2(ParticleUnpack(quad.atlas_xy));
+    int2 high = origin + int2(ParticleUnpack(quad.atlas_size));
+    float2 atlas = origin + 2 + (i.pos.xy - ParticleUnpack(quad.screen_xy)) * quad.atlas_scale - .5;
+    int2 p = int2(floor(atlas));
+    float2 f = frac(atlas);
+    // Interpolate premultiplied energy/coverage, not straight color; every contributor is cell-bounded.
+    float4 value = lerp(lerp(ParticleAtlasLoad(p, origin, high),
+                              ParticleAtlasLoad(p + int2(1, 0), origin, high), f.x),
+                        lerp(ParticleAtlasLoad(p + int2(0, 1), origin, high),
+                              ParticleAtlasLoad(p + int2(1, 1), origin, high), f.x), f.y);
+#if PARTICLE_DOF_BLEND == 1
+    float alpha = sqrt(max(value.a, 0));
+#else
+    float alpha = max(value.a, 0);
+#endif
+    return alpha > 0 ? float4(value.rgb / alpha, alpha) : 0;
+}
+#else
+float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target { return ParticleLegacy(i, front); }
+#endif
+)";
+
+// Filter-only b0 is independent of the native vertex constants. Each packed float4 contains four radii
+// already scaled into atlas pixels. b1 keeps the production DrawConstants prefix and shared metadata ABI.
+inline const std::string kParticleDofAtlasFilterHlsl = std::string(kParticleDofQuadHlsl) + R"(
+cbuffer ParticleAtlasRadii : register(b0) { float4 particleRadii[256]; };
+cbuffer ParticleAtlasDraw : register(b1) { float4 drawPadding[130];
+)" + kParticleDofCbufferFields + R"(
+};
+)" + kParticleDofDiskHlsl + R"(
+Texture2D<float4> particleSourceAtlas : register(t0);
+SamplerState particleAtlasSampler : register(s0);
+struct AtlasOut { float4 pos : SV_Position; nointerpolation uint quad : TEXCOORD0; };
+float2 AtlasUnpack(uint packed) { return float2(packed & 65535u, packed >> 16); }
+AtlasOut vs(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID) {
+    AtlasOut o;
+    o.quad = (uint)particleAtlasTarget.z + instanceId;
+    o.pos = float4(2, 2, 0, 1);
+    if (instanceId >= (uint)particleAtlasTarget.w || o.quad >= 1024 ||
+        o.quad >= (uint)particleTarget.z) return o;
+    ParticleDofQuad quad = particleQuads[o.quad];
+    if (quad.atlas_scale <= 0) return o;
+    const float2 corners[6] = {float2(0, 0), float2(0, 1), float2(1, 1),
+                              float2(0, 0), float2(1, 1), float2(1, 0)};
+    float2 pixel = AtlasUnpack(quad.atlas_xy) + corners[vertexId % 6] * AtlasUnpack(quad.atlas_size);
+    o.pos.xy = pixel / particleAtlasTarget.xy * float2(2, -2) + float2(-1, 1);
+    return o;
+}
+float4 filter_ps(AtlasOut i) : SV_Target {
+    ParticleDofQuad quad = particleQuads[i.quad];
+    float2 low = AtlasUnpack(quad.atlas_xy), high = low + AtlasUnpack(quad.atlas_size);
+    // Write the entire allocated cell, including transparent guards; no separate filtered-atlas clear.
+    if (any(i.pos.xy < low + 2) || any(i.pos.xy >= high - 2)) return 0;
+    float radius = particleRadii[i.quad / 4][i.quad % 4];
+    if ((asuint(radius) & 0x7f800000u) == 0x7f800000u || radius < 0) return 0;
+    float4 sum = 0;
+    [loop] for (int tap = 0; tap < PARTICLE_DOF_TAPS; ++tap) {
+        float2 source = i.pos.xy + particleDisk[tap] * radius;
+        if (any(source < low) || any(source >= high)) continue;
+        // Cell guards are zero. Clamp the complete bilinear footprint to this cell, so a tap immediately
+        // inside its outer edge cannot read an adjacent particle even though the atlas sampler is global.
+        source = clamp(source, low + .5, high - .5);
+        sum += particleSourceAtlas.SampleLevel(particleAtlasSampler, source / particleAtlasTarget.xy, 0);
+    }
+    return sum / PARTICLE_DOF_TAPS;
 }
 )";
 

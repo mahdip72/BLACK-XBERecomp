@@ -1,5 +1,5 @@
-// Offscreen D3D12 timestamp benchmark of the frozen a5777a9 smoke shader and the
-// optimized production shader. This executable deliberately requires hardware D3D12.
+// Offscreen D3D12 timestamp benchmark of native, frozen v25d4110, and atlas smoke.
+// This executable deliberately requires hardware D3D12.
 // The WARP correctness executable remains software-only and is run separately.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -20,25 +20,26 @@
 #include <vector>
 
 #include "d3d/particle_dof.h"
+#include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "gpu/shaders.h"
-namespace smoke_reference {
+namespace smoke_v25 {
 namespace gpu {
 using ::gpu::PixelKey;
 using ::gpu::TexInfo;
 using ::gpu::kTex2D;
 using ::gpu::kTexWide;
 }
-#include "reference/particle_dof_shader.h"
-#define ParticleDofNativePixelKey A5777a9ParticleDofNativePixelKey
-#include "reference/particle_dof_wrapper.h"
+#include "reference/v25d4110/particle_dof_shader.h"
+#define ParticleDofNativePixelKey V25ParticleDofNativePixelKey
+#include "reference/v25d4110/particle_dof_wrapper.h"
 #undef ParticleDofNativePixelKey
 }
 using Microsoft::WRL::ComPtr;
 
 namespace {
-constexpr uint32_t W = 1280, H = 720, Samples = 8, Quads = 12, Batches = 4;
+constexpr uint32_t W = 1280, H = 720, Samples = 8, Quads = 12, Batches = 4, AtlasExtent = 2048;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
 void Hr(HRESULT value, const char* what) {
     if (FAILED(value)) {
@@ -79,7 +80,9 @@ D3D12_RESOURCE_DESC TextureDesc(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; d.Flags = flags;
     return d;
 }
-struct Intervals { double copy = 0, range = 0, draw = 0, total = 0; };
+enum class Mode { Native, V25, Atlas };
+struct Intervals { double copy = 0, range = 0, prepare = 0, filter = 0,
+                   composite = 0, total = 0; };
 struct Result { Intervals ms; std::vector<uint16_t> rgba; };
 
 class Bench {
@@ -124,8 +127,8 @@ public:
     }
     ~Bench() { if (event_) CloseHandle(event_); }
 
-    Result Run(bool old) {
-        // All resources, upload buffers and PSOs exist before the first timestamp.
+    Result Run(Mode mode) {
+        // Resource creation, uploads and PSO creation are deliberately outside GPU timestamps.
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         Hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -133,58 +136,83 @@ public:
         Hr(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(),
                                       nullptr, IID_PPV_ARGS(&list)), "Create list");
         auto depth = MakeTexture(TextureDesc(DXGI_FORMAT_R24G8_TYPELESS,
-            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, Samples),
-            D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, Samples), D3D12_RESOURCE_STATE_DEPTH_WRITE);
         auto snapshot = MakeTexture(TextureDesc(DXGI_FORMAT_R24G8_TYPELESS,
-            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, Samples),
-            D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, Samples), D3D12_RESOURCE_STATE_COPY_DEST);
         auto range = MakeTexture(TextureDesc(DXGI_FORMAT_R32G32_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
         auto target = MakeTexture(TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
-        auto descriptors = MakeDescriptors(snapshot.Get(), range.Get(), target.Get());
+        ComPtr<ID3D12Resource> source_atlas, filtered_atlas;
+        if (mode == Mode::Atlas) {
+            const auto desc = TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 1, AtlasExtent, AtlasExtent);
+            source_atlas = MakeTexture(desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            filtered_atlas = MakeTexture(desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+        auto descriptors = MakeDescriptors(snapshot.Get(), range.Get(), target.Get(),
+                                            source_atlas.Get(), filtered_atlas.Get());
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
         dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
         device_->CreateDepthStencilView(depth.Get(), &dsv_desc, descriptors.dsv);
         list->ClearDepthStencilView(descriptors.dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
-        auto depth_barrier = Barrier(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->ResourceBarrier(1, &depth_barrier);
+        const float clear[] = {.02f,.03f,.05f,.1f};
+        list->ClearRenderTargetView(descriptors.target_rtv, clear, 0, nullptr);
 
         D3D12_QUERY_HEAP_DESC qh{};
-        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qh.Count = 2*(2+Batches*2)+2;
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = UINT(2 + 2 * (2 + Batches * std::max<size_t>(1, pages_.size()) * 3));
         ComPtr<ID3D12QueryHeap> queries;
         Hr(device_->CreateQueryHeap(&qh, IID_PPV_ARGS(&queries)), "Create timestamp heap");
         const auto timing = MakeBuffer(qh.Count*sizeof(uint64_t), D3D12_HEAP_TYPE_READBACK,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
         UINT ticks = 0;
-        auto stamp = [&] { list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ticks++); };
-        std::vector<std::pair<UINT,UINT>> copies, ranges, draws;
+        auto stamp = [&] {
+            Require(ticks < qh.Count, "Timestamp query capacity exceeded");
+            list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, ticks++);
+        };
+        std::vector<std::pair<UINT,UINT>> copies, ranges, prepares, filters, composites;
         auto timed = [&](auto& bucket, auto&& operation) {
             const UINT first = ticks; stamp(); operation(); stamp();
             bucket.emplace_back(first, ticks-1);
         };
-        const UINT all_start = ticks; stamp();
-        auto copy = [&] {
-            list->CopyResource(snapshot.Get(), depth.Get());
-            auto b = Barrier(snapshot.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            list->ResourceBarrier(1, &b);
-        };
-        timed(copies, copy);
         auto heap = descriptors.srv_heap.Get();
         list->SetDescriptorHeaps(1, &heap);
         list->SetGraphicsRootSignature(root_.Get());
-        list->SetGraphicsRootDescriptorTable(0, descriptors.srv_heap->GetGPUDescriptorHandleForHeapStart());
+        list->SetGraphicsRootDescriptorTable(0, descriptors.native_srv);
         list->SetGraphicsRootConstantBufferView(1, vcb_->GetGPUVirtualAddress());
-        list->SetGraphicsRootConstantBufferView(2, dcb_->GetGPUVirtualAddress());
+        list->SetGraphicsRootConstantBufferView(2, old_dcb_->GetGPUVirtualAddress());
         const D3D12_VIEWPORT viewport{0,0,float(W),float(H),0,1};
         const D3D12_RECT scissor{0,0,LONG(W),LONG(H)};
+        const D3D12_VIEWPORT atlas_viewport{0,0,float(AtlasExtent),float(AtlasExtent),0,1};
+        const D3D12_RECT atlas_scissor{0,0,LONG(AtlasExtent),LONG(AtlasExtent)};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scissor);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        if (!old) {
+        const D3D12_VERTEX_BUFFER_VIEW vbv{
+            (mode == Mode::Native ? native_vb_ : vb_)->GetGPUVirtualAddress(),
+            UINT(sizeof(gpu::NativeParticleVertex)*expanded_.size()), sizeof(gpu::NativeParticleVertex)};
+        const D3D12_INDEX_BUFFER_VIEW ibv{ib_->GetGPUVirtualAddress(),
+            UINT(sizeof(uint16_t)*indices_.size()), DXGI_FORMAT_R16_UINT};
+        list->IASetVertexBuffers(0, 1, &vbv);
+        list->IASetIndexBuffer(&ibv);
+
+        const UINT all_start = ticks; stamp();
+        if (mode != Mode::Native) {
+            // v25d4110 already caches opaque depth: BOTH DoF modes use exactly one copy and range pass.
+            timed(copies, [&] {
+                const auto before = Barrier(depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &before);
+                list->CopyResource(snapshot.Get(), depth.Get());
+                const D3D12_RESOURCE_BARRIER after[]{
+                    Barrier(snapshot.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                    Barrier(depth.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_DEPTH_WRITE)};
+                list->ResourceBarrier(2, after);
+            });
             timed(ranges, [&] {
                 list->SetPipelineState(range_pso_.Get());
                 list->OMSetRenderTargets(1, &descriptors.range_rtv, FALSE, nullptr);
@@ -194,28 +222,64 @@ public:
                 list->ResourceBarrier(1, &b);
             });
         }
-        const float clear[] = {.02f,.03f,.05f,.1f};
-        list->ClearRenderTargetView(descriptors.target_rtv, clear, 0, nullptr);
-        const D3D12_VERTEX_BUFFER_VIEW vbv{vb_->GetGPUVirtualAddress(),
-            UINT(sizeof(gpu::NativeParticleVertex)*expanded_.size()),
-            sizeof(gpu::NativeParticleVertex)};
-        const D3D12_INDEX_BUFFER_VIEW ibv{ib_->GetGPUVirtualAddress(),
-            UINT(sizeof(uint16_t)*indices_.size()), DXGI_FORMAT_R16_UINT};
-        list->IASetVertexBuffers(0,1,&vbv); list->IASetIndexBuffer(&ibv);
+        D3D12_RESOURCE_STATES source_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        D3D12_RESOURCE_STATES filtered_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES& state,
+                              D3D12_RESOURCE_STATES next) {
+            if (state == next) return;
+            const auto barrier = Barrier(resource, state, next);
+            list->ResourceBarrier(1, &barrier); state = next;
+        };
         for (uint32_t batch = 0; batch < Batches; ++batch) {
-            if (old && batch) {
-                timed(copies, [&] {
-                    auto b = Barrier(snapshot.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                     D3D12_RESOURCE_STATE_COPY_DEST);
-                    list->ResourceBarrier(1, &b);
-                    copy();
+            if (mode != Mode::Atlas) {
+                timed(composites, [&] {
+                    list->SetPipelineState(mode == Mode::Native ? native_pso_.Get() : old_pso_.Get());
+                    list->OMSetRenderTargets(1, &descriptors.target_rtv, FALSE, nullptr);
+                    list->DrawIndexedInstanced(UINT(indices_.size()), 1, 0, 0, 0);
+                });
+                continue;
+            }
+            for (size_t page_index = 0; page_index < pages_.size(); ++page_index) {
+                const auto page = pages_[page_index];
+                const auto page_cb = page_dcbs_[page_index]->GetGPUVirtualAddress();
+                timed(prepares, [&] {
+                    transition(source_atlas.Get(), source_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    const float zero[4]{};
+                    // Production clears only allocated cells. The filtered pass writes every cell itself.
+                    const auto& rectangles = page_rects_[page_index];
+                    list->ClearRenderTargetView(descriptors.source_rtv, zero, UINT(rectangles.size()),
+                                                rectangles.data());
+                    list->RSSetViewports(1, &atlas_viewport);
+                    list->RSSetScissorRects(1, &atlas_scissor);
+                    list->SetGraphicsRootDescriptorTable(0, descriptors.native_srv);
+                    list->SetGraphicsRootConstantBufferView(1, vcb_->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(2, page_cb);
+                    list->SetPipelineState(source_pso_.Get());
+                    list->OMSetRenderTargets(1, &descriptors.source_rtv, FALSE, nullptr);
+                    list->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
+                    transition(source_atlas.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                });
+                timed(filters, [&] {
+                    transition(filtered_atlas.Get(), filtered_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->SetGraphicsRootDescriptorTable(0, descriptors.filter_srv);
+                    list->SetGraphicsRootConstantBufferView(1, radii_cb_->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(2, page_cb);
+                    list->SetPipelineState(filter_pso_.Get());
+                    list->OMSetRenderTargets(1, &descriptors.filtered_rtv, FALSE, nullptr);
+                    list->DrawInstanced(6, page.quad_count, 0, 0);
+                    transition(filtered_atlas.Get(), filtered_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                });
+                timed(composites, [&] {
+                    list->RSSetViewports(1, &viewport);
+                    list->RSSetScissorRects(1, &scissor);
+                    list->SetGraphicsRootDescriptorTable(0, descriptors.composite_srv);
+                    list->SetGraphicsRootConstantBufferView(1, vcb_->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(2, page_cb);
+                    list->SetPipelineState(composite_pso_.Get());
+                    list->OMSetRenderTargets(1, &descriptors.target_rtv, FALSE, nullptr);
+                    list->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
                 });
             }
-            timed(draws, [&] {
-                list->SetPipelineState(old ? old_pso_.Get() : new_pso_.Get());
-                list->OMSetRenderTargets(1,&descriptors.target_rtv,FALSE,nullptr);
-                list->DrawIndexedInstanced(UINT(indices_.size()),1,0,0,0);
-            });
         }
         const UINT all_end = ticks; stamp();
         list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,0,ticks,
@@ -229,12 +293,12 @@ public:
         device_->GetCopyableFootprints(&desc,0,1,0,&fp,&rows,&row_bytes,&total);
         auto pixels = MakeBuffer(total,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION src{},dst{};
-        src.pResource=target.Get(); src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.pResource=pixels.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.pResource=target.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=pixels.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint=fp;
         list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
         Hr(list->Close(),"Close benchmark list");
-        ID3D12CommandList* lists[]{list.Get()}; queue_->ExecuteCommandLists(1,lists);
+        ID3D12CommandList* lists[]{list.Get()};queue_->ExecuteCommandLists(1,lists);
         const UINT64 fence_value=++fence_value_;
         Hr(queue_->Signal(fence_.Get(),fence_value),"Signal benchmark fence");
         if (fence_->GetCompletedValue()<fence_value) {
@@ -246,12 +310,16 @@ public:
         uint64_t* t=nullptr;
         const D3D12_RANGE tr{0,ticks*sizeof(uint64_t)};
         Hr(timing->Map(0,&tr,reinterpret_cast<void**>(&t)),"Map timestamp readback");
-        auto duration = [&](UINT a,UINT b) { return 1000.0*double(t[b]-t[a])/frequency_; };
-        for (auto [a,b]:copies) result.ms.copy += duration(a,b);
-        for (auto [a,b]:ranges) result.ms.range += duration(a,b);
-        for (auto [a,b]:draws) result.ms.draw += duration(a,b);
-        result.ms.total=duration(all_start,all_end);
-        const D3D12_RANGE no_write{0,0}; timing->Unmap(0,&no_write);
+        auto collect = [&](const auto& intervals) {
+            double ms = 0;
+            for (auto [a,b]:intervals) ms += 1000.0*double(t[b]-t[a])/frequency_;
+            return ms;
+        };
+        result.ms.copy=collect(copies); result.ms.range=collect(ranges);
+        result.ms.prepare=collect(prepares); result.ms.filter=collect(filters);
+        result.ms.composite=collect(composites);
+        result.ms.total=1000.0*double(t[all_end]-t[all_start])/frequency_;
+        const D3D12_RANGE no_write{0,0};timing->Unmap(0,&no_write);
         uint8_t* pixel_bytes=nullptr;
         const D3D12_RANGE pr{0,SIZE_T(fp.Footprint.RowPitch)*(H-1)+W*8};
         Hr(pixels->Map(0,&pr,reinterpret_cast<void**>(&pixel_bytes)),"Map RGBA readback");
@@ -266,7 +334,8 @@ public:
 private:
     struct Descriptors {
         ComPtr<ID3D12DescriptorHeap> srv_heap,rtv_heap,dsv_heap;
-        D3D12_CPU_DESCRIPTOR_HANDLE range_rtv{},target_rtv{},dsv{};
+        D3D12_CPU_DESCRIPTOR_HANDLE range_rtv{},target_rtv{},source_rtv{},filtered_rtv{},dsv{};
+        D3D12_GPU_DESCRIPTOR_HANDLE native_srv{},filter_srv{},composite_srv{};
     };
     ComPtr<ID3D12Resource> MakeBuffer(UINT64 bytes,D3D12_HEAP_TYPE type,
                                       D3D12_RESOURCE_STATES state) {
@@ -324,7 +393,8 @@ private:
         Hr(device_->CreateRootSignature(0,serialized->GetBufferPointer(),
             serialized->GetBufferSize(),IID_PPV_ARGS(&root_)),"Create benchmark root");
     }
-    ComPtr<ID3D12PipelineState> Pipeline(ID3DBlob* vs,ID3DBlob* ps,bool range) {
+    ComPtr<ID3D12PipelineState> Pipeline(ID3DBlob* vs,ID3DBlob* ps,
+                                        DXGI_FORMAT format,bool blend,bool vertices) {
         D3D12_INPUT_ELEMENT_DESC attrs[]{
             {"ATTR",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
             {"ATTR",3,DXGI_FORMAT_B8G8R8A8_UNORM,0,16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
@@ -333,7 +403,7 @@ private:
         p.pRootSignature=root_.Get();
         p.VS={vs->GetBufferPointer(),vs->GetBufferSize()};
         p.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
-        if (!range) p.InputLayout={attrs,3};
+        if (vertices) p.InputLayout={attrs,3};
         p.SampleMask=UINT_MAX;
         p.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;
         p.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
@@ -341,10 +411,10 @@ private:
         p.DepthStencilState.DepthEnable=FALSE;
         p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         p.NumRenderTargets=1;
-        p.RTVFormats[0]=range?DXGI_FORMAT_R32G32_FLOAT:DXGI_FORMAT_R16G16B16A16_FLOAT;
+        p.RTVFormats[0]=format;
         p.SampleDesc.Count=1;
         p.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
-        if (!range) {
+        if (blend) {
             auto& b=p.BlendState.RenderTarget[0];
             b.BlendEnable=TRUE;
             b.SrcBlend=b.SrcBlendAlpha=D3D12_BLEND_SRC_ALPHA;
@@ -360,19 +430,28 @@ private:
                                              gpu::kParticleDofNativeProgram.end());
         const auto native_vs=gpu::VertexProgramHlsl(program,0x209,0);
         const auto native_ps=gpu::PixelHlsl(gpu::ParticleDofNativePixelKey(gpu::TexInfo{gpu::kTex2D}));
-        const auto vs=Compile(gpu::MakeParticleDofVertexShader(native_vs),"main","vs_5_0");
-        const auto old_vs=Compile(smoke_reference::gpu::MakeParticleDofVertexShader(native_vs),
+        const auto native_vertex=Compile(native_vs,"main","vs_5_0");
+        const auto native_pixel=Compile(native_ps,"main","ps_5_0");
+        const auto source_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs,1),"main","vs_5_0");
+        const auto source_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1),"main","ps_5_0");
+        const auto composite_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs,2),"main","vs_5_0");
+        const auto composite_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,2),"main","ps_5_0");
+        const auto old_vs=Compile(smoke_v25::gpu::MakeParticleDofVertexShader(native_vs),
                                   "main","vs_5_0");
-        const auto ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7),"main","ps_5_0");
-        const auto old_ps=Compile(smoke_reference::gpu::MakeParticleDofPixelShader(native_ps,Samples),
+        const auto old_ps=Compile(smoke_v25::gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7),
                                   "main","ps_5_0");
         const auto range_source=std::string("#define PARTICLE_DOF_SAMPLES 8\n")+
                                 gpu::kParticleDofDepthRangeHlsl;
         const auto range_vs=Compile(range_source,"vs","vs_5_0");
         const auto range_ps=Compile(range_source,"range_ps","ps_5_0");
-        new_pso_=Pipeline(vs.Get(),ps.Get(),false);
-        old_pso_=Pipeline(old_vs.Get(),old_ps.Get(),false);
-        range_pso_=Pipeline(range_vs.Get(),range_ps.Get(),true);
+        const auto filter_vs=Compile(gpu::kParticleDofAtlasFilterHlsl,"vs","vs_5_0");
+        const auto filter_ps=Compile(gpu::kParticleDofAtlasFilterHlsl,"filter_ps","ps_5_0");
+        native_pso_=Pipeline(native_vertex.Get(),native_pixel.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
+        old_pso_=Pipeline(old_vs.Get(),old_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
+        source_pso_=Pipeline(source_vs.Get(),source_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,false,true);
+        filter_pso_=Pipeline(filter_vs.Get(),filter_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,false,false);
+        composite_pso_=Pipeline(composite_vs.Get(),composite_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
+        range_pso_=Pipeline(range_vs.Get(),range_ps.Get(),DXGI_FORMAT_R32G32_FLOAT,false,false);
     }
     void MakeFixture() {
         gpu::ParticleDofGeometryParams p{};
@@ -398,23 +477,65 @@ private:
         gpu::ParticleDofGeometryStats stats{};
         Require(gpu::BuildParticleDofGeometry(native,p,expanded_,metadata_,stats) &&
                 stats.active==Quads,"benchmark geometry failed production expansion");
+        native_vb_=Upload(native.data(),native.size()*sizeof(native[0]));
         vb_=Upload(expanded_.data(),expanded_.size()*sizeof(expanded_[0]));
         ib_=Upload(indices_.data(),indices_.size()*sizeof(indices_[0]));
+        pages_=gpu::BuildParticleDofAtlasPages(expanded_,p,metadata_,AtlasExtent,AtlasExtent);
+        Require(!pages_.empty(),"production atlas packer returned no pages");
+        std::array<float,gpu::kParticleDofMaxQuads> radii{};
+        size_t mapped=0; uint64_t atlas_pixels=0;
+        for (size_t q=0;q<metadata_.size();++q) {
+            const auto& m=metadata_[q];
+            if (m.atlas_scale<=0) continue;
+            ++mapped;
+            radii[q]=gpu::ParticleDofRadius(1.0f/expanded_[q*4].position[2],p.globals)*m.atlas_scale;
+            atlas_pixels+=uint64_t(m.atlas_size&65535u)*(m.atlas_size>>16);
+        }
+        Require(mapped==Quads,"benchmark fixture did not map every quad to the production atlas");
+        radii_cb_=Upload(radii.data(),sizeof(radii));
         std::array<std::array<float,4>,192> vc{};
         for (int j=0;j<4;++j) {vc[97][j]=p.c97[j];vc[98][j]=p.c98[j];}
         vcb_=Upload(vc.data(),sizeof(vc));
-        constexpr size_t bytes=sizeof(gpu::DrawConstants)+sizeof(gpu::ParticleDofGlobals)+
-                               gpu::kParticleDofMaxQuads*sizeof(gpu::ParticleDofQuad);
-        std::vector<uint8_t> cb(bytes);
         gpu::DrawConstants dc{};
         dc.surf[0]=float(W);dc.surf[1]=float(H);dc.surf[2]=1;
         dc.misc[1]=7;dc.texsize[0][0]=dc.texsize[0][1]=1;
-        std::memcpy(cb.data(),&dc,sizeof(dc));
-        std::memcpy(cb.data()+sizeof(dc),&p.globals,sizeof(p.globals));
-        std::memcpy(cb.data()+sizeof(dc)+sizeof(p.globals),metadata_.data(),
-                    metadata_.size()*sizeof(metadata_[0]));
-        dcb_=Upload(cb.data(),cb.size());
-        // 1x1 opaque RGBA texture is immutable across both timed modes.
+        // v25d4110 has a 48-byte globals block and 32-byte quad records. Never memcpy the current stride.
+        constexpr size_t old_globals=48, old_quad=32;
+        static_assert(sizeof(gpu::DrawConstants)==2080);
+        static_assert(sizeof(gpu::ParticleDofGlobals)==64 && sizeof(gpu::ParticleDofQuad)==48);
+        std::vector<uint8_t> old_cb(sizeof(dc)+old_globals+gpu::kParticleDofMaxQuads*old_quad);
+        std::memcpy(old_cb.data(),&dc,sizeof(dc));
+        std::memcpy(old_cb.data()+sizeof(dc),&p.globals,old_globals);
+        for (size_t i=0;i<metadata_.size();++i)
+            std::memcpy(old_cb.data()+sizeof(dc)+old_globals+i*old_quad,&metadata_[i],old_quad);
+        old_dcb_=Upload(old_cb.data(),old_cb.size());
+        for (const auto page:pages_) {
+            auto globals=p.globals;
+            globals.atlas_target[0]=globals.atlas_target[1]=float(AtlasExtent);
+            globals.atlas_target[2]=float(page.first_quad);
+            globals.atlas_target[3]=float(page.quad_count);
+            std::vector<uint8_t> cb(sizeof(dc)+sizeof(globals)+
+                                    gpu::kParticleDofMaxQuads*sizeof(gpu::ParticleDofQuad));
+            std::memcpy(cb.data(),&dc,sizeof(dc));
+            std::memcpy(cb.data()+sizeof(dc),&globals,sizeof(globals));
+            std::memcpy(cb.data()+sizeof(dc)+sizeof(globals),metadata_.data(),
+                        metadata_.size()*sizeof(metadata_[0]));
+            page_dcbs_.push_back(Upload(cb.data(),cb.size()));
+            std::vector<D3D12_RECT> rectangles;
+            for (uint32_t q=page.first_quad;q<page.first_quad+page.quad_count;++q) {
+                const auto& m=metadata_[q];
+                if (m.atlas_scale<=0) continue;
+                const LONG x=LONG(m.atlas_xy&65535u),y=LONG(m.atlas_xy>>16);
+                rectangles.push_back({x,y,x+LONG(m.atlas_size&65535u),y+LONG(m.atlas_size>>16)});
+            }
+            Require(!rectangles.empty(),"benchmark page contains no source cells");
+            page_rects_.push_back(std::move(rectangles));
+        }
+        std::printf("Fixture: %u quads, %u batches, %zu production atlas pages at %ux%u; "
+                    "%llu allocated texels/page-set (guards included); R16G16B16A16_FLOAT atlas\n",
+                    Quads,Batches,pages_.size(),AtlasExtent,AtlasExtent,
+                    static_cast<unsigned long long>(atlas_pixels));
+        // 1x1 opaque RGBA texture is immutable across all three timed modes.
         texture_=MakeTexture(TextureDesc(DXGI_FORMAT_R8G8B8A8_UNORM,
             D3D12_RESOURCE_FLAG_NONE,1,1,1),D3D12_RESOURCE_STATE_COPY_DEST);
         std::array<uint8_t,256> texel{};
@@ -440,32 +561,49 @@ private:
         Require(WaitForSingleObject(event_,30000)==WAIT_OBJECT_0,"Texture init timed out");
     }
     Descriptors MakeDescriptors(ID3D12Resource* snapshot,ID3D12Resource* range,
-                                ID3D12Resource* target) {
+                                ID3D12Resource* target,ID3D12Resource* source,
+                                ID3D12Resource* filtered) {
         Descriptors d;
         D3D12_DESCRIPTOR_HEAP_DESC h{};
-        h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;h.NumDescriptors=4;
+        h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;h.NumDescriptors=12;
         h.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.srv_heap)),"SRV heap");
-        auto cpu=d.srv_heap->GetCPUDescriptorHandleForHeapStart();
+        const auto cpu=d.srv_heap->GetCPUDescriptorHandleForHeapStart();
         const UINT step=device_->GetDescriptorHandleIncrementSize(h.Type);
-        D3D12_SHADER_RESOURCE_VIEW_DESC v{};
-        v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
-        v.Texture2D.MipLevels=1;v.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-        device_->CreateShaderResourceView(texture_.Get(),&v,cpu);
-        cpu.ptr+=step;device_->CreateShaderResourceView(nullptr,&v,cpu);
-        cpu.ptr+=step;v.Format=DXGI_FORMAT_R32G32_FLOAT;
-        device_->CreateShaderResourceView(range,&v,cpu);
-        cpu.ptr+=step;v.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-        v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DMS;
-        device_->CreateShaderResourceView(snapshot,&v,cpu);
-        h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;h.NumDescriptors=2;
+        auto at=[&](UINT index) { auto handle=cpu;handle.ptr+=size_t(index)*step;return handle; };
+        auto view2d=[&](UINT index,ID3D12Resource* resource,DXGI_FORMAT format) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Texture2D.MipLevels=1;view.Format=format;
+            device_->CreateShaderResourceView(resource,&view,at(index));
+        };
+        for (UINT table=0;table<3;++table) {
+            const UINT base=table*4;
+            view2d(base,table==1?source:texture_.Get(),
+                   table==1?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM);
+            view2d(base+1,table==2?filtered:nullptr,DXGI_FORMAT_R16G16B16A16_FLOAT);
+            view2d(base+2,table==1?nullptr:range,DXGI_FORMAT_R32G32_FLOAT);
+            D3D12_SHADER_RESOURCE_VIEW_DESC depth{};
+            depth.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            depth.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            depth.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            device_->CreateShaderResourceView(table==1?nullptr:snapshot,&depth,at(base+3));
+        }
+        d.native_srv=d.srv_heap->GetGPUDescriptorHandleForHeapStart();
+        d.filter_srv=d.native_srv;d.filter_srv.ptr+=4*UINT64(step);
+        d.composite_srv=d.native_srv;d.composite_srv.ptr+=8*UINT64(step);
+        h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;h.NumDescriptors=4;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.rtv_heap)),"RTV heap");
+        const UINT rtv_step=device_->GetDescriptorHandleIncrementSize(h.Type);
         d.range_rtv=d.rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        d.target_rtv=d.range_rtv;
-        d.target_rtv.ptr+=device_->GetDescriptorHandleIncrementSize(h.Type);
+        d.target_rtv=d.range_rtv;d.target_rtv.ptr+=rtv_step;
+        d.source_rtv=d.target_rtv;d.source_rtv.ptr+=rtv_step;
+        d.filtered_rtv=d.source_rtv;d.filtered_rtv.ptr+=rtv_step;
         device_->CreateRenderTargetView(range,nullptr,d.range_rtv);
         device_->CreateRenderTargetView(target,nullptr,d.target_rtv);
+        if (source) device_->CreateRenderTargetView(source,nullptr,d.source_rtv);
+        if (filtered) device_->CreateRenderTargetView(filtered,nullptr,d.filtered_rtv);
         h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;h.NumDescriptors=1;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.dsv_heap)),"DSV heap");
         d.dsv=d.dsv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -476,8 +614,11 @@ private:
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<ID3D12Fence> fence_;
     ComPtr<ID3D12RootSignature> root_;
-    ComPtr<ID3D12PipelineState> old_pso_,new_pso_,range_pso_;
-    ComPtr<ID3D12Resource> vb_,ib_,vcb_,dcb_,texture_;
+    ComPtr<ID3D12PipelineState> native_pso_,old_pso_,source_pso_,filter_pso_,composite_pso_,range_pso_;
+    ComPtr<ID3D12Resource> native_vb_,vb_,ib_,vcb_,old_dcb_,radii_cb_,texture_;
+    std::vector<ComPtr<ID3D12Resource>> page_dcbs_;
+    std::vector<gpu::ParticleDofAtlasPage> pages_;
+    std::vector<std::vector<D3D12_RECT>> page_rects_;
     std::vector<gpu::NativeParticleVertex> expanded_;
     std::vector<gpu::ParticleDofQuad> metadata_;
     std::vector<uint16_t> indices_;
@@ -497,42 +638,110 @@ float FromHalf(uint16_t bits) {
                           std::ldexp(float(1024u+fraction),int(exponent)-25);
     return bits&0x8000u ? -magnitude : magnitude;
 }
-void Print(const char* name,const std::vector<Result>& runs) {
-    std::vector<double> copy,range,draw,total;
-    for (const auto& r:runs) {
-        copy.push_back(r.ms.copy);range.push_back(r.ms.range);
-        draw.push_back(r.ms.draw);total.push_back(r.ms.total);
-    }
-    std::printf("%s GPU ms med/p90: copy %.3f/%.3f, range %.3f/%.3f, draw %.3f/%.3f, total %.3f/%.3f\n",
-        name,Percentile(copy,.5),Percentile(copy,.9),Percentile(range,.5),Percentile(range,.9),
-        Percentile(draw,.5),Percentile(draw,.9),Percentile(total,.5),Percentile(total,.9));
+double MedianTotal(const std::vector<Result>& runs) {
+    std::vector<double> values;
+    for (const auto& run:runs) values.push_back(run.ms.total);
+    return Percentile(std::move(values),.5);
 }
+void Print(const char* name,const std::vector<Result>& runs) {
+    std::printf("%s GPU ms median/p90:",name);
+    const std::pair<const char*,double Intervals::*> fields[]{
+        {"copy",&Intervals::copy},{"range",&Intervals::range},{"source",&Intervals::prepare},
+        {"filter",&Intervals::filter},{"composite",&Intervals::composite},{"total",&Intervals::total}};
+    for (const auto& [label,member]:fields) {
+        std::vector<double> values;
+        for (const auto& run:runs) values.push_back(run.ms.*member);
+        std::printf(" %s %.3f/%.3f",label,Percentile(values,.5),Percentile(values,.9));
+    }
+    std::puts("");
+}
+struct Difference {
+    float maximum=0;
+    double rms=0,active_rms=0,rgb_energy_percent=0,alpha_energy_percent=0;
+};
+Difference Compare(const Result& reference,const Result& candidate,const char* label) {
+    Require(reference.rgba.size()==candidate.rgba.size(),"RGBA readback sizes differ");
+    constexpr float clear[4]{.02f,.03f,.05f,.1f};
+    double squared=0,active_squared=0,old_energy[4]{},new_energy[4]{};
+    size_t active_pixels=0;
+    Difference difference;
+    for (size_t pixel=0;pixel<reference.rgba.size()/4;++pixel) {
+        double pixel_squared=0;
+        bool active=false;
+        for (size_t channel=0;channel<4;++channel) {
+            const size_t index=pixel*4+channel;
+            const float a=FromHalf(reference.rgba[index]),b=FromHalf(candidate.rgba[index]);
+            Require(std::isfinite(a)&&std::isfinite(b),"benchmark RGBA is nonfinite");
+            const float delta=std::abs(a-b);
+            difference.maximum=std::max(difference.maximum,delta);
+            pixel_squared+=double(delta)*delta;
+            old_energy[channel]+=std::abs(double(a)-clear[channel]);
+            new_energy[channel]+=std::abs(double(b)-clear[channel]);
+            active|=std::abs(a-clear[channel])>1e-4f||std::abs(b-clear[channel])>1e-4f;
+        }
+        squared+=pixel_squared;
+        if (active) { ++active_pixels;active_squared+=pixel_squared; }
+    }
+    difference.rms=std::sqrt(squared/reference.rgba.size());
+    difference.active_rms=active_pixels?std::sqrt(active_squared/(active_pixels*4)):0;
+    const double old_rgb=old_energy[0]+old_energy[1]+old_energy[2];
+    const double new_rgb=new_energy[0]+new_energy[1]+new_energy[2];
+    difference.rgb_energy_percent=100*std::abs(new_rgb-old_rgb)/std::max(old_rgb,1e-12);
+    difference.alpha_energy_percent=100*std::abs(new_energy[3]-old_energy[3])/std::max(old_energy[3],1e-12);
+    std::printf("%s RGBA16F: max %.6f, full RMS %.6f, active RMS %.6f (%zu pixels), "
+                "absolute background-relative RGB/alpha energy delta %.4f%%/%.4f%%\n",
+                label,difference.maximum,difference.rms,difference.active_rms,active_pixels,
+                difference.rgb_energy_percent,difference.alpha_energy_percent);
+    return difference;
+}
+
 } // namespace
 
 int main() {
     try {
+        // Declared before measurement. The atlas deliberately resamples a premultiplied source field;
+        // it is not bit-identical to evaluating the native material independently at every aperture tap.
+        constexpr double max_rms=.01, max_active_rms=.02, max_energy_percent=2.0;
+        constexpr float max_absolute=.15f;
+        std::printf("Atlas/v25 acceptance declared before run: max RGBA <=%.3f, full RMS <=%.3f, "
+                    "active RMS <=%.3f, RGB and alpha background-relative energy delta <=%.1f%%\n",
+                    max_absolute,max_rms,max_active_rms,max_energy_percent);
         Bench bench;
-        bench.Run(true);bench.Run(false); // separate warmups, excluded from metrics
-        std::vector<Result> old,newer;
-        for (bool old_mode:{true,false,false,true,true,false,false,true}) {
-            auto result=bench.Run(old_mode);
-            (old_mode?old:newer).push_back(std::move(result));
+        bench.Run(Mode::Native);bench.Run(Mode::V25);bench.Run(Mode::Atlas);
+        std::vector<Result> native,v25,atlas;
+        // Eight runs per mode, with V25/atlas ABBA pairs and symmetric native measurements.
+        constexpr Mode order[]{Mode::Native,Mode::V25,Mode::Atlas,Mode::Atlas,Mode::V25,Mode::Native,
+                               Mode::Native,Mode::V25,Mode::Atlas,Mode::Atlas,Mode::V25,Mode::Native};
+        for (unsigned round=0;round<2;++round) {
+            for (Mode mode:order) {
+                auto result=bench.Run(mode);
+                auto& bucket=mode==Mode::Native?native:mode==Mode::V25?v25:atlas;
+                bucket.push_back(std::move(result));
+            }
         }
-        Require(old.size()==newer.size(),"ABBA pairing failed");
-        float max_rgba=0;double rms=0;
-        for (size_t i=0;i<old[0].rgba.size();++i) {
-            const float a=FromHalf(old[0].rgba[i]),b=FromHalf(newer[0].rgba[i]);
-            Require(std::isfinite(a)&&std::isfinite(b),"benchmark RGBA is nonfinite");
-            const float delta=std::abs(a-b);
-            max_rgba=std::max(max_rgba,delta);rms+=delta*delta;
-        }
-        rms=std::sqrt(rms/old[0].rgba.size());
-        std::printf("RGBA16F readback old/new: max absolute %.6f, RMS %.6f\n",max_rgba,rms);
-        Require(max_rgba<.02f && rms<.003f,
-                "optimized smoke benchmark changed image materially");
-        Print("old per-batch copy+draw",old);
-        Print("new cached copy+range+draw",newer);
-        std::puts("Hardware timestamp benchmark complete: 1280x720, 8x D24S8, 12 overlapping quads, four unchanged-depth batches; old 4 copies, new 1 copy + 1 range. No game was launched.");
+        Require(native.size()==8&&v25.size()==8&&atlas.size()==8,"three-mode ABBA pairing failed");
+        Print("native",native);
+        Print("v25d4110 cached depth + direct64",v25);
+        Print("atlas cached depth + source + filter64 + composite",atlas);
+        Compare(native.front(),v25.front(),"native/v25 (diagnostic; blur intentionally differs)");
+        const auto difference=Compare(v25.front(),atlas.front(),"v25/atlas");
+        const double native_ms=MedianTotal(native),old_ms=MedianTotal(v25),new_ms=MedianTotal(atlas);
+        std::printf("Total median: native %.3fms, v25 %.3fms, atlas %.3fms; "
+                    "DoF overhead versus native %.3fms -> %.3fms; v25/atlas %.3fx (%.2f%% reduction)\n",
+                    native_ms,old_ms,new_ms,old_ms-native_ms,new_ms-native_ms,
+                    old_ms/std::max(new_ms,1e-9),100*(old_ms-new_ms)/std::max(old_ms,1e-9));
+        Require(difference.maximum<=max_absolute && difference.rms<=max_rms &&
+                difference.active_rms<=max_active_rms &&
+                difference.rgb_energy_percent<=max_energy_percent &&
+                difference.alpha_energy_percent<=max_energy_percent,
+                "atlas image exceeded predeclared approximation gates");
+        std::puts("Hardware timestamp benchmark PASS: 1280x720, 8x D24S8 source depth, 1x color, "
+                  "12 overlapping quads, four unchanged-depth batches. Native: no DoF preparation. "
+                  "Both DoF paths: one depth copy + one range pass; atlas includes every batch/page's "
+                  "source clear/evaluation, 64-tap filter, transitions and composite. "
+                  "Clear depth fixture and constant white texture isolate dense particle cost; destination "
+                  "depth is disabled because color is single-sampled. WARP separately covers occlusion, "
+                  "textured materials, blending and correctness. No game was launched or accessed.");
         return 0;
     } catch(const std::exception& e) {
         std::fprintf(stderr,"smoke GPU benchmark FAILED: %s\n",e.what());

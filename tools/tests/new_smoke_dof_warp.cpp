@@ -22,12 +22,16 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "d3d/particle_dof.h"
+#include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "gpu/shaders.h"
@@ -44,6 +48,18 @@ using ::gpu::kTexWide;
 #include "reference/particle_dof_shader.h"
 #define ParticleDofNativePixelKey A5777a9ParticleDofNativePixelKey
 #include "reference/particle_dof_wrapper.h"
+#undef ParticleDofNativePixelKey
+}
+namespace smoke_v25 {
+namespace gpu {
+using ::gpu::PixelKey;
+using ::gpu::TexInfo;
+using ::gpu::kTex2D;
+using ::gpu::kTexWide;
+}
+#include "reference/v25d4110/particle_dof_shader.h"
+#define ParticleDofNativePixelKey V25ParticleDofNativePixelKey
+#include "reference/v25d4110/particle_dof_wrapper.h"
 #undef ParticleDofNativePixelKey
 }
 
@@ -190,6 +206,12 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile,
                          const char* entry = "main") {
     Check(!source.empty(), "production particle shader wrapper rejected native source");
+    // Render fixtures reuse identical production variants dozens of times. Cache only
+    // the immutable shader blob; every draw still creates its own actual pipeline.
+    using Key=std::tuple<std::string,std::string,std::string>;
+    static std::map<Key,ComPtr<ID3DBlob>> compiled;
+    Key key{source,profile,entry};
+    if (const auto it=compiled.find(key);it!=compiled.end()) return it->second;
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "production particle shader",
                                   nullptr, nullptr, entry, profile,
@@ -198,6 +220,7 @@ ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile,
         std::fprintf(stderr, "%s: %s\n", profile,
                      static_cast<const char*>(errors->GetBufferPointer()));
     Hr(hr, "D3DCompile(production particle shader)");
+    compiled.emplace(std::move(key),code);
     return code;
 }
 
@@ -262,6 +285,20 @@ public:
         reference_ps_[1] = smoke_reference::gpu::MakeParticleDofPixelShader(native_ps_, 2);
         reference_ps_[2] = smoke_reference::gpu::MakeParticleDofPixelShader(native_ps_, 4);
         reference_ps_[3] = smoke_reference::gpu::MakeParticleDofPixelShader(native_ps_, 8);
+        v25_vs_ = smoke_v25::gpu::MakeParticleDofVertexShader(native_vs_);
+        for (uint32_t i=0; i<v25_ps_.size(); ++i) {
+            v25_ps_[i] = smoke_v25::gpu::MakeParticleDofPixelShader(native_ps_,1u<<i,0,7);
+            v25_additive_ps_[i] = smoke_v25::gpu::MakeParticleDofPixelShader(native_ps_,1u<<i,1,7);
+        }
+        atlas_source_vs_ = gpu::MakeParticleDofVertexShader(native_vs_,1);
+        atlas_composite_vs_ = gpu::MakeParticleDofVertexShader(native_vs_,2);
+        for (uint32_t i=0;i<atlas_source_ps_[0].size();++i) {
+            const uint32_t samples=1u<<i;
+            for (uint32_t blend=0;blend<2;++blend) {
+                atlas_source_ps_[blend][i]=gpu::MakeParticleDofPixelShader(native_ps_,samples,blend,7,1);
+                atlas_composite_ps_[blend][i]=gpu::MakeParticleDofPixelShader(native_ps_,samples,blend,7,2);
+            }
+        }
         Compile(native_vs_, "vs_5_0"); Compile(native_ps_, "ps_5_0");
         Compile(wrapped_vs_, "vs_5_0");
         for (const auto& source : wrapped_ps_) Compile(source, "ps_5_0");
@@ -274,6 +311,15 @@ public:
         }
         Compile(reference_vs_, "vs_5_0");
         for (const auto& source : reference_ps_) Compile(source, "ps_5_0");
+        Compile(v25_vs_, "vs_5_0");
+        for (const auto& source : v25_ps_) Compile(source, "ps_5_0");
+        for (const auto& source : v25_additive_ps_) Compile(source, "ps_5_0");
+        Compile(atlas_source_vs_,"vs_5_0");
+        Compile(atlas_composite_vs_,"vs_5_0");
+        for (const auto& modes:atlas_source_ps_) for (const auto& source:modes) Compile(source,"ps_5_0");
+        for (const auto& modes:atlas_composite_ps_) for (const auto& source:modes) Compile(source,"ps_5_0");
+        Compile(gpu::kParticleDofAtlasFilterHlsl,"vs_5_0","vs");
+        Compile(gpu::kParticleDofAtlasFilterHlsl,"ps_5_0","filter_ps");
         auto assembly = [&](const std::string& source) {
             const auto code = Compile(source, "ps_5_0");
             ComPtr<ID3DBlob> disassembled;
@@ -316,9 +362,15 @@ public:
                               uint32_t depth_samples = 1,
                               bool one_sample_occluded = false,
                               bool reference = false,
-                              bool additive = false) {
+                              bool additive = false,
+                              bool v25 = false,
+                              bool atlas = false,
+                              uint32_t atlas_extent = 128) {
         Check(!additive || blend, "additive smoke needs its native blend state");
         Check(!additive || !reference, "the frozen reference predates additive smoke");
+        Check(!reference || !v25, "select only one frozen smoke reference");
+        Check(!atlas || (wrapped && !reference && !v25),
+              "atlas smoke requires the production wrapper");
         Check(scene.width && scene.height && scene.tex_width && scene.tex_height &&
               scene.texture.size() == size_t(scene.tex_width) * scene.tex_height &&
               scene.source_depth.size() == size_t(scene.width) * scene.height &&
@@ -338,6 +390,15 @@ public:
         gpu::ParticleDofGeometryStats stats{};
         if (wrapped) gpu::BuildParticleDofGeometry(scene.vertices, scene.geometry,
                                                    vertices, metadata, stats);
+        const uint32_t kAtlasExtent = atlas_extent;
+        Check(!atlas || (atlas_extent>=16 && atlas_extent<=512),
+              "smoke atlas fixture extent is outside its bounded test range");
+        std::vector<gpu::ParticleDofAtlasPage> pages;
+        if (atlas) {
+            pages = gpu::BuildParticleDofAtlasPages(vertices,scene.geometry,metadata,
+                                                   kAtlasExtent,kAtlasExtent);
+            Check(!pages.empty(),"production atlas allocator dropped the smoke draw");
+        }
         ComPtr<ID3D12Resource> texture = NewTexture(scene.tex_width, scene.tex_height,
                                                     DXGI_FORMAT_R8G8B8A8_UNORM,
                                                     D3D12_RESOURCE_STATE_COPY_DEST);
@@ -355,6 +416,15 @@ public:
                                                    DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        ComPtr<ID3D12Resource> atlas_source,atlas_filtered;
+        if (atlas) {
+            atlas_source = NewTexture(kAtlasExtent,kAtlasExtent,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            atlas_filtered = NewTexture(kAtlasExtent,kAtlasExtent,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        }
         auto tex_upload = UploadTexture(texture.Get(), scene.texture.data(), scene.tex_width * 4);
         auto vb = UploadBuffer(vertices.data(), vertices.size() * sizeof(vertices[0]));
         std::vector<uint16_t> indices;
@@ -372,10 +442,17 @@ public:
         }
         auto vcb = UploadBuffer(vc.data(), sizeof(vc));
         static_assert(sizeof(gpu::DrawConstants) == 2080);
-        constexpr size_t constant_bytes = sizeof(gpu::DrawConstants) +
-            sizeof(gpu::ParticleDofGlobals) +
-            gpu::kParticleDofMaxQuads * sizeof(gpu::ParticleDofQuad);
-        std::vector<uint8_t> constants(constant_bytes);
+        constexpr size_t kLegacyGlobalsBytes = 48;
+        constexpr size_t kLegacyQuadBytes = 32;
+        static_assert(sizeof(gpu::ParticleDofGlobals) >= kLegacyGlobalsBytes &&
+                      sizeof(gpu::ParticleDofQuad) >= kLegacyQuadBytes);
+        const bool old_layout = reference || v25;
+        const size_t globals_bytes = old_layout ? kLegacyGlobalsBytes :
+                                     sizeof(gpu::ParticleDofGlobals);
+        const size_t quad_bytes = old_layout ? kLegacyQuadBytes :
+                                  sizeof(gpu::ParticleDofQuad);
+        std::vector<uint8_t> constants(sizeof(gpu::DrawConstants) + globals_bytes +
+                                       gpu::kParticleDofMaxQuads * quad_bytes);
         gpu::DrawConstants dc{};
         dc.surf[0] = scene.geometry.guest_size[0];
         dc.surf[1] = scene.geometry.guest_size[1];
@@ -387,10 +464,34 @@ public:
         auto globals = scene.geometry.globals;
         globals.target[2] = float(metadata.size());
         std::memcpy(constants.data(), &dc, sizeof(dc));
-        std::memcpy(constants.data() + sizeof(dc), &globals, sizeof(globals));
-        std::memcpy(constants.data() + sizeof(dc) + sizeof(globals), metadata.data(),
-                    metadata.size() * sizeof(metadata[0]));
+        std::memcpy(constants.data() + sizeof(dc), &globals, globals_bytes);
+        for (size_t i=0; i<metadata.size(); ++i)
+            std::memcpy(constants.data() + sizeof(dc) + globals_bytes + i*quad_bytes,
+                        &metadata[i], quad_bytes);
         auto dcb = UploadBuffer(constants.data(), constants.size());
+        ComPtr<ID3D12Resource> radii_cb;
+        std::vector<ComPtr<ID3D12Resource>> atlas_page_cb;
+        if (atlas) {
+            std::array<float,gpu::kParticleDofMaxQuads> radii{};
+            for (size_t q=0;q<metadata.size();++q)
+                if (metadata[q].atlas_scale>0)
+                    radii[q]=gpu::ParticleDofRadius(1.0f/vertices[q*4].position[2],
+                                                   scene.geometry.globals)*metadata[q].atlas_scale;
+            radii_cb=UploadBuffer(radii.data(),sizeof(radii));
+            for (const auto& page:pages) {
+                auto page_globals=globals;
+                page_globals.atlas_target[0]=page_globals.atlas_target[1]=float(kAtlasExtent);
+                page_globals.atlas_target[2]=float(page.first_quad);
+                page_globals.atlas_target[3]=float(page.quad_count);
+                std::vector<uint8_t> bytes(sizeof(dc)+sizeof(page_globals)+
+                    gpu::kParticleDofMaxQuads*sizeof(gpu::ParticleDofQuad));
+                std::memcpy(bytes.data(),&dc,sizeof(dc));
+                std::memcpy(bytes.data()+sizeof(dc),&page_globals,sizeof(page_globals));
+                std::memcpy(bytes.data()+sizeof(dc)+sizeof(page_globals),metadata.data(),
+                            metadata.size()*sizeof(metadata[0]));
+                atlas_page_cb.push_back(UploadBuffer(bytes.data(),bytes.size()));
+            }
+        }
 
         D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{};
         srv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -420,10 +521,41 @@ public:
         view.ViewDimension = depth_samples == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                                   D3D12_SRV_DIMENSION_TEXTURE2DMS;
         device_->CreateShaderResourceView(depth_copy.Get(), &view, cpu);
+        ComPtr<ID3D12DescriptorHeap> atlas_source_srvs,atlas_composite_srvs;
+        if (atlas) {
+            Hr(device_->CreateDescriptorHeap(&srv_heap_desc,IID_PPV_ARGS(&atlas_source_srvs)),
+               "Create source-atlas SRV heap");
+            Hr(device_->CreateDescriptorHeap(&srv_heap_desc,IID_PPV_ARGS(&atlas_composite_srvs)),
+               "Create filtered-atlas SRV heap");
+            // Shader-visible descriptors are CPU-write-only on D3D12. Populate each
+            // heap directly; CopyDescriptorsSimple cannot read from the main heap.
+            auto fill_atlas_heap=[&](ID3D12DescriptorHeap* heap,bool filter) {
+                auto slot=heap->GetCPUDescriptorHandleForHeapStart();
+                D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+                v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                v.Format=filter?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM;
+                v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+                v.Texture2D.MipLevels=1;
+                device_->CreateShaderResourceView(filter?atlas_source.Get():texture.Get(),&v,slot);
+                slot.ptr+=increment;
+                v.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+                device_->CreateShaderResourceView(filter?nullptr:atlas_filtered.Get(),&v,slot);
+                slot.ptr+=increment;
+                v.Format=DXGI_FORMAT_R32G32_FLOAT;
+                device_->CreateShaderResourceView(depth_samples>1?depth_range.Get():nullptr,&v,slot);
+                slot.ptr+=increment;
+                v.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+                v.ViewDimension=depth_samples==1?D3D12_SRV_DIMENSION_TEXTURE2D:
+                                                   D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                device_->CreateShaderResourceView(depth_copy.Get(),&v,slot);
+            };
+            fill_atlas_heap(atlas_source_srvs.Get(),true);
+            fill_atlas_heap(atlas_composite_srvs.Get(),false);
+        }
 
         D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
         rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtv_heap_desc.NumDescriptors = 2;
+        rtv_heap_desc.NumDescriptors = atlas ? 4 : 2;
         ComPtr<ID3D12DescriptorHeap> rtvs;
         Hr(device_->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtvs)), "Create RTV heap");
         const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -432,6 +564,14 @@ public:
         range_rtv.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         if (depth_samples > 1)
             device_->CreateRenderTargetView(depth_range.Get(), nullptr, range_rtv);
+        auto source_rtv=range_rtv,filtered_rtv=range_rtv;
+        if (atlas) {
+            const UINT rtv_step=device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            source_rtv.ptr+=rtv_step;
+            filtered_rtv.ptr+=2*rtv_step;
+            device_->CreateRenderTargetView(atlas_source.Get(),nullptr,source_rtv);
+            device_->CreateRenderTargetView(atlas_filtered.Get(),nullptr,filtered_rtv);
+        }
 
         D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{};
         dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -448,7 +588,8 @@ public:
 
         const uint32_t ps_index = depth_samples == 8 ? 3 : depth_samples == 4 ? 2 :
                                   depth_samples == 2 ? 1 : 0;
-        const auto vs = Compile(wrapped ? (reference ? reference_vs_ : wrapped_vs_) : native_vs_,
+        const auto vs = Compile(wrapped ? (reference ? reference_vs_ :
+                                         v25 ? v25_vs_ : wrapped_vs_) : native_vs_,
                                 "vs_5_0");
         const int alpha_function = int(scene.alpha_function);
         Check(alpha_function >= 0 && alpha_function <= 7 &&
@@ -457,12 +598,34 @@ public:
         const std::string specialized = wrapped && !reference && alpha_function != 7 ?
             gpu::MakeParticleDofPixelShader(native_ps_, depth_samples,
                                             additive ? 1 : 0, alpha_function) : std::string{};
+        const std::string v25_specialized = v25 && alpha_function != 7 ?
+            smoke_v25::gpu::MakeParticleDofPixelShader(native_ps_,depth_samples,
+                                                      additive?1:0,alpha_function) : std::string{};
         const auto ps = Compile(wrapped ? (reference ? reference_ps_[ps_index] :
+                                          v25 ? (alpha_function!=7 ? v25_specialized :
+                                                 additive ? v25_additive_ps_[ps_index] :
+                                                            v25_ps_[ps_index]) :
                                           (alpha_function != 7 ? specialized :
                                            additive ? additive_ps_[ps_index] :
                                                       wrapped_ps_[ps_index])) : native_ps_,
                                 "ps_5_0");
         ComPtr<ID3D12PipelineState> pso = Pipeline(vs.Get(), ps.Get(), blend, additive);
+        ComPtr<ID3D12PipelineState> source_pso,composite_pso,filter_pso;
+        if (atlas) {
+            const uint32_t mode=additive?1:0;
+            const auto source_vs=Compile(atlas_source_vs_,"vs_5_0");
+            const auto source_ps=Compile(alpha_function==7?atlas_source_ps_[mode][ps_index]:
+                gpu::MakeParticleDofPixelShader(native_ps_,depth_samples,mode,alpha_function,1),"ps_5_0");
+            const auto composite_vs=Compile(atlas_composite_vs_,"vs_5_0");
+            const auto composite_ps=Compile(alpha_function==7?atlas_composite_ps_[mode][ps_index]:
+                gpu::MakeParticleDofPixelShader(native_ps_,depth_samples,mode,alpha_function,2),"ps_5_0");
+            const auto filter_vs=Compile(gpu::kParticleDofAtlasFilterHlsl,"vs_5_0","vs");
+            const auto filter_ps=Compile(gpu::kParticleDofAtlasFilterHlsl,"ps_5_0","filter_ps");
+            source_pso=Pipeline(source_vs.Get(),source_ps.Get(),false);
+            composite_pso=Pipeline(composite_vs.Get(),composite_ps.Get(),blend,additive);
+            filter_pso=RangePipeline(filter_vs.Get(),filter_ps.Get(),
+                                     DXGI_FORMAT_R16G16B16A16_FLOAT);
+        }
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         Hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -539,7 +702,82 @@ public:
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->IASetVertexBuffers(0, 1, &vview);
         list->IASetIndexBuffer(&iview);
-        list->DrawIndexedInstanced(UINT(indices.size()), 1, 0, 0, 0);
+        if (!atlas) list->DrawIndexedInstanced(UINT(indices.size()), 1, 0, 0, 0);
+        else {
+            D3D12_RESOURCE_STATES source_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+            D3D12_RESOURCE_STATES filtered_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+            const float zero[4]{};
+            const D3D12_VIEWPORT atlas_viewport{0,0,float(kAtlasExtent),float(kAtlasExtent),0,1};
+            const D3D12_RECT atlas_scissor{0,0,LONG(kAtlasExtent),LONG(kAtlasExtent)};
+            auto bind_heap=[&](ID3D12DescriptorHeap* heap) {
+                ID3D12DescriptorHeap* bound[]{heap};
+                list->SetDescriptorHeaps(1,bound);
+                list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+            };
+            for (size_t pi=0;pi<pages.size();++pi) {
+                const auto& page=pages[pi];
+                const auto begin=page.first_quad,end=begin+page.quad_count;
+                bool mapped=false;
+                for (uint32_t q=begin;q<end;++q) mapped |= metadata[q].atlas_scale>0;
+                if (mapped) {
+                    if (source_state!=D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                        auto b=Transition(atlas_source.Get(),source_state,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->ResourceBarrier(1,&b);
+                        source_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    }
+                    list->ClearRenderTargetView(source_rtv,zero,0,nullptr);
+                    list->OMSetRenderTargets(1,&source_rtv,FALSE,nullptr);
+                    list->RSSetViewports(1,&atlas_viewport);
+                    list->RSSetScissorRects(1,&atlas_scissor);
+                    bind_heap(srvs.Get());
+                    list->SetGraphicsRootConstantBufferView(1,vcb->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(2,
+                        atlas_page_cb[pi]->GetGPUVirtualAddress());
+                    list->SetPipelineState(source_pso.Get());
+                    list->DrawIndexedInstanced(page.quad_count*6,1,page.first_quad*6,0,0);
+                    auto a=Transition(atlas_source.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    list->ResourceBarrier(1,&a);
+                    source_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+                    if (filtered_state!=D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                        auto b=Transition(atlas_filtered.Get(),filtered_state,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->ResourceBarrier(1,&b);
+                        filtered_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    }
+                    list->ClearRenderTargetView(filtered_rtv,zero,0,nullptr);
+                    list->OMSetRenderTargets(1,&filtered_rtv,FALSE,nullptr);
+                    bind_heap(atlas_source_srvs.Get());
+                    list->SetGraphicsRootConstantBufferView(1,radii_cb->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(2,
+                        atlas_page_cb[pi]->GetGPUVirtualAddress());
+                    list->SetPipelineState(filter_pso.Get());
+                    list->DrawInstanced(6,page.quad_count,0,0);
+                    auto b=Transition(atlas_filtered.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    list->ResourceBarrier(1,&b);
+                    filtered_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                }
+                if (filtered_state==D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                    list->ClearRenderTargetView(filtered_rtv,zero,0,nullptr);
+                    auto b=Transition(atlas_filtered.Get(),filtered_state,
+                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    list->ResourceBarrier(1,&b);
+                    filtered_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                }
+                list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
+                list->RSSetViewports(1,&viewport);
+                list->RSSetScissorRects(1,&scene.scissor);
+                bind_heap(atlas_composite_srvs.Get());
+                list->SetGraphicsRootConstantBufferView(1,vcb->GetGPUVirtualAddress());
+                list->SetGraphicsRootConstantBufferView(2,
+                    atlas_page_cb[pi]->GetGPUVirtualAddress());
+                list->SetPipelineState(composite_pso.Get());
+                list->DrawIndexedInstanced(page.quad_count*6,1,page.first_quad*6,0,0);
+            }
+        }
 
         auto footprint = Footprint(target.Get());
         auto readback = NewBuffer(footprint.bytes, D3D12_HEAP_TYPE_READBACK,
@@ -816,7 +1054,8 @@ private:
         return result;
     }
 
-    ComPtr<ID3D12PipelineState> RangePipeline(ID3DBlob* vs, ID3DBlob* ps) {
+    ComPtr<ID3D12PipelineState> RangePipeline(ID3DBlob* vs, ID3DBlob* ps,
+                         DXGI_FORMAT format=DXGI_FORMAT_R32G32_FLOAT) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};
         p.pRootSignature = root_.Get();
         p.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
@@ -828,7 +1067,7 @@ private:
         p.DepthStencilState.DepthEnable = FALSE;
         p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         p.NumRenderTargets = 1;
-        p.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
+        p.RTVFormats[0] = format;
         p.SampleDesc.Count = 1;
         p.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         ComPtr<ID3D12PipelineState> result;
@@ -870,6 +1109,10 @@ private:
     std::array<std::string, 4> additive_ps_;
     std::string reference_vs_;
     std::array<std::string, 4> reference_ps_;
+    std::string v25_vs_;
+    std::array<std::string, 4> v25_ps_, v25_additive_ps_;
+    std::string atlas_source_vs_, atlas_composite_vs_;
+    std::array<std::array<std::string, 4>,2> atlas_source_ps_,atlas_composite_ps_;
 };
 
 size_t At(const SmokeScene& scene, uint32_t x, uint32_t y) {
@@ -1127,6 +1370,12 @@ void CheckViewportAndDownscale(Warp& warp) {
           output[At(s,8,20)].a > 0.01f && output[At(s,48,32)].a > 0.1f,
           "offset/downscaled viewport leaked or shifted smoke support");
     WriteBmp("offset-downscaled-after.bmp", s, output);
+    const auto atlas_output=warp.Render(s,true,false,1,false,false,false,false,true);
+    CheckFinite(atlas_output);
+    Check(atlas_output[At(s,6,20)].a==0 && atlas_output[At(s,87,32)].a==0 &&
+          atlas_output[At(s,8,20)].a>.01f && atlas_output[At(s,48,32)].a>.05f,
+          "atlas leaked or shifted smoke at odd-offset/downscaled viewport");
+    WriteBmp("atlas-offset-downscaled-after.bmp",s,atlas_output);
     std::puts("odd-offset, 2x downscaled smoke viewport PASS");
 }
 
@@ -1284,6 +1533,234 @@ void CheckAdditiveFire(Warp& warp) {
     }
 }
 
+std::vector<Pixel> RenderV25(Warp& warp,const SmokeScene& s,bool blend=false,
+                             uint32_t samples=1,bool mixed=false,bool additive=false) {
+    return warp.Render(s,true,blend,samples,mixed,false,additive,true,false);
+}
+std::vector<Pixel> RenderAtlas(Warp& warp,const SmokeScene& s,bool blend=false,
+                               uint32_t samples=1,bool mixed=false,bool additive=false,
+                               uint32_t extent=128) {
+    return warp.Render(s,true,blend,samples,mixed,false,additive,false,true,extent);
+}
+struct AtlasError { float rgb_rms=0,alpha_energy=0,max_rgba=0,raw_rgb_max=0; };
+AtlasError CompareAtlasPixels(const SmokeScene& s,const std::vector<Pixel>& old,
+                              const std::vector<Pixel>& now,bool straight_layer=true) {
+    CheckFinite(old);CheckFinite(now);
+    double rgb_squared=0,old_alpha=0,now_alpha=0;
+    AtlasError e{};
+    for (size_t i=0;i<old.size();++i) {
+        const auto& a=old[i];const auto& b=now[i];
+        const float aa=straight_layer?a.a:1.0f;
+        const float ba=straight_layer?b.a:1.0f;
+        for (float d:{a.r*aa-b.r*ba,a.g*aa-b.g*ba,a.b*aa-b.b*ba}) {
+            rgb_squared+=double(d)*d;e.max_rgba=std::max(e.max_rgba,std::abs(d));
+        }
+        e.raw_rgb_max=std::max({e.raw_rgb_max,std::abs(a.r-b.r),
+                               std::abs(a.g-b.g),std::abs(a.b-b.b)});
+        e.max_rgba=std::max(e.max_rgba,std::abs(a.a-b.a));
+        const float baseline=straight_layer?0.0f:s.clear.a;
+        old_alpha+=std::max(0.0f,a.a-baseline);
+        now_alpha+=std::max(0.0f,b.a-baseline);
+    }
+    e.rgb_rms=float(std::sqrt(rgb_squared/(3*old.size())));
+    e.alpha_energy=float(std::abs(now_alpha-old_alpha)/std::max(old_alpha,1.0));
+    return e;
+}
+void CheckAtlasImageQuality(Warp& warp) {
+    for (float view_z:{3.0f,12.0f}) {
+        auto s=Scene(view_z);
+        const auto old=RenderV25(warp,s),now=RenderAtlas(warp,s);
+        const auto error=CompareAtlasPixels(s,old,now);
+        if (view_z==3) {
+            WriteBmp("atlas-near-v25.bmp",s,old);
+            WriteBmp("atlas-near-after.bmp",s,now);
+        } else {
+            WriteBmp("atlas-far-v25.bmp",s,old);
+            WriteBmp("atlas-far-after.bmp",s,now);
+        }
+        std::printf("atlas z%.0f vs25: visible RGB RMS %.5f, max RGBA %.5f, raw RGB max %.5f, alpha energy %.3f%%\n",
+                    view_z,error.rgb_rms,error.max_rgba,error.raw_rgb_max,error.alpha_energy*100);
+        Check(error.rgb_rms<.015f && error.alpha_energy<.03f,
+              "atlas changed basic smoke blur or alpha energy materially");
+        if (view_z==3) {
+            Check(now[At(s,36,32)].a>.02f,
+                  "atlas clipped the near smoke aperture outside its native quad");
+        }
+    }
+    const auto focus=Scene(5.0f);
+    const auto old=RenderV25(warp,focus),now=RenderAtlas(warp,focus);
+    const auto error=CompareAtlasPixels(focus,old,now);
+    Check(error.raw_rgb_max<.003f && error.max_rgba<.003f,
+          "zero-CoC atlas route changed exact native smoke");
+    std::printf("atlas zero-CoC max RGBA %.6f\n",error.max_rgba);
+
+    auto below=Scene(3.0f),above=below;
+    below.geometry.globals.optics[1]=9.36f; // CoC=3.9 target pixels
+    above.geometry.globals.optics[1]=9.60f; // CoC=4.0, half-scale atlas threshold
+    const auto a=RenderAtlas(warp,below),b=RenderAtlas(warp,above);
+    const auto crossing=CompareAtlasPixels(below,a,b);
+    std::printf("atlas radius 3.9->4.0: RGB RMS %.5f, alpha energy %.3f%%\n",
+                crossing.rgb_rms,crossing.alpha_energy*100);
+    WriteBmp("atlas-radius-3p9.bmp",below,a);
+    WriteBmp("atlas-radius-4p0.bmp",above,b);
+    Check(crossing.rgb_rms<.015f && crossing.alpha_energy<.03f,
+          "half-scale atlas threshold caused a visible smoke pop");
+}
+
+void CheckAtlasOcclusionAndMsaa(Warp& warp) {
+    auto s=Scene(3.0f);
+    const auto open=RenderAtlas(warp,s);
+    for (uint32_t y=24;y<40;++y) for (uint32_t x=40;x<56;++x)
+        s.source_depth[At(s,x,y)]=.1f;
+    const auto hidden=RenderAtlas(warp,s);
+    Check(open[At(s,36,32)].a>.02f && hidden[At(s,36,32)].a<.012f,
+          "atlas borrowed smoke color from behind an opaque source wall");
+    std::printf("atlas opaque wall halo open/hidden %.4f/%.4f\n",
+                open[At(s,36,32)].a,hidden[At(s,36,32)].a);
+    for (uint32_t samples:{4u,8u}) {
+        if (!warp.SupportsDepthSamples(samples)) {
+            std::printf("atlas %ux D24S8 visibility UNSUPPORTED on WARP\n",samples);
+            continue;
+        }
+        auto mixed_scene=Scene(3.0f);
+        const auto full=RenderAtlas(warp,mixed_scene,false,samples);
+        const auto mixed=RenderAtlas(warp,mixed_scene,false,samples,true);
+        const float ratio=mixed[At(mixed_scene,48,32)].a/
+            std::max(full[At(mixed_scene,48,32)].a,1e-6f);
+        const float expected=float(samples-1)/samples;
+        std::printf("atlas %ux source visibility %.4f (expected %.4f)\n",
+                    samples,ratio,expected);
+        Check(std::abs(ratio-expected)<.06f,
+              "atlas source preparation lost fractional MSAA visibility");
+    }
+}
+
+void CheckAtlasFallbackAndOrder(Warp& warp) {
+    auto s=Scene(3.0f);
+    for (auto& v:s.vertices) {v.uv[0]=.25f+.5f*v.uv[0];}
+    const auto old=RenderV25(warp,s),native=RenderAtlas(warp,s);
+    const auto error=CompareAtlasPixels(s,old,native);
+    Check(error.raw_rgb_max<.003f && error.max_rgba<.003f,
+          "partial-UV atlas material did not use the unchanged native aperture fallback");
+
+    auto pair=Scene(3.0f);
+    std::fill(pair.texture.begin(),pair.texture.end(),Rgba(255,255,255,255));
+    auto q0=Quad(40,24,56,40,1.0f/3,2.25f);
+    auto q1=Quad(41,24,57,40,1.0f/12,2.25f);
+    for (auto& v:q0) v.argb=0xA0FF2020;
+    for (auto& v:q1) v.argb=0xA02040FF;
+    pair.vertices.assign(q0.begin(),q0.end());
+    pair.vertices.insert(pair.vertices.end(),q1.begin(),q1.end());
+    std::vector<gpu::NativeParticleVertex> expanded;
+    std::vector<gpu::ParticleDofQuad> meta;
+    gpu::ParticleDofGeometryStats stats{};
+    gpu::BuildParticleDofGeometry(pair.vertices,pair.geometry,expanded,meta,stats);
+    const auto pages=gpu::BuildParticleDofAtlasPages(expanded,pair.geometry,meta,32,32);
+    Check(pages.size()==2 && pages[0].quad_count==1 && pages[1].quad_count==1,
+          "chunk-order fixture did not cross a real production atlas page");
+    const auto old_pair=RenderV25(warp,pair,true);
+    const auto new_pair=RenderAtlas(warp,pair,true,1,false,false,32);
+    const auto pair_error=CompareAtlasPixels(pair,old_pair,new_pair,false);
+    WriteBmp("atlas-page-order-v25.bmp",pair,old_pair,false);
+    WriteBmp("atlas-page-order-after.bmp",pair,new_pair,false);
+    Check(pair_error.rgb_rms<.015f && pair_error.alpha_energy<.03f,
+          "atlas page split lost native alpha-over ordering");
+    auto reverse=pair;
+    std::copy(q1.begin(),q1.end(),reverse.vertices.begin());
+    std::copy(q0.begin(),q0.end(),reverse.vertices.begin()+4);
+    const auto reversed=RenderAtlas(warp,reverse,true,1,false,false,32);
+    const auto center=At(pair,48,32);
+    Check(std::abs(new_pair[center].r-reversed[center].r)>.01f ||
+          std::abs(new_pair[center].b-reversed[center].b)>.01f,
+          "atlas page composition ignored native quad order");
+    std::printf("atlas two-page alpha-over: RGB RMS %.5f, alpha energy %.3f%%\n",
+                pair_error.rgb_rms,pair_error.alpha_energy*100);
+}
+
+void CheckAtlasAdditive(Warp& warp) {
+    auto fire=Scene(3.0f);
+    std::fill(fire.texture.begin(),fire.texture.end(),Rgba(255,255,255,255));
+    for (auto& v:fire.vertices) v.argb=0x80FF6020;
+    fire.clear={.04f,.07f,.11f,.15f};
+    const auto old=RenderV25(warp,fire,true,1,false,true);
+    const auto now=RenderAtlas(warp,fire,true,1,false,true);
+    const auto error=CompareAtlasPixels(fire,old,now,false);
+    const auto center=At(fire,48,32);
+    const float old_red=old[center].r-fire.clear.r;
+    const float new_red=now[center].r-fire.clear.r;
+    const float old_q=old[center].a-fire.clear.a;
+    const float new_q=now[center].a-fire.clear.a;
+    WriteBmp("atlas-additive-v25.bmp",fire,old,false);
+    WriteBmp("atlas-additive-after.bmp",fire,now,false);
+    Check(old_red>.1f && old_q>.05f &&
+          std::abs(new_red-old_red)/old_red<.15f &&
+          std::abs(new_q-old_q)/old_q<.15f &&
+          error.rgb_rms<.015f && error.alpha_energy<.03f,
+          "atlas additive filtering changed native RGB or alpha-second-moment energy");
+    std::printf("atlas additive vs25: center RGB ratio %.3f, Q ratio %.3f, RGB RMS %.5f\n",
+                new_red/old_red,new_q/old_q,error.rgb_rms);
+    auto focus=fire;
+    focus.geometry.globals.optics[0]=3;
+    const auto native_focus=warp.Render(focus,false,true,1,false,false,true);
+    const auto atlas_focus=RenderAtlas(warp,focus,true,1,false,true);
+    const auto focus_error=CompareAtlasPixels(focus,native_focus,atlas_focus,false);
+    Check(focus_error.max_rgba<.003f,"zero-CoC additive atlas path changed native fire");
+    for (uint32_t samples:{4u,8u}) {
+        if (!warp.SupportsDepthSamples(samples)) continue;
+        const auto full=RenderAtlas(warp,fire,true,samples,false,true);
+        const auto mixed=RenderAtlas(warp,fire,true,samples,true,true);
+        const float full_q=full[center].a-fire.clear.a;
+        const float mixed_q=mixed[center].a-fire.clear.a;
+        const float ratio=mixed_q/std::max(full_q,1e-6f);
+        const float expected=float(samples-1)/samples;
+        std::printf("atlas additive %ux Q visibility %.4f (expected %.4f)\n",
+                    samples,ratio,expected);
+        Check(full_q>.05f && std::abs(ratio-expected)<.07f,
+              "atlas additive Q lost fractional source visibility");
+    }
+}
+
+void CheckAtlasClippedAlphaTest(Warp& warp) {
+    auto s=Scene(3.0f);
+    std::fill(s.texture.begin(),s.texture.end(),Rgba(255,255,255,255));
+    s.alpha_function=4; // Native GREATER, not the usual ALWAYS/7 specialization.
+    s.alpha_reference=.5f;
+    s.geometry.guest_size[0]=192;
+    s.geometry.guest_size[1]=128;
+    s.geometry.globals.viewport[0]=7;
+    s.geometry.globals.viewport[1]=9;
+    s.geometry.globals.viewport[2]=93; // Intentionally exceeds the 96px target.
+    s.geometry.globals.viewport[3]=59; // Intentionally exceeds the 64px target.
+    s.scissor={7,9,96,64};
+    const uint32_t colors[]{0x50FF2020,0xD040FF20,0xB02040FF,0xF0FFC020};
+    constexpr float cs=.973666f,sn=.227978f;
+    for (size_t k=0;k<4;++k) {
+        auto& v=s.vertices[k];
+        const float x=v.position[0]-48,y=v.position[1]-32;
+        v.position[0]=2*(80.35f+cs*x-sn*y);
+        v.position[1]=2*(52.20f+sn*x+cs*y);
+        v.argb=colors[k];
+    }
+    const auto old=RenderV25(warp,s);
+    const auto now=RenderAtlas(warp,s);
+    const auto e=CompareAtlasPixels(s,old,now);
+    size_t old_covered=0,new_covered=0;
+    for (size_t i=0;i<old.size();++i) {
+        old_covered+=old[i].a>.01f;
+        new_covered+=now[i].a>.01f;
+    }
+    WriteBmp("atlas-alpha-rotated-v25.bmp",s,old);
+    WriteBmp("atlas-alpha-rotated-after.bmp",s,now);
+    std::printf("atlas GREATER4 rotated/clipped: visible RGB RMS %.5f, alpha energy %.3f%%, coverage %zu/%zu\n",
+                e.rgb_rms,e.alpha_energy*100,old_covered,new_covered);
+    Check(old_covered>20 && new_covered>20 &&
+          e.rgb_rms<.015f && e.alpha_energy<.03f &&
+          std::abs(double(new_covered)-double(old_covered))/double(old_covered)<.10,
+          "atlas changed alpha-tested, rotated, clipped smoke materially");
+    Check(now[At(s,6,32)].a==0 && now[At(s,80,8)].a==0,
+          "atlas wrote outside the odd clipped viewport");
+}
+
 } // namespace
 
 int main() {
@@ -1301,6 +1778,11 @@ int main() {
         CheckReferenceQuality(warp);
         CheckAlphaFunctionModes(warp);
         CheckAdditiveFire(warp);
+        CheckAtlasImageQuality(warp);
+        CheckAtlasOcclusionAndMsaa(warp);
+        CheckAtlasFallbackAndOrder(warp);
+        CheckAtlasAdditive(warp);
+        CheckAtlasClippedAlphaTest(warp);
         std::puts("production particle smoke DoF WARP checks PASS");
         return 0;
     } catch (const std::exception& e) {

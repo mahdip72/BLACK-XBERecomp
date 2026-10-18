@@ -13,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -21,6 +22,7 @@
 #include <cwchar>
 #include <filesystem>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -41,6 +43,7 @@
 #include "d3d/fidelityfx_dof_shader.h"
 #include "d3d/viewmodel_dof_shader.h"
 #include "d3d/particle_dof_geometry.h"
+#include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "d3d/occlusion.h"
 #include "d3d/smaa_shader.h"
@@ -795,6 +798,7 @@ struct DrawShaders {
     uint32_t particle_samples = 0;  // only the verified, late native smoke variant
     uint32_t particle_blend = 0;    // 0 alpha-over, 1 native SRC_ALPHA/ONE additive
     int particle_alpha_function = -1;
+    uint32_t particle_pass = 0;  // 0 direct aperture, 1 atlas source, 2 atlas composite
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
     FixedKey fk;
@@ -951,6 +955,12 @@ private:
     void ParticleDofWorld(const Target& rt, const float c[12]);
     bool PrepareParticleDof(const State& s, Assembled& a, const PixelKey& pk, DrawShaders& sh, DrawTextures& stages);
     void ParticleDofSkipped(uint32_t reason, const char* message);
+    bool EnsureParticleDofAtlas(uint32_t extent);
+    bool DrawParticleDofAtlas(const State& s, const Assembled& a, const PixelKey& pk,
+        const DrawShaders& sh, DrawTextures& stages, const PsoKey& native_key, bool clamp);
+    D3D12_CPU_DESCRIPTOR_HANDLE ParticleDofAtlasView(uint32_t index) {
+        return ParticleDofRangeView(kParticleDofSnapshots + index);
+    }
     bool ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* range,
         D3D12_RESOURCE_STATES& range_state, uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h);
     D3D12_CPU_DESCRIPTOR_HANDLE ParticleDofRangeView(uint32_t index) {
@@ -1013,8 +1023,8 @@ private:
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
-    void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                         GuestExtent size, DrawConstants& c);
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> UploadConstants(const State& s, const DrawShaders& sh,
+        const PsoKey& k, const DrawTextures& stages, GuestExtent size, DrawConstants& c);
     void FillTextureConstants(const State& s, const DrawTextures& stages, DrawConstants& c);
     void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
@@ -1212,8 +1222,14 @@ private:
         uint32_t world_w = 0, world_h = 0;
         float optics[4] = {};
         ParticleDofGlobals globals{};
+        ParticleDofGeometryParams params{};
         std::vector<NativeParticleVertex> vertices;
         std::vector<ParticleDofQuad> quads;
+        ComPtr<ID3D12Resource> atlas[2];
+        D3D12_RESOURCE_STATES atlas_states[2] = {};
+        uint32_t atlas_extent = 0, atlas_failed = 0;
+        uint64_t atlas_batches = 0, atlas_pages = 0, atlas_quads = 0, atlas_fallback = 0;
+        std::vector<D3D12_RECT> atlas_rects;
         struct Snapshot {
             ComPtr<ID3D12Resource> depth;
             ComPtr<ID3D12Resource> range;
@@ -1382,7 +1398,7 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
 // RTVs: the targets' pool, then the back buffers, occlusion, output, SMAA and the DOF filter mips
 void D3D12Backend::CreateHeaps() {
     constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
-        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots;
+        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots + 2;
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvTotal, false, rtv_heap_);
@@ -2057,7 +2073,7 @@ D3D12Backend::~D3D12Backend() {
     // The SDK owns resources referenced by recorded/in-flight commands, including a failed dispatch.
     bool particle_resources = false;
     for (const auto& snapshot : particle_dof_.snapshots) particle_resources |= bool(snapshot.depth);
-    if (ffx_dof_.Ready() || particle_resources) Flush();
+    if (ffx_dof_.Ready() || particle_resources || particle_dof_.atlas[0]) Flush();
     if (ffx_dof_.Ready()) ffx_dof_.Reset();
 }
 
@@ -2520,6 +2536,7 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
     stages.sv[3].ViewDimension = Ms(*ds) > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
     if (Ms(*ds) == 1) stages.sv[3].Texture2D.MipLevels = 1;
     p.globals = params.globals;
+    p.params = params;
     a.buffers[0].src = reinterpret_cast<const uint8_t*>(p.vertices.data());
     sh.particle_samples = samples;
     sh.particle_blend = k.dst == 1 ? 1 : 0;
@@ -3389,10 +3406,21 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     return vkey;
 }
 
+void DrawShaderKeys(const State& s, const Assembled& a, const PixelKey& pk, DrawShaders& sh) {
+    sh.vkey = VertexKey(s, a, sh);
+    sh.pkey = Hash(&pk, sizeof(pk));
+    if (sh.particle_samples) {
+        sh.vkey ^= 0x50444F4656530001ull ^ (uint64_t(sh.particle_pass) << 24);
+        sh.pkey ^= 0x50444F4650530002ull ^ (uint64_t(sh.particle_samples) << 48) ^
+            (uint64_t(sh.particle_blend) << 56) ^ (uint64_t(sh.particle_alpha_function + 1) << 32) ^
+            (uint64_t(sh.particle_pass) << 24);
+    }
+}
+
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.prog) {
         auto source = VertexProgram(*s.vs, a.regs, a.decode);
-        return sh.particle_samples ? MakeParticleDofVertexShader(std::move(source)) : source;
+        return sh.particle_samples ? MakeParticleDofVertexShader(std::move(source), sh.particle_pass) : source;
     }
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
 }
@@ -3435,7 +3463,7 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
     }
     auto source = PixelHlsl(pk);
     if (sh.particle_samples) source = MakeParticleDofPixelShader(std::move(source), sh.particle_samples,
-        sh.particle_blend, sh.particle_alpha_function);
+        sh.particle_blend, sh.particle_alpha_function, sh.particle_pass);
     sh.ps_code = Compile(source, "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
@@ -3686,11 +3714,13 @@ void FillLightConstants(const State& s, const FixedKey& fk, DrawConstants& c) {
     }
 }
 
-void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                                   GuestExtent size, DrawConstants& c) {
+std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh,
+    const PsoKey& k, const DrawTextures& stages, GuestExtent size, DrawConstants& c) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
     static_assert(sizeof(DrawConstants) == 2080);
+    static_assert(sizeof(DrawConstants) + sizeof(ParticleDofGlobals) +
+        kParticleDofMaxQuads * sizeof(ParticleDofQuad) <= 65536);
     const size_t tail = sh.particle_samples ? sizeof(ParticleDofGlobals) + particle_dof_.quads.size() * sizeof(ParticleDofQuad) : 0;
     Alloc dc = Upload(sizeof(DrawConstants) + tail, 256);
     FillSurfaceConstants(s, size, c);
@@ -3711,6 +3741,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     }
     cl_->SetGraphicsRootConstantBufferView(0, vc.gpu);
     cl_->SetGraphicsRootConstantBufferView(1, dc.gpu);
+    return {vc.gpu, dc.gpu};
 }
 
 void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
@@ -3785,7 +3816,7 @@ void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const Draw
     CaptureShader("vs", sh.vkey, VertexHlsl(s, a, sh));
     auto source = PixelHlsl(pk);
     if (sh.particle_samples) source = MakeParticleDofPixelShader(std::move(source), sh.particle_samples,
-        sh.particle_blend, sh.particle_alpha_function);
+        sh.particle_blend, sh.particle_alpha_function, sh.particle_pass);
     CaptureShader("ps", sh.pkey, source);
 }
 
@@ -3874,6 +3905,200 @@ void D3D12Backend::DrawGeometry(const Assembled& a) {
     }
 }
 
+bool D3D12Backend::EnsureParticleDofAtlas(uint32_t extent) {
+    auto& p = particle_dof_;
+    if (p.atlas[0] && p.atlas_extent == extent) return true;
+    const uint32_t failure = extent == 2048 ? 1 : 2;
+    if (p.atlas_failed & failure) return false;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    auto desc = Texture2DDesc(DXGI_FORMAT_R16G16B16A16_FLOAT, extent, extent);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ComPtr<ID3D12Resource> atlas[2];
+    for (auto& target : atlas) {
+        if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&target)))) {
+            p.atlas_failed |= failure;
+            LOGR("Particle DOF: %ux%u atlas allocation failed; retaining direct aperture filtering", extent, extent);
+            return false;
+        }
+    }
+    // Replacing an RTV must wait for previous draws that reference its old descriptor/resource.
+    // The fixed pages otherwise survive target resizes and are reused without a CPU wait.
+    if (p.atlas[0]) Flush();
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (p.atlas[i]) Release(std::move(p.atlas[i]));
+        p.atlas[i] = std::move(atlas[i]);
+        p.atlas_states[i] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        dev_->CreateRenderTargetView(p.atlas[i].Get(), nullptr, ParticleDofAtlasView(i));
+    }
+    p.atlas_extent = extent;
+    return true;
+}
+
+bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, const PixelKey& pk,
+    const DrawShaders& sh, DrawTextures& stages, const PsoKey& native_key, bool clamp) {
+    auto& p = particle_dof_;
+    Target* rt = bound_rt_;
+    Target* ds = bound_ds_;
+    uint32_t extent = p.atlas_extent ? p.atlas_extent : 2048;
+    std::vector<ParticleDofAtlasPage> pages;
+    uint32_t mapped = 0;
+    try {
+        pages = BuildParticleDofAtlasPages(p.vertices, p.params, p.quads, extent, extent);
+        const auto mapped_count = [&]() {
+            return uint32_t(std::count_if(p.quads.begin(), p.quads.end(),
+                [](const ParticleDofQuad& q) { return q.atlas_scale > 0; }));
+        };
+        mapped = mapped_count();
+        // Only grow if the larger page actually recovers a quad that does not fit. Offscreen and
+        // unsupported quads also have zero metadata; those alone must not allocate larger pages.
+        if (extent == 2048 && mapped < p.draw_active && (rt->w > 2044 || rt->h > 2044) && !(p.atlas_failed & 2)) {
+            auto small_metadata = p.quads;
+            auto larger_pages = BuildParticleDofAtlasPages(p.vertices, p.params, p.quads, 4096, 4096);
+            const uint32_t larger_count = mapped_count();
+            if (larger_count > mapped) {
+                extent = 4096; mapped = larger_count; pages = std::move(larger_pages);
+            } else p.quads = std::move(small_metadata);
+        }
+        // No vector growth is allowed once an earlier chunk may already have been composited.
+        p.atlas_rects.reserve(p.quads.size());
+    } catch (const std::bad_alloc&) {
+        if (!(p.reported & (1u << 9))) {
+            p.reported |= 1u << 9;
+            LOGR("Particle DOF: atlas metadata allocation failed; retaining direct aperture filtering");
+        }
+        return false;
+    }
+    if (!mapped || pages.empty()) return false;
+
+    DrawShaders source = sh, composite = sh;
+    source.particle_pass = 1;
+    composite.particle_pass = 2;
+    auto pipeline = [&](DrawShaders& variant, bool prepare) -> ID3D12PipelineState* {
+        DrawShaderKeys(s, a, pk, variant);
+        EnsureVertexShader(s, a, variant);
+        EnsurePixelShader(pk, variant);
+        if (!variant.vs_code || !variant.ps_code) return nullptr;
+        PsoKey key = native_key;
+        key.vs = variant.vh; key.ps = variant.ph;
+        if (prepare) {
+            key.has_ds = key.zen = key.zwrite = key.sten = key.blend = key.msaa = 0;
+            key.has_rt = 1;
+            key.rtfmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            key.wmask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        return EnsurePipeline(key, variant.vs_code, variant.ps_code);
+    };
+    // Every fallible resource/pipeline operation precedes the first native-target composite.
+    // A failure can therefore fall back to the complete original draw without double blending.
+    auto* source_pso = pipeline(source, true);
+    auto* composite_pso = pipeline(composite, false);
+    auto* filter_pso = EnsurePassPipeline(kParticleDofAtlasFilterHlsl.c_str(), "vs", "filter_ps",
+                                         DXGI_FORMAT_R16G16B16A16_FLOAT, -1);
+    if (!source_pso || !composite_pso || !filter_pso) {
+        if (!(p.reported & (1u << 8))) {
+            p.reported |= 1u << 8;
+            LOGR("Particle DOF: atlas pipeline unavailable; retaining direct aperture filtering");
+        }
+        return false;
+    }
+    if (!EnsureParticleDofAtlas(extent)) return false;
+    const auto restore_target = [&]() {
+        const auto color = Cpu(rtv_heap_.Get(), rt->view, rtv_inc_);
+        const auto depth = Cpu(dsv_heap_.Get(), ds->view, dsv_inc_);
+        cl_->OMSetRenderTargets(1, &color, FALSE, &depth);
+        bound_rt_ = rt; bound_ds_ = ds;
+    };
+    restore_target();  // Atlas growth can Flush and reset the bound-target cache.
+    if (cap_) {
+        CaptureShaders(s, a, source, pk);
+        CaptureShaders(s, a, composite, pk);
+        CaptureShader("particle_filter", Hash(kParticleDofAtlasFilterHlsl.data(), kParticleDofAtlasFilterHlsl.size()),
+                      kParticleDofAtlasFilterHlsl);
+    }
+
+    float radii[kParticleDofMaxQuads]{};
+    for (size_t q = 0; q < p.quads.size(); ++q) if (p.quads[q].atlas_scale > 0)
+        radii[q] = ParticleDofRadius(1.0f / p.vertices[q * 4].position[2], p.params.globals) * p.quads[q].atlas_scale;
+    Alloc radius_constants = Upload(sizeof(radii), 256);
+    std::memcpy(radius_constants.cpu, radii, sizeof(radii));
+    UploadVertexBuffers(a);
+    Alloc indices = Upload(uint64_t(a.index_count) * sizeof(uint32_t), 4);
+    std::memcpy(indices.cpu, a.index_src, size_t(a.index_count) * sizeof(uint32_t));
+    D3D12_INDEX_BUFFER_VIEW index_view{indices.gpu, a.index_count * uint32_t(sizeof(uint32_t)), DXGI_FORMAT_R32_UINT};
+    cl_->IASetIndexBuffer(&index_view);
+
+    DrawTextures filtered = stages;
+    filtered.res[1] = p.atlas[1].Get();
+    filtered.info[1] = TexInfo{kTex2D};
+    filtered.sv[1] = {};
+    filtered.sv[1].Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    filtered.sv[1].Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    filtered.sv[1].ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    filtered.sv[1].Texture2D.MipLevels = 1;
+    filtered.rt[1] = false;
+    filtered.wide[1] = 0; filtered.blur[1] = false; filtered.k[1] = 1;
+    DrawTextures unfiltered = stages;
+    unfiltered.res[0] = p.atlas[0].Get();
+    unfiltered.info[0] = TexInfo{kTex2D};
+    unfiltered.sv[0] = filtered.sv[1];
+    GuestExtent size{};
+    SurfaceSize(s.rt, size.w, size.h);
+    p.globals.atlas_target[0] = p.globals.atlas_target[1] = float(extent);
+    const float zero[4]{};
+    for (const auto& page : pages) {
+        p.globals.atlas_target[2] = float(page.first_quad);
+        p.globals.atlas_target[3] = float(page.quad_count);
+        DrawConstants constants{};
+        const auto cb = UploadConstants(s, source, native_key, stages, size, constants);
+        p.atlas_rects.clear();
+        for (uint32_t q = page.first_quad; q < page.first_quad + page.quad_count; ++q) {
+            const auto& map = p.quads[q];
+            if (map.atlas_scale <= 0) continue;
+            const LONG x = LONG(map.atlas_xy & 0xffff), y = LONG(map.atlas_xy >> 16);
+            p.atlas_rects.push_back({x, y, x + LONG(map.atlas_size & 0xffff), y + LONG(map.atlas_size >> 16)});
+        }
+        if (!p.atlas_rects.empty()) {
+            Transition(p.atlas[0].Get(), p.atlas_states[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            SetBlitTarget(ParticleDofAtlasView(0), extent, extent);
+            cl_->ClearRenderTargetView(ParticleDofAtlasView(0), zero, UINT(p.atlas_rects.size()), p.atlas_rects.data());
+            cl_->SetPipelineState(source_pso);
+            SetTextureViewsAndSamplers(s, stages, clamp);
+            cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
+            Transition(p.atlas[0].Get(), p.atlas_states[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+            Transition(p.atlas[1].Get(), p.atlas_states[1], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            SetBlitTarget(ParticleDofAtlasView(1), extent, extent);
+            cl_->SetPipelineState(filter_pso);
+            cl_->SetGraphicsRootConstantBufferView(0, radius_constants.gpu);
+            SetTextureViewsAndSamplers(s, unfiltered, clamp);
+            cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), EnsureBlitSamplers(), smp_inc_));
+            cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            // The procedural pass writes every texel of each allocated cell, including its zero guard.
+            cl_->DrawInstanced(6, page.quad_count, 0, 0);
+            Transition(p.atlas[1].Get(), p.atlas_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        restore_target();
+        cl_->SetPipelineState(composite_pso);
+        cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
+        cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
+        SetTextureViewsAndSamplers(s, filtered, clamp);
+        SetViewportScissor(s, size.w);
+        SetBlendFactorStencilRef(s);
+        cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
+    }
+    ++p.atlas_batches;
+    p.atlas_pages += pages.size();
+    p.atlas_quads += mapped;
+    p.atlas_fallback += p.draw_active - mapped;
+    if (p.atlas_batches == 1)
+        LOGR("Particle DOF atlas active: %ux%u pages, source visibility/material prefilter, "
+             "64 prepared taps, ordered native composite", extent, extent);
+    return true;
+}
+
 // calls the extension's EndDraw on every return from Draw once made
 struct DrawEnd {
     Extension* e;
@@ -3926,13 +4151,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     PrepareParticleDof(s, a, pk, sh, stages);
     PsoKey k;
     auto pipeline = [&]() -> ID3D12PipelineState* {
-        sh.vkey = VertexKey(s, a, sh);
-        sh.pkey = Hash(&pk, sizeof(pk));
-        if (sh.particle_samples) {
-            sh.vkey ^= 0x50444F4656530001ull;
-            sh.pkey ^= 0x50444F4650530002ull ^ (uint64_t(sh.particle_samples) << 48) ^
-                (uint64_t(sh.particle_blend) << 56) ^ (uint64_t(sh.particle_alpha_function + 1) << 32);
-        }
+        DrawShaderKeys(s, a, pk, sh);
         EnsureVertexShader(s, a, sh);
         EnsurePixelShader(pk, sh);
         if (!sh.vs_code || !sh.ps_code) return nullptr;
@@ -3967,13 +4186,16 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         CaptureShaders(s, a, sh, pk);
     }
 
-    // texture views and samplers, viewport and scissor, blend factor and stencil reference
-    SetTextureViewsAndSamplers(s, stages, native_clamp);
-    SetViewportScissor(s, size.w);
-    SetBlendFactorStencilRef(s);
-
-    // geometry
-    DrawGeometry(a);
+    const bool atlas = sh.particle_samples && DrawParticleDofAtlas(s, a, pk, sh, stages, k, native_clamp);
+    if (!atlas) {
+        // Texture views and samplers, viewport/scissor and native blend/depth behavior are unchanged
+        // for ordinary draws and for any particle batch that cannot use the bounded atlas.
+        cl_->SetPipelineState(pso);
+        SetTextureViewsAndSamplers(s, stages, native_clamp);
+        SetViewportScissor(s, size.w);
+        SetBlendFactorStencilRef(s);
+        DrawGeometry(a);
+    }
     if (bound_ds_ && k.zen && k.zwrite) ++particle_depth_serial_;
     if (sh.particle_samples) {
         particle_dof_.active += particle_dof_.draw_active;
@@ -3981,8 +4203,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         if (!particle_dof_.active_reported) {
             particle_dof_.active_reported = true;
             LOGR("Particle DOF active: native D660/D6A0 late alpha quads, %ux%u target, %ux MSAA, "
-                 "64 source-visible aperture taps; early particles keep the world pass", bound_rt_->w, bound_rt_->h,
-                 sh.particle_samples);
+                 "%s; early particles keep the world pass", bound_rt_->w, bound_rt_->h,
+                 sh.particle_samples, atlas ? "prepared atlas aperture" : "direct source-visible aperture");
         }
     }
 }
@@ -4670,13 +4892,16 @@ void D3D12Backend::Present(const Surface& front) {
     if (particle.batches && ((particle.world_valid && frame_ % 120 == 0) ||
         (particle.previous_world && !particle.world_valid))) {
         LOGR("Particle DOF totals: %llu batches, %llu filtered quads (%llu additive), %llu focused, %llu invalid quads, "
-             "%llu early/no-world batches, %llu rejected batches; %llu depth copies/%.1f MiB, %llu reused, %llu range passes",
+             "%llu early/no-world batches, %llu rejected batches; %llu depth copies/%.1f MiB, %llu reused, %llu range passes; "
+             "%llu atlas batches/%llu pages/%llu quads, %llu direct-filter quads",
              (unsigned long long)particle.batches, (unsigned long long)particle.active,
              (unsigned long long)particle.additive,
              (unsigned long long)particle.focused, (unsigned long long)particle.invalid,
              (unsigned long long)particle.early, (unsigned long long)particle.rejected,
              (unsigned long long)particle.copies, double(particle.copy_bytes) / 1048576.0,
-             (unsigned long long)particle.reused, (unsigned long long)particle.range_passes);
+             (unsigned long long)particle.reused, (unsigned long long)particle.range_passes,
+             (unsigned long long)particle.atlas_batches, (unsigned long long)particle.atlas_pages,
+             (unsigned long long)particle.atlas_quads, (unsigned long long)particle.atlas_fallback);
     }
     particle.previous_world = particle.world_valid;
     particle.marker = particle.world_valid = false;

@@ -20,12 +20,17 @@ struct ParticleDofQuad {
     // Signed endpoints preserve UV flips. A zero extent selects the native path.
     float uv_bounds[4];
     uint32_t argb[4];
+    uint32_t atlas_xy = 0;    // cell origin, uint16 x/y; includes the two-pixel guard
+    uint32_t screen_xy = 0;   // clipped expanded screen rectangle origin, uint16 x/y
+    uint32_t atlas_size = 0;  // whole cell width/height including guards, uint16 x/y
+    float atlas_scale = 0;   // zero keeps the legacy filter; otherwise one or one half
 };
 
 struct ParticleDofGlobals {
     float optics[4];    // focus, eased radius in this target's pixels, near scale, far scale
     float viewport[4];  // x, y, width, height in this target's pixels
     float target[4];    // width, height, quad count, 0=LESS / 1=LEQUAL
+    float atlas_target[4]; // atlas width/height, first quad and count for the filter draw
 };
 
 struct ParticleDofGeometryParams {
@@ -42,7 +47,7 @@ struct ParticleDofGeometryStats {
 };
 
 static_assert(sizeof(NativeParticleVertex) == 32);
-static_assert(sizeof(ParticleDofQuad) == 32);
-static_assert(sizeof(ParticleDofGlobals) == 48);
+static_assert(sizeof(ParticleDofQuad) == 48);
+static_assert(sizeof(ParticleDofGlobals) == 64);
 
 }  // namespace gpu
