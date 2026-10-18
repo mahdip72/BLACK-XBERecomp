@@ -37,6 +37,10 @@
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_small_radius.h"
 #include "d3d/particle_dof_wrapper.h"
+#include "d3d/fidelityfx_dof.h"
+#include "d3d/fidelityfx_dof_shader.h"
+#include "d3d/dof_shader_library.h"
+#include "d3d/shader_cache.h"
 #include "gpu/shaders.h"
 
 // These two headers are byte-for-byte copies from commit a5777a9. Nesting their
@@ -74,12 +78,15 @@ using Microsoft::WRL::ComPtr;
 namespace {
 bool g_optimization_only=false;
 bool g_small_radius_only=false;
+bool g_coverage_only=false;
+bool g_mixed_focus_only=false;
 
 void Check(bool okay, const char* why) {
     if (!okay) throw std::runtime_error(why);
 }
 
-void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix) {
+void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix,
+                                   size_t expected_globals_bytes) {
     Microsoft::WRL::ComPtr<ID3D11ShaderReflection> reflection;
     const HRESULT hr=D3DReflect(shader->GetBufferPointer(),shader->GetBufferSize(),
         IID_ID3D11ShaderReflection,reinterpret_cast<void**>(reflection.GetAddressOf()));
@@ -90,7 +97,7 @@ void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix) {
           "atlas-filter shader omitted ParticleAtlasDraw cbuffer");
     const char* names[]{"particleTarget","particleAtlasTarget","particleQuads"};
     const UINT offsets[]{UINT(expected_prefix+32),UINT(expected_prefix+48),
-                         UINT(expected_prefix+64)};
+                         UINT(expected_prefix+expected_globals_bytes)};
     for (size_t i=0;i<3;++i) {
         D3D11_SHADER_VARIABLE_DESC variable_desc{};
         auto* variable=cbuffer->GetVariableByName(names[i]);
@@ -116,6 +123,8 @@ std::string LegacyDrawConstantsShader(std::string source) {
 
 static_assert(offsetof(gpu::DrawConstants, rtshift) == 2080);
 static_assert(sizeof(gpu::DrawConstants) == 2096);
+static_assert(offsetof(gpu::ParticleDofGlobals, projection) == 64);
+static_assert(sizeof(gpu::ParticleDofGlobals) == 80);
 
 void CheckParticleShaderCanonicalization() {
     const gpu::TexInfo unused_types[]{
@@ -134,6 +143,12 @@ void CheckParticleShaderCanonicalization() {
         Check(gpu::CanonicalParticleDofPixelKey(base) == base,
               "canonicalization changed an already canonical particle key");
         const auto base_native = gpu::PixelHlsl(base);
+        auto flat_shaded = base;
+        flat_shaded.flat = 1;
+        Check(gpu::IsParticleDofNativePixel(flat_shaded) &&
+              gpu::CanonicalParticleDofPixelKey(flat_shaded) == base &&
+              gpu::PixelHlsl(flat_shaded) == base_native,
+              "flat-shaded native smoke no longer shares the canonical particle shader");
         std::vector<gpu::PixelKey> variants;
         for (int stage = 1; stage < 4; ++stage) {
             for (const auto type : unused_types) {
@@ -154,6 +169,10 @@ void CheckParticleShaderCanonicalization() {
                 for (uint32_t blend : {0u, 1u}) {
                     const auto expected = gpu::MakeParticleDofPixelShader(base_native, samples, blend, 7, pass);
                     Check(!expected.empty(), "canonical particle baseline wrapper rejected source");
+                    Check(gpu::MakeParticleDofPixelShader(
+                              gpu::PixelHlsl(gpu::CanonicalParticleDofPixelKey(flat_shaded)),
+                              samples, blend, 7, pass) == expected,
+                          "flat-shaded native smoke split the wrapped shader source");
                     for (const auto& variant : variants) {
                         Check(gpu::IsParticleDofNativePixel(variant),
                               "unused-stage fixture unexpectedly changes particle eligibility");
@@ -336,16 +355,35 @@ ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile,
     static std::map<Key,ComPtr<ID3DBlob>> compiled;
     Key key{source,profile,entry};
     if (const auto it=compiled.find(key);it!=compiled.end()) return it->second;
+    static const gpu::ShaderCache disk_cache([] {
+        std::wstring executable(32768,L'\0');
+        const DWORD length=GetModuleFileNameW(nullptr,executable.data(),
+                                              DWORD(executable.size()));
+        Check(length>0 && length<executable.size(),
+              "cannot locate executable-relative production DoF bytecode cache");
+        executable.resize(length);
+        return std::filesystem::path(executable).parent_path()/"generated"/
+               "dof-bytecode-cache";
+    }());
+    const uint64_t compile_flags=gpu::DofShaderCompilerFlags(entry,profile) |
+                                  (gpu::DofShaderCompilerFlags2 << 32);
+    if (auto cached=disk_cache.Load(source,entry,profile,compile_flags)) {
+        std::printf("FXC cached %s/%s %zu bytes\n",entry,profile,cached->GetBufferSize());
+        compiled.emplace(std::move(key),cached);
+        return cached;
+    }
     std::printf("FXC begin %s/%s %zu bytes\n",entry,profile,source.size());
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "production particle shader",
                                   nullptr, nullptr, entry, profile,
-                                  D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &errors);
+                                  UINT(compile_flags), UINT(compile_flags >> 32),
+                                  &code, &errors);
     if (FAILED(hr) && errors)
         std::fprintf(stderr, "%s: %s\n", profile,
                      static_cast<const char*>(errors->GetBufferPointer()));
     Hr(hr, "D3DCompile(production particle shader)");
     std::printf("FXC ready %s/%s %zu bytes\n",entry,profile,code->GetBufferSize());
+    disk_cache.Store(source,entry,profile,compile_flags,code.Get());
     compiled.emplace(std::move(key),code);
     return code;
 }
@@ -362,6 +400,16 @@ struct SmokeScene {
     float alpha_function = 7;
     D3D12_RECT scissor{0, 0, 96, 64};
     D3D12_RECT sample_occluder{40, 24, 56, 40};
+    float sample_occluder_depth = 0.1f;
+    bool native_msaa = false; // true-sample native hardware-depth reference
+    bool reverse_subtract = false;
+    std::vector<Pixel> world_blurred; // production FidelityFX adapter result, composited before particles
+    bool mixed_sample_color = false;
+    Pixel sample_color{0.05f,0.9f,0.15f,1};
+    D3D12_RECT sample_color_rect{40,24,56,40};
+    bool depth_probe = false;
+    bool sample_frequency_reference = false;
+    bool coverage_probe = false;
 };
 
 std::string SmallRadiusFilterSource() {
@@ -432,7 +480,7 @@ public:
                 atlas_composite_ps_[blend][i]=gpu::MakeParticleDofPixelShader(native_ps_,samples,blend,7,2);
             }
         }
-        if (!g_optimization_only) {
+        if (!g_optimization_only && !g_coverage_only && !g_mixed_focus_only) {
         Compile(native_vs_, "vs_5_0"); Compile(native_ps_, "ps_5_0");
         Compile(wrapped_vs_, "vs_5_0");
         for (const auto& source : wrapped_ps_) Compile(source, "ps_5_0");
@@ -480,9 +528,11 @@ public:
         std::printf("64-tap PS disassembly: frozen sincos/sqrt %zu/%zu, optimized %zu/%zu\n",
                     old_trig, old_sqrt, new_trig, new_sqrt);
         std::puts("actual native particle VS/PS and current/reference 1x/2x/4x/8x wrappers compiled");
-        } else {
+        } else if (g_optimization_only) {
             Compile(SmallRadiusFilterSource(),"ps_5_0","filter_ps");
             std::puts("optimization-only shader variants compiled");
+        } else {
+            std::puts("coverage-only shaders compile lazily from the actual draw paths");
         }
         MakeRoot();
         std::puts("WARP fixture: shader roots ready");
@@ -491,11 +541,181 @@ public:
     ~Warp() { if (event_) CloseHandle(event_); }
 
     bool SupportsDepthSamples(uint32_t samples) const {
-        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{};
-        quality.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        quality.SampleCount = samples;
-        return SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-                         &quality, sizeof(quality))) && quality.NumQualityLevels > 0;
+        for (DXGI_FORMAT format : {DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                   DXGI_FORMAT_R16G16B16A16_FLOAT}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality{};
+            quality.Format=format;
+            quality.SampleCount=samples;
+            if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                    &quality,sizeof(quality))) ||
+                quality.NumQualityLevels==0) return false;
+        }
+        return true;
+    }
+
+    // Produce the actual Medium-profile world result before the late particle
+    // draw. The particle fixture independently recreates the same raw D24S8
+    // depths; this pass uses the production FidelityFX adapter and SDK.
+    std::vector<Pixel> BlurWorld(const SmokeScene& scene,bool cinematic=false) {
+        Check(scene.source_depth.size()==size_t(scene.width)*scene.height,
+              "world fixture depth extent mismatch");
+        const uint32_t scale=cinematic?2:1;
+        const auto extent=gpu::FidelityFxDofProcessingSize(scene.width,scene.height,scale);
+        Check(extent.width && extent.height,"unsupported world fixture processing extent");
+        gpu::FidelityFxDof dof;
+        Check(dof.Create(device_.Get(),extent.width,extent.height,
+                         cinematic?8u:4u,cinematic),dof.Failure());
+        auto original=NewTexture(scene.width,scene.height,DXGI_FORMAT_R16G16B16A16_FLOAT,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto raw=NewTexture(scene.width,scene.height,DXGI_FORMAT_R32_FLOAT,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        auto prepared=NewTexture(extent.width,extent.height,DXGI_FORMAT_R16G16B16A16_FLOAT,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto encoded=NewTexture(extent.width,extent.height,DXGI_FORMAT_R32_FLOAT,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto filtered=NewTexture(extent.width,extent.height,DXGI_FORMAT_R16G16B16A16_FLOAT,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto result=NewTexture(scene.width,scene.height,DXGI_FORMAT_R16G16B16A16_FLOAT,
+            D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        auto raw_upload=UploadTexture(raw.Get(),scene.source_depth.data(),scene.width*4);
+        const float bound=scene.geometry.globals.optics[1]*
+            std::max(scene.geometry.globals.optics[2],scene.geometry.globals.optics[3]);
+        const float constants[12]={-1,1,scene.geometry.globals.optics[0],
+            scene.geometry.globals.optics[1]*float(scale),scene.geometry.globals.viewport[0],
+            scene.geometry.globals.viewport[1],scene.geometry.globals.viewport[2],
+            scene.geometry.globals.viewport[3],scene.geometry.globals.optics[2],
+            scene.geometry.globals.optics[3],bound*float(scale),float(scale)};
+        auto cb=UploadBuffer(constants,sizeof(constants));
+        auto make_pipeline=[&](const char* entry,bool present) {
+            const std::string source=present ?
+                std::string("#define FFX_DOF_PRESENT 1\n")+gpu::kFidelityFxDofHlsl :
+                std::string(gpu::kFidelityFxDofHlsl);
+            auto vs=Compile(source,"vs_5_0","vs"),ps=Compile(source,"ps_5_0",entry);
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};
+            p.pRootSignature=root_.Get();
+            p.VS={vs->GetBufferPointer(),vs->GetBufferSize()};
+            p.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+            p.SampleMask=UINT_MAX;
+            p.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;
+            p.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
+            p.RasterizerState.DepthClipEnable=TRUE;
+            p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            p.NumRenderTargets=present?1:2;
+            p.RTVFormats[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            if (!present) p.RTVFormats[1]=DXGI_FORMAT_R32_FLOAT;
+            p.SampleDesc.Count=1;
+            p.BlendState.RenderTarget[0].RenderTargetWriteMask=present ?
+                D3D12_COLOR_WRITE_ENABLE_RED|D3D12_COLOR_WRITE_ENABLE_GREEN|
+                    D3D12_COLOR_WRITE_ENABLE_BLUE : D3D12_COLOR_WRITE_ENABLE_ALL;
+            if (!present) p.BlendState.RenderTarget[1].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+            ComPtr<ID3D12PipelineState> pipeline;
+            Hr(device_->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&pipeline)),
+               "Create production world adapter pipeline");
+            return pipeline;
+        };
+        auto prepare_pso=make_pipeline("ffx_dof_prepare",false);
+        auto present_pso=make_pipeline("ffx_dof_present",true);
+        D3D12_DESCRIPTOR_HEAP_DESC sd{};
+        sd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        sd.NumDescriptors=4;sd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ComPtr<ID3D12DescriptorHeap> prep_srvs,present_srvs;
+        Hr(device_->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&prep_srvs)),"Create world prepare SRVs");
+        Hr(device_->CreateDescriptorHeap(&sd,IID_PPV_ARGS(&present_srvs)),"Create world present SRVs");
+        const UINT srv_step=device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        auto srv=[&](ID3D12DescriptorHeap* heap,uint32_t index,ID3D12Resource* resource,DXGI_FORMAT format) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+            v.Format=format;v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+            v.Texture2D.MipLevels=1;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            auto handle=heap->GetCPUDescriptorHandleForHeapStart();handle.ptr+=SIZE_T(index)*srv_step;
+            device_->CreateShaderResourceView(resource,&v,handle);
+        };
+        srv(prep_srvs.Get(),0,raw.Get(),DXGI_FORMAT_R32_FLOAT);
+        srv(prep_srvs.Get(),1,original.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT);
+        srv(present_srvs.Get(),0,filtered.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT);
+        srv(present_srvs.Get(),1,prepared.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT);
+        D3D12_DESCRIPTOR_HEAP_DESC rd{};rd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;rd.NumDescriptors=4;
+        ComPtr<ID3D12DescriptorHeap> rtvs;
+        Hr(device_->CreateDescriptorHeap(&rd,IID_PPV_ARGS(&rtvs)),"Create world adapter RTVs");
+        const UINT rtv_step=device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        std::array<D3D12_CPU_DESCRIPTOR_HANDLE,4> rh{};
+        for (uint32_t i=0;i<4;++i) {rh[i]=rtvs->GetCPUDescriptorHandleForHeapStart();rh[i].ptr+=SIZE_T(i)*rtv_step;}
+        device_->CreateRenderTargetView(original.Get(),nullptr,rh[0]);
+        device_->CreateRenderTargetView(prepared.Get(),nullptr,rh[1]);
+        device_->CreateRenderTargetView(encoded.Get(),nullptr,rh[2]);
+        device_->CreateRenderTargetView(result.Get(),nullptr,rh[3]);
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        Hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
+           "Create world adapter allocator");
+        Hr(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,
+                                     IID_PPV_ARGS(&list)),"Create world adapter list");
+        const float background[4]{.05f,.08f,.15f,1},wall[4]{.8f,.8f,.8f,1};
+        list->ClearRenderTargetView(rh[0],background,0,nullptr);
+        for (uint32_t y=0;y<scene.height;++y)
+            for (uint32_t x=0;x<scene.width;) {
+                if (scene.source_depth[size_t(y)*scene.width+x]>=.95f) {++x;continue;}
+                const uint32_t begin=x++;
+                while (x<scene.width && scene.source_depth[size_t(y)*scene.width+x]<.95f) ++x;
+                const D3D12_RECT rect{LONG(begin),LONG(y),LONG(x),LONG(y+1)};
+                list->ClearRenderTargetView(rh[0],wall,1,&rect);
+            }
+        CopyUpload(list.Get(),raw.Get(),raw_upload);
+        D3D12_RESOURCE_BARRIER initial[]{
+            Transition(original.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(raw.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+        list->ResourceBarrier(2,initial);
+        list->CopyResource(result.Get(),original.Get());
+        D3D12_RESOURCE_BARRIER inputs[]{
+            Transition(original.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(result.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_RENDER_TARGET)};
+        list->ResourceBarrier(2,inputs);
+        auto bind=[&](ID3D12DescriptorHeap* heap) {
+            ID3D12DescriptorHeap* heaps[]{heap};list->SetDescriptorHeaps(1,heaps);
+            list->SetGraphicsRootSignature(root_.Get());
+            list->SetGraphicsRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+            list->SetGraphicsRootConstantBufferView(2,cb->GetGPUVirtualAddress());
+        };
+        bind(prep_srvs.Get());list->SetPipelineState(prepare_pso.Get());
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VIEWPORT processing_view{0,0,float(extent.width),float(extent.height),0,1};
+        const D3D12_RECT processing_rect{0,0,LONG(extent.width),LONG(extent.height)};
+        list->RSSetViewports(1,&processing_view);list->RSSetScissorRects(1,&processing_rect);
+        D3D12_CPU_DESCRIPTOR_HANDLE prep_targets[]{rh[1],rh[2]};
+        list->OMSetRenderTargets(2,prep_targets,FALSE,nullptr);
+        list->DrawInstanced(3,1,0,0);
+        D3D12_RESOURCE_BARRIER to_sdk[]{
+            Transition(prepared.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(encoded.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+        list->ResourceBarrier(2,to_sdk);
+        Check(dof.Dispatch(list.Get(),prepared.Get(),encoded.Get(),filtered.Get(),
+                           bound*float(scale)),dof.Failure());
+        D3D12_RESOURCE_BARRIER to_present[]{
+            Transition(filtered.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(prepared.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+        list->ResourceBarrier(2,to_present);
+        bind(present_srvs.Get());list->SetPipelineState(present_pso.Get());
+        const D3D12_VIEWPORT logical_view{0,0,float(scene.width),float(scene.height),0,1};
+        list->RSSetViewports(1,&logical_view);list->RSSetScissorRects(1,&scene.scissor);
+        list->OMSetRenderTargets(1,&rh[3],FALSE,nullptr);
+        list->DrawInstanced(3,1,0,0);
+        auto footprint=Footprint(result.Get());
+        auto readback=NewBuffer(footprint.bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+        auto for_copy=Transition(result.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1,&for_copy);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};
+        src.pResource=result.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=readback.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint=footprint.placed;
+        list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        Hr(list->Close(),"Close world adapter list");
+        ID3D12CommandList* command_lists[]{list.Get()};queue_->ExecuteCommandLists(1,command_lists);
+        const uint64_t value=++fence_value_;Hr(queue_->Signal(fence_.Get(),value),"Signal world adapter fence");
+        if (fence_->GetCompletedValue()<value) {
+            Hr(fence_->SetEventOnCompletion(value,event_),"Wait world adapter fence");
+            Check(WaitForSingleObject(event_,30000)==WAIT_OBJECT_0,"WARP world adapter timed out");
+        }
+        CheckDebugMessages();
+        return ReadPixels(readback.Get(),footprint.placed,scene.width,scene.height);
     }
 
     std::vector<Pixel> Render(const SmokeScene& scene, bool wrapped, bool blend,
@@ -510,6 +730,11 @@ public:
                               bool small_radius_filter = false,
                               std::vector<Pixel>* filter_pixels = nullptr,
                               bool interior_filter = false) {
+        const bool aware = scene.geometry.globals.projection[2] > 0;
+        const bool true_ms = aware || scene.native_msaa;
+        const uint32_t target_samples = true_ms ? depth_samples : 1;
+        Check(!aware || (atlas && wrapped),
+              "blur-aware smoke fixture must use the actual atlas composite");
         Check(!additive || blend, "additive smoke needs its native blend state");
         Check(!additive || !reference, "the frozen reference predates additive smoke");
         Check(!reference || !v25, "select only one frozen smoke reference");
@@ -522,6 +747,9 @@ public:
               scene.source_depth.size() == size_t(scene.width) * scene.height &&
               !scene.vertices.empty() && scene.vertices.size() % 4 == 0,
               "invalid smoke fixture dimensions");
+        Check(scene.world_blurred.empty() ||
+              scene.world_blurred.size()==size_t(scene.width)*scene.height,
+              "production world result does not match the particle target");
         Check(scene.vertices.size() / 4 <= gpu::kParticleDofMaxQuads,
               "smoke fixture exceeds production metadata capacity");
         Check(depth_samples == 1 || depth_samples == 2 || depth_samples == 4 ||
@@ -561,7 +789,54 @@ public:
         ComPtr<ID3D12Resource> target = NewTexture(scene.width, scene.height,
                                                    DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+                                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                                   target_samples);
+        ComPtr<ID3D12Resource> world_texture;
+        Upload world_upload{};
+        ComPtr<ID3D12DescriptorHeap> world_srvs;
+        ComPtr<ID3D12PipelineState> world_blit;
+        if (!scene.world_blurred.empty()) {
+            static_assert(sizeof(Pixel)==16);
+            world_texture=NewTexture(scene.width,scene.height,DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                     D3D12_RESOURCE_STATE_COPY_DEST);
+            world_upload=UploadTexture(world_texture.Get(),scene.world_blurred.data(),scene.width*sizeof(Pixel));
+            const std::string blit_hlsl=R"(
+Texture2D<float4> worldImage : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 uv=float2((id<<1)&2,id&2);
+    return float4(uv*float2(2,-2)+float2(-1,1),0,1);
+}
+float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(pos.xy,0)); }
+)";
+            auto bvs=Compile(blit_hlsl,"vs_5_0","vs"),bps=Compile(blit_hlsl,"ps_5_0","ps");
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC bp{};
+            bp.pRootSignature=root_.Get();
+            bp.VS={bvs->GetBufferPointer(),bvs->GetBufferSize()};
+            bp.PS={bps->GetBufferPointer(),bps->GetBufferSize()};
+            bp.SampleMask=UINT_MAX;
+            bp.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;
+            bp.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
+            bp.RasterizerState.DepthClipEnable=TRUE;
+            bp.RasterizerState.MultisampleEnable=target_samples>1;
+            bp.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            bp.NumRenderTargets=1;bp.RTVFormats[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            bp.SampleDesc.Count=target_samples;
+            bp.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+            Hr(device_->CreateGraphicsPipelineState(&bp,IID_PPV_ARGS(&world_blit)),
+               "Create world-result transfer pipeline");
+            D3D12_DESCRIPTOR_HEAP_DESC sh{};
+            sh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            sh.NumDescriptors=4;sh.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            Hr(device_->CreateDescriptorHeap(&sh,IID_PPV_ARGS(&world_srvs)),
+               "Create world-result SRV heap");
+            auto handle=world_srvs->GetCPUDescriptorHandleForHeapStart();
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;
+            sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Texture2D.MipLevels=1;
+            sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            device_->CreateShaderResourceView(world_texture.Get(),&sv,handle);
+        }
         ComPtr<ID3D12Resource> atlas_source,atlas_filtered;
         if (atlas) {
             atlas_source = NewTexture(kAtlasExtent,kAtlasExtent,
@@ -643,17 +918,19 @@ public:
                 if (baseline_filter) {
                     constexpr size_t legacy_prefix=offsetof(gpu::DrawConstants,rtshift);
                     static_assert(legacy_prefix==2080 && sizeof(dc)==2096);
-                    static_assert(sizeof(gpu::ParticleDofGlobals)==64 &&
+                    constexpr size_t legacy_globals_bytes=64;
+                    static_assert(offsetof(gpu::ParticleDofGlobals, projection)==legacy_globals_bytes &&
                                   sizeof(gpu::ParticleDofQuad)==48);
-                    std::vector<uint8_t> legacy_bytes(legacy_prefix+sizeof(page_globals)+
+                    std::vector<uint8_t> legacy_bytes(legacy_prefix+legacy_globals_bytes+
                         gpu::kParticleDofMaxQuads*sizeof(gpu::ParticleDofQuad));
                     std::memcpy(legacy_bytes.data(),&dc,legacy_prefix);
                     std::memcpy(legacy_bytes.data()+legacy_prefix,&page_globals,
-                                sizeof(page_globals));
-                    std::memcpy(legacy_bytes.data()+legacy_prefix+sizeof(page_globals),
+                                legacy_globals_bytes);
+                    std::memcpy(legacy_bytes.data()+legacy_prefix+legacy_globals_bytes,
                                 metadata.data(),metadata.size()*sizeof(metadata[0]));
-                    Check(legacy_bytes.size()+sizeof(dc)-legacy_prefix==bytes.size(),
-                          "frozen filter constant-buffer tail is not exactly 16 bytes shorter");
+                    Check(legacy_bytes.size()+sizeof(dc)-legacy_prefix+
+                              sizeof(page_globals)-legacy_globals_bytes==bytes.size(),
+                          "frozen filter constant-buffer tail has the wrong legacy layout");
                     legacy_filter_page_cb.push_back(
                         UploadBuffer(legacy_bytes.data(),legacy_bytes.size()));
                 }
@@ -776,7 +1053,11 @@ public:
                                            additive ? additive_ps_[ps_index] :
                                                       wrapped_ps_[ps_index])) : native_ps_,
                                 "ps_5_0");
-        ComPtr<ID3D12PipelineState> pso = Pipeline(vs.Get(), ps.Get(), blend, additive);
+        ComPtr<ID3D12PipelineState> pso = Pipeline(vs.Get(), ps.Get(), blend, additive,
+                                                   target_samples, true_ms,
+                                                   scene.native_msaa && !wrapped,
+                                                   scene.reverse_subtract,
+                                                   scene.geometry.globals.target[3] > 0.5f);
         ComPtr<ID3D12PipelineState> source_pso,composite_pso,filter_pso;
         if (atlas) {
             const uint32_t mode=additive?1:0;
@@ -784,8 +1065,79 @@ public:
             const auto source_ps=Compile(alpha_function==7?atlas_source_ps_[mode][ps_index]:
                 gpu::MakeParticleDofPixelShader(native_ps_,depth_samples,mode,alpha_function,1),"ps_5_0");
             const auto composite_vs=Compile(atlas_composite_vs_,"vs_5_0");
-            const auto composite_ps=Compile(alpha_function==7?atlas_composite_ps_[mode][ps_index]:
-                gpu::MakeParticleDofPixelShader(native_ps_,depth_samples,mode,alpha_function,2),"ps_5_0");
+            std::string composite_source=alpha_function==7?atlas_composite_ps_[mode][ps_index]:
+                gpu::MakeParticleDofPixelShader(native_ps_,depth_samples,mode,alpha_function,2);
+            if (scene.depth_probe) composite_source+=R"(
+float4 depth_probe(VOut i) : SV_Target {
+    float opaque=ParticleRawDepth(int2(i.pos.xy),0);
+    int codeDelta=int(ParticleD24Code(i.pos.z))-int(ParticleD24Code(opaque));
+    return float4(i.pos.z,opaque,clamp(float(codeDelta)/16.0,-1.0,1.0),
+                  ParticleDepthPass(i.pos.z,opaque,particleTarget.w>.5)?1.0:0.0);
+}
+)";
+            if (scene.sample_frequency_reference) composite_source+=R"(
+ParticleFinal sample_reference(VOut i, bool front : SV_IsFrontFace,
+                               uint sampleIndex : SV_SampleIndex) {
+    // Evaluate the same atlas field at the pixel center for each destination
+    // sample. Only coverage/transmission changes across samples.
+    i.pos.xy=floor(i.pos.xy)+.5;
+    ParticleFinal result=(ParticleFinal)0;
+    float4 color=ParticleAtlasComposite(i,front);
+    float2 coverage=ParticleCoverage(i,color.a,1u << sampleIndex);
+    result.color=ParticleTransmit(color,coverage);
+    result.coverage=(uint)coverage.x;
+    return result;
+}
+)";
+            if (scene.coverage_probe) composite_source+=R"(
+float4 coverage_probe(VOut i, bool front : SV_IsFrontFace,
+                      uint rasterCoverage : SV_Coverage) : SV_Target {
+    float4 original=ParticleAtlasComposite(i,front);
+    float2 coverage=ParticleCoverage(i,original.a,rasterCoverage);
+    float4 color=ParticleTransmit(original,coverage);
+    return float4(color.a,coverage.x/255.0,
+                  float(rasterCoverage)/255.0,ParticleActiveRadius(i));
+}
+)";
+            const auto composite_ps=Compile(composite_source,"ps_5_0",
+                scene.depth_probe?"depth_probe":
+                scene.sample_frequency_reference?"sample_reference":
+                scene.coverage_probe?"coverage_probe":"main");
+            if (aware && depth_samples==4 && !scene.depth_probe &&
+                !scene.sample_frequency_reference && !scene.coverage_probe) {
+                static bool dumped=false;
+                if (!dumped) {
+                    ComPtr<ID3DBlob> assembly;
+                    Hr(D3DDisassemble(composite_ps->GetBufferPointer(),
+                                      composite_ps->GetBufferSize(),0,nullptr,&assembly),
+                       "Disassemble production 4x particle pass2");
+                    const std::string text(static_cast<const char*>(assembly->GetBufferPointer()),
+                                           assembly->GetBufferSize());
+                    const auto directory=std::filesystem::path("out")/"reports"/"smoke-dof";
+                    std::filesystem::create_directories(directory);
+                    std::ofstream file(directory/"aware-pass2-ms4.asm",std::ios::binary);
+                    file.write(text.data(),std::streamsize(text.size()));
+                    Check(bool(file),"cannot save production pass2 disassembly");
+                    bool computed_mask_write=false;
+                    for (size_t at=0;at<text.size();) {
+                        const size_t end=text.find('\n',at);
+                        const std::string_view line(text.data()+at,
+                            (end==std::string::npos?text.size():end)-at);
+                        if (line.find("oMask")!=std::string_view::npos ||
+                            line.find("dcl_output")!=std::string_view::npos)
+                            std::printf("pass2 MS4 assembly: %.*s\n",int(line.size()),line.data());
+                        if (line.find("oMask")!=std::string_view::npos &&
+                            line.find("dcl_")==std::string_view::npos &&
+                            line.find("vCoverage")==std::string_view::npos)
+                            computed_mask_write=true;
+                        if (end==std::string::npos) break;
+                        at=end+1;
+                    }
+                    Check(computed_mask_write,
+                          "production 4x pass2 DXBC writes only incoming raster coverage");
+                    dumped=true;
+                }
+            }
             const std::string filter_source=baseline_filter ?
                 smoke_f543::gpu::kParticleDofAtlasFilterHlsl :
                 (small_radius_filter || interior_filter) ?
@@ -793,9 +1145,12 @@ public:
                     gpu::kParticleDofAtlasFilterHlsl;
             const auto filter_vs=Compile(filter_source,"vs_5_0","vs");
             const auto filter_ps=Compile(filter_source,"ps_5_0","filter_ps");
-            CheckAtlasFilterCbufferLayout(filter_vs.Get(),baseline_filter ? 2080 : 2096);
+            CheckAtlasFilterCbufferLayout(filter_vs.Get(),baseline_filter ? 2080 : 2096,
+                                          baseline_filter ? 64 : 80);
             source_pso=Pipeline(source_vs.Get(),source_ps.Get(),false);
-            composite_pso=Pipeline(composite_vs.Get(),composite_ps.Get(),blend,additive);
+            composite_pso=Pipeline(composite_vs.Get(),composite_ps.Get(),
+                                   (scene.depth_probe || scene.coverage_probe)?false:blend,additive,
+                                   target_samples,true_ms,false,scene.reverse_subtract);
             filter_pso=RangePipeline(filter_vs.Get(),filter_ps.Get(),
                                      DXGI_FORMAT_R16G16B16A16_FLOAT);
         }
@@ -826,6 +1181,11 @@ public:
                                         D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &depth_to_copy);
         list->CopyResource(depth_copy.Get(), depth.Get());
+        if (true_ms) {
+            const auto native_depth = Transition(depth.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_DEPTH_READ);
+            list->ResourceBarrier(1,&native_depth);
+        }
         D3D12_RESOURCE_BARRIER to_read[2] = {Transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
                            Transition(depth_copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -857,7 +1217,30 @@ public:
         }
         const float clear[] = {scene.clear.r, scene.clear.g, scene.clear.b, scene.clear.a};
         list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        if (world_texture) {
+            CopyUpload(list.Get(),world_texture.Get(),world_upload);
+            auto world_read=Transition(world_texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1,&world_read);
+            ID3D12DescriptorHeap* world_heap[]{world_srvs.Get()};
+            list->SetDescriptorHeaps(1,world_heap);
+            list->SetGraphicsRootSignature(root_.Get());
+            list->SetGraphicsRootDescriptorTable(0,world_srvs->GetGPUDescriptorHandleForHeapStart());
+            list->SetPipelineState(world_blit.Get());
+            const D3D12_VIEWPORT world_view{0,0,float(scene.width),float(scene.height),0,1};
+            list->RSSetViewports(1,&world_view);
+            list->RSSetScissorRects(1,&scene.scissor);
+            list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->DrawInstanced(3,1,0,0);
+        }
+        ComPtr<ID3D12PipelineState> sample_color_initializer;
+        if (scene.mixed_sample_color) {
+            Check(target_samples > 1,
+                  "single-sample background color requires an MSAA target");
+            sample_color_initializer=DrawOneSampleColor(list.Get(),rtv,scene,target_samples);
+        }
+        list->OMSetRenderTargets(1, &rtv, FALSE, true_ms ? &dsv : nullptr);
         D3D12_VIEWPORT viewport{0, 0, float(scene.width), float(scene.height), 0, 1};
         list->RSSetViewports(1, &viewport);
         list->RSSetScissorRects(1, &scene.scissor);
@@ -941,7 +1324,7 @@ public:
                     list->ResourceBarrier(1,&b);
                     filtered_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
                 }
-                list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
+                list->OMSetRenderTargets(1,&rtv,FALSE,true_ms ? &dsv : nullptr);
                 list->RSSetViewports(1,&viewport);
                 list->RSSetScissorRects(1,&scene.scissor);
                 bind_heap(atlas_composite_srvs.Get());
@@ -953,14 +1336,28 @@ public:
             }
         }
 
-        auto footprint = Footprint(target.Get());
+        ComPtr<ID3D12Resource> resolved_target;
+        ID3D12Resource* read_target=target.Get();
+        if (target_samples > 1) {
+            resolved_target=NewTexture(scene.width,scene.height,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_RESOLVE_DEST);
+            auto to_resolve=Transition(target.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                       D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            list->ResourceBarrier(1,&to_resolve);
+            list->ResolveSubresource(resolved_target.Get(),0,target.Get(),0,
+                                     DXGI_FORMAT_R16G16B16A16_FLOAT);
+            read_target=resolved_target.Get();
+        }
+        auto footprint = Footprint(read_target);
         auto readback = NewBuffer(footprint.bytes, D3D12_HEAP_TYPE_READBACK,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
-        auto barrier = Transition(target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+        auto barrier = Transition(read_target,
+            target_samples > 1 ? D3D12_RESOURCE_STATE_RESOLVE_DEST :
+                                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &barrier);
         D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-        source.pResource = target.Get();
+        source.pResource = read_target;
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         destination.pResource = readback.Get();
         destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -1008,10 +1405,12 @@ private:
     struct CopyFootprint { D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed{}; UINT64 bytes = 0; };
 
     ComPtr<ID3D12Resource> NewTexture(uint32_t width, uint32_t height, DXGI_FORMAT format,
-        D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
+        D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE,
+        uint32_t samples = 1) {
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        const auto desc = TextureDesc(width, height, format, flags);
+        auto desc = TextureDesc(width, height, format, flags);
+        desc.SampleDesc.Count = samples;
         ComPtr<ID3D12Resource> result;
         Hr(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
                                             nullptr, IID_PPV_ARGS(&result)), "Create smoke texture");
@@ -1054,7 +1453,8 @@ private:
         const auto vs = Compile(
             "float4 main(uint id:SV_VertexID):SV_Position { return float4(id==2?3:-1,id==1?-3:1,0,1); }",
             "vs_5_0");
-        const auto ps = Compile("float main():SV_Depth { return 0.1; }", "ps_5_0");
+        const auto ps = Compile("float main():SV_Depth { return " +
+                                std::to_string(scene.sample_occluder_depth) + "; }", "ps_5_0");
         D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};
         p.pRootSignature = root_.Get();
         p.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
@@ -1082,6 +1482,44 @@ private:
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
         return init;
+    }
+
+    ComPtr<ID3D12PipelineState> DrawOneSampleColor(ID3D12GraphicsCommandList* list,
+                               D3D12_CPU_DESCRIPTOR_HANDLE rtv,const SmokeScene& scene,
+                               uint32_t samples) {
+        const auto vs=Compile(
+            "float4 main(uint id:SV_VertexID):SV_Position { return float4(id==2?3:-1,id==1?-3:1,0,1); }",
+            "vs_5_0");
+        const Pixel& c=scene.sample_color;
+        const auto ps=Compile("float4 main():SV_Target { return float4("+
+            std::to_string(c.r)+","+std::to_string(c.g)+","+
+            std::to_string(c.b)+","+std::to_string(c.a)+"); }","ps_5_0");
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};
+        p.pRootSignature=root_.Get();
+        p.VS={vs->GetBufferPointer(),vs->GetBufferSize()};
+        p.PS={ps->GetBufferPointer(),ps->GetBufferSize()};
+        p.SampleMask=1;
+        p.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;
+        p.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
+        p.RasterizerState.DepthClipEnable=TRUE;
+        p.RasterizerState.MultisampleEnable=TRUE;
+        p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        p.NumRenderTargets=1;
+        p.RTVFormats[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+        p.SampleDesc.Count=samples;
+        p.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+        ComPtr<ID3D12PipelineState> init;
+        Hr(device_->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&init)),
+           "Create one-sample background color pipeline");
+        list->SetPipelineState(init.Get());
+        list->SetGraphicsRootSignature(root_.Get());
+        list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
+        const D3D12_VIEWPORT viewport{0,0,float(scene.width),float(scene.height),0,1};
+        list->RSSetViewports(1,&viewport);
+        list->RSSetScissorRects(1,&scene.sample_color_rect);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3,1,0,0);
+        return init; // PSO must outlive command-list execution.
     }
 
     ComPtr<ID3D12Resource> NewBuffer(UINT64 bytes, D3D12_HEAP_TYPE type,
@@ -1210,7 +1648,11 @@ private:
     }
 
     ComPtr<ID3D12PipelineState> Pipeline(ID3DBlob* vs, ID3DBlob* ps, bool blend,
-                                          bool additive = false) {
+                                          bool additive = false, uint32_t samples = 1,
+                                          bool native_depth_attached = false,
+                                          bool hardware_depth = false,
+                                          bool reverse_subtract = false,
+                                          bool less_equal = false) {
         D3D12_INPUT_ELEMENT_DESC attributes[] = {
             {"ATTR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -1228,20 +1670,25 @@ private:
         p.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         p.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         p.RasterizerState.DepthClipEnable = TRUE;
-        p.DepthStencilState.DepthEnable = FALSE;
+        p.RasterizerState.MultisampleEnable = samples > 1;
+        p.DepthStencilState.DepthEnable = hardware_depth;
+        p.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        p.DepthStencilState.DepthFunc = less_equal ? D3D12_COMPARISON_FUNC_LESS_EQUAL :
+                                                 D3D12_COMPARISON_FUNC_LESS;
+        p.DSVFormat = native_depth_attached ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
         p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         p.NumRenderTargets = 1;
         p.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        p.SampleDesc.Count = 1;
+        p.SampleDesc.Count = samples;
         auto& b = p.BlendState.RenderTarget[0];
         b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         b.BlendEnable = blend;
         b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
         b.DestBlend = additive ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
-        b.BlendOp = D3D12_BLEND_OP_ADD;
+        b.BlendOp = reverse_subtract ? D3D12_BLEND_OP_REV_SUBTRACT : D3D12_BLEND_OP_ADD;
         b.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
         b.DestBlendAlpha = additive ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
-        b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        b.BlendOpAlpha = reverse_subtract ? D3D12_BLEND_OP_REV_SUBTRACT : D3D12_BLEND_OP_ADD;
         ComPtr<ID3D12PipelineState> result;
         Hr(device_->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&result)),
            "CreateGraphicsPipelineState(smoke)");
@@ -1327,6 +1774,23 @@ SmokeScene Scene(float view_z = 3.0f) {
     for (auto& v : q) v.argb = 0xC0FFFFFF;
     s.vertices.assign(q.begin(), q.end());
     return s;
+}
+
+float RawDepth(float view_z) { return 1.0f - 1.0f / view_z; }
+
+void EnableAwareCoverage(SmokeScene& scene) {
+    // Match the native VS in Params(): raw depth is 1-1/viewZ. Validity is
+    // explicit; an unverified projection must keep the old depth path.
+    scene.geometry.globals.projection[0] = -1.0f;
+    scene.geometry.globals.projection[1] = 1.0f;
+    scene.geometry.globals.projection[2] = 1.0f;
+}
+
+void FillWall(SmokeScene& scene, D3D12_RECT rect, float view_z) {
+    const float raw = RawDepth(view_z);
+    for (LONG y = rect.top; y < rect.bottom; ++y)
+        for (LONG x = rect.left; x < rect.right; ++x)
+            scene.source_depth[At(scene, uint32_t(x), uint32_t(y))] = raw;
 }
 
 void WriteBmp(const char* name, const SmokeScene& scene,
@@ -1836,6 +2300,378 @@ void CheckAtlasOcclusionAndMsaa(Warp& warp) {
     }
 }
 
+void CheckAwareDestinationCoverage(Warp& warp) {
+    auto smoke = Scene(12.0f);
+    smoke.geometry.globals.optics[1] = 24.0f;
+    EnableAwareCoverage(smoke);
+    const D3D12_RECT whole{40,24,56,40}, left{40,24,48,40};
+    auto render = [&](const SmokeScene& scene) {
+        auto pixels = warp.Render(scene,true,false,1,false,false,false,false,true);
+        CheckFinite(pixels);
+        return pixels;
+    };
+    auto hidden = smoke;
+    FillWall(hidden,whole,5.0f);
+    const auto hidden_pixels=render(hidden);
+    float hidden_alpha=0;
+    for (const auto& p:hidden_pixels) hidden_alpha=std::max(hidden_alpha,p.a);
+    Check(hidden_alpha<0.003f,
+          "fully occluded smoke appeared beyond an opaque wall after blur-aware composite");
+
+    auto focused=smoke;
+    FillWall(focused,left,5.0f);
+    const auto focused_pixels=render(focused);
+    const float focused_blocked=focused_pixels[At(focused,47,32)].a;
+    Check(focused_blocked<0.003f,
+          "in-focus wall leaked defocused smoke across its exact depth edge");
+
+    auto narrow=smoke;
+    FillWall(narrow,left,4.0f); // near wall radius < the far particle radius
+    const auto narrow_pixels=render(narrow);
+    const float narrow_edge=narrow_pixels[At(narrow,47,32)].a;
+    auto broad=smoke;
+    FillWall(broad,left,3.0f); // wall radius >= the particle radius
+    const auto broad_pixels=render(broad);
+    const float broad_edge=broad_pixels[At(broad,47,32)].a;
+    Check(narrow_edge>focused_blocked+0.002f &&
+          narrow_edge<broad_pixels[At(broad,49,32)].a,
+          "blurred foreground wall retained a hard step or exceeded exposed smoke");
+    Check(broad_edge>=narrow_edge-0.01f,
+          "broader foreground aperture reduced edge visibility a second time");
+    auto invalid=narrow;
+    invalid.geometry.globals.projection[0]=NAN;
+    const auto invalid_pixels=render(invalid);
+    Check(invalid_pixels[At(invalid,47,32)].a<0.003f,
+          "invalid world projection failed closed at the blocked smoke edge");
+    WriteBmp("aware-focused-wall-after.bmp",focused,focused_pixels);
+    WriteBmp("aware-defocused-wall-after.bmp",narrow,narrow_pixels);
+    std::printf("aware wall: hidden max alpha %.5f, focused/narrow/broad edge %.5f/%.5f/%.5f\n",
+                hidden_alpha,focused_blocked,narrow_edge,broad_edge);
+}
+
+void CheckAwareMultisampleAndNativeFallback(Warp& warp) {
+    if (!g_mixed_focus_only) for (uint32_t samples : {1u,2u,4u,8u}) {
+        if (samples>1 && !warp.SupportsDepthSamples(samples)) {
+            std::printf("%ux aware D24S8 destination UNSUPPORTED on WARP\n",samples);
+            continue;
+        }
+        auto focused=Scene(5.0f);
+        focused.native_msaa=true;
+        focused.sample_occluder_depth=RawDepth(5.0f);
+        focused.sample_occluder={40,24,56,40};
+        std::fill(focused.source_depth.begin(),focused.source_depth.end(),
+                  RawDepth(5.0f));
+        for (float comparison : {0.0f,1.0f}) {
+            focused.geometry.globals.target[3]=comparison;
+            auto manual=focused;
+            manual.native_msaa=false;
+            EnableAwareCoverage(manual);
+            const auto native=warp.Render(focused,false,true,samples);
+            const auto aware=warp.Render(manual,true,true,samples,false,false,false,false,true);
+            CheckFinite(native); CheckFinite(aware);
+            float max_rgba=0;
+            size_t max_index=0;
+            for (size_t i=0;i<native.size();++i) {
+                const float error=std::max({std::abs(native[i].r-aware[i].r),
+                    std::abs(native[i].g-aware[i].g),std::abs(native[i].b-aware[i].b),
+                    std::abs(native[i].a-aware[i].a)});
+                if (error>max_rgba) {max_rgba=error;max_index=i;}
+            }
+            const auto& n=native[max_index],&a=aware[max_index];
+            std::printf("%ux focused D24 %s max RGBA %.6f at (%zu,%zu); "
+                        "native=(%.6f,%.6f,%.6f,%.6f) aware=(%.6f,%.6f,%.6f,%.6f)\n",
+                        samples,comparison>0?"LEQUAL":"LESS",max_rgba,
+                        max_index%focused.width,max_index/focused.width,
+                        n.r,n.g,n.b,n.a,a.r,a.g,a.b,a.a);
+            if (max_rgba>=.006f && samples==1) {
+                auto diagnostic=manual;
+                diagnostic.depth_probe=true;
+                const auto depths=warp.Render(diagnostic,true,false,samples,
+                                              false,false,false,false,true);
+                const auto& d=depths[max_index];
+                std::printf("1x focused D24 probe at (%zu,%zu): incoming/raw %.9f/%.9f, "
+                            "code delta/16 %.6f, manual pass %.0f\n",
+                            max_index%focused.width,max_index/focused.width,
+                            d.r,d.g,d.b,d.a);
+            }
+            Check(max_rgba<0.006f,
+                  "focused/coplanar smoke manual SV_Coverage diverged from native D24 hardware depth");
+        }
+        if (samples==1) continue;
+        auto mixed=Scene(12.0f);
+        EnableAwareCoverage(mixed);
+        mixed.sample_occluder_depth=RawDepth(5.0f);
+        const auto open=warp.Render(mixed,true,true,samples,false,false,false,false,true);
+        const auto one_blocked=warp.Render(mixed,true,true,samples,true,false,false,false,true);
+        CheckFinite(open); CheckFinite(one_blocked);
+        const float open_alpha=open[At(mixed,48,32)].a;
+        const float mixed_alpha=one_blocked[At(mixed,48,32)].a;
+        Check(open_alpha>0.25f && mixed_alpha>0 && mixed_alpha<open_alpha,
+              "blur-aware MSAA source/destination coverage lost its partial sample ordering");
+        std::printf("%ux aware focused single-sample wall: open/mixed alpha %.5f/%.5f ratio %.4f\n",
+                    samples,open_alpha,mixed_alpha,mixed_alpha/open_alpha);
+    }
+
+    // The focused second quad must retain the exact native per-sample result
+    // even though the first quad activates atlas blur in the same draw batch.
+    for (uint32_t samples : {1u,4u}) {
+        if (g_mixed_focus_only && samples!=4) continue;
+        if (samples>1 && !warp.SupportsDepthSamples(samples)) continue;
+        auto pair=Scene(12.0f);
+        auto focused_quad=Quad(65,24,81,40,1.0f/5.0f,2.25f);
+        for (auto& v:focused_quad) v.argb=0xC0FFFFFF;
+        pair.vertices.insert(pair.vertices.end(),focused_quad.begin(),focused_quad.end());
+        pair.sample_occluder={68,28,76,36};
+        pair.sample_occluder_depth=RawDepth(4.0f);
+        EnableAwareCoverage(pair);
+        auto native=pair;
+        native.vertices.assign(focused_quad.begin(),focused_quad.end());
+        native.geometry.globals.projection[2]=0;
+        native.native_msaa=true;
+        const auto expected=warp.Render(native,false,true,samples,samples>1);
+        const auto actual=warp.Render(pair,true,true,samples,samples>1,
+                                      false,false,false,true);
+        float max_rgba=0;
+        uint32_t max_x=0,max_y=0;
+        for (uint32_t y=27;y<37;++y) for (uint32_t x=68;x<78;++x) {
+            const auto& a=actual[At(pair,x,y)];
+            const auto& b=expected[At(pair,x,y)];
+            const float difference=std::max({std::abs(a.r-b.r),std::abs(a.g-b.g),
+                                             std::abs(a.b-b.b),std::abs(a.a-b.a)});
+            if (difference>max_rgba) {max_rgba=difference;max_x=x;max_y=y;}
+        }
+        const auto& n=expected[At(pair,max_x,max_y)];
+        const auto& a=actual[At(pair,max_x,max_y)];
+        std::printf("%ux active-batch focused/native ROI max RGBA %.6f at (%u,%u); "
+                    "native=(%.6f,%.6f,%.6f,%.6f) aware=(%.6f,%.6f,%.6f,%.6f)\n",
+                    samples,max_rgba,max_x,max_y,n.r,n.g,n.b,n.a,a.r,a.g,a.b,a.a);
+        if (max_rgba>=.006f && samples>1) {
+            auto diagnostic=pair;
+            diagnostic.coverage_probe=true;
+            const auto probe=warp.Render(diagnostic,true,false,samples,samples>1,
+                                         false,false,false,true);
+            const auto& p=probe[At(pair,max_x,max_y)];
+            std::printf("%ux focused coverage probe at (%u,%u): color alpha %.6f, "
+                        "final mask/255 %.6f, raster mask/255 %.6f, radius %.6f\n",
+                        samples,max_x,max_y,p.r,p.g,p.b,p.a);
+        }
+        Check(max_rgba<.006f,
+              "focused quad in active blur batch changed native per-sample depth or blend");
+    }
+    if (g_mixed_focus_only) return;
+
+    // A differently colored destination sample tests the covariance lost by
+    // pixel-frequency T averaging. This is a bounded approximation diagnostic,
+    // not a claim that a multisampled blurred layer preserves exact covariance.
+    for (uint32_t samples : {4u,8u}) {
+        if (!warp.SupportsDepthSamples(samples)) continue;
+        auto scene=Scene(12.0f);
+        EnableAwareCoverage(scene);
+        scene.mixed_sample_color=true;
+        scene.sample_color_rect={44,28,53,37};
+        scene.sample_occluder={44,28,49,37};
+        scene.sample_occluder_depth=RawDepth(5.0f);
+        auto blank=scene;
+        std::fill(blank.texture.begin(),blank.texture.end(),Rgba(255,0,0,0));
+        const auto background=warp.Render(blank,true,true,samples,true,false,false,false,true);
+        auto uniform=scene;uniform.mixed_sample_color=false;
+        const auto uniform_result=warp.Render(uniform,true,true,samples,true,false,false,false,true);
+        const auto mixed=warp.Render(scene,true,true,samples,true,false,false,false,true);
+        CheckFinite(background);CheckFinite(uniform_result);CheckFinite(mixed);
+        const float nominal=scene.sample_color.g/float(samples);
+        const float isolated=background[At(scene,47,32)].g;
+        const float blocked_delta=mixed[At(scene,47,32)].g-
+                                  uniform_result[At(scene,47,32)].g;
+        const float open_delta=mixed[At(scene,50,32)].g-
+                               uniform_result[At(scene,50,32)].g;
+        Check(std::abs(isolated-nominal)<.006f &&
+              blocked_delta>.5f*nominal && blocked_delta<=isolated+.015f &&
+              open_delta>=-.006f && open_delta<blocked_delta-.005f,
+              "blur-aware MSAA composite lost colored-background sample covariance bounds");
+        std::printf("%ux colored MSAA destination: isolated %.5f, blocked/open "
+                    "green deltas %.5f/%.5f (pixel-frequency approximation)\n",
+                    samples,isolated,blocked_delta,open_delta);
+    }
+}
+
+void CheckAwareDefocusedCoplanarDepth(Warp& warp) {
+    // D24 equality affects both source visibility and destination coverage.
+    // z=2 maps exactly to raw .5; z=10 exercises raw .9 rounding. A wrong
+    // float-vs-D24 comparison creates blurred energy under native LESS.
+    for (float view_z : {2.0f,10.0f}) {
+        for (uint32_t samples : {1u,4u,8u}) {
+            if (samples>1 && !warp.SupportsDepthSamples(samples)) continue;
+            auto wall=Scene(view_z);
+            std::fill(wall.source_depth.begin(),wall.source_depth.end(),RawDepth(view_z));
+            wall.native_msaa=true;
+            for (float comparison : {0.0f,1.0f}) {
+                wall.geometry.globals.target[3]=comparison;
+                auto aware=wall;
+                aware.native_msaa=false;
+                EnableAwareCoverage(aware);
+                const auto native_pixels=warp.Render(wall,false,true,samples);
+                const auto aware_pixels=warp.Render(aware,true,true,samples,
+                                                    false,false,false,false,true);
+                CheckFinite(native_pixels);CheckFinite(aware_pixels);
+                const float native_alpha=native_pixels[At(wall,48,32)].a;
+                const float aware_alpha=aware_pixels[At(wall,48,32)].a;
+                std::printf("%ux defocused D24 coplanar z%.1f %s native/aware alpha %.6f/%.6f\n",
+                            samples,view_z,comparison>0?"LEQUAL":"LESS",
+                            native_alpha,aware_alpha);
+                if (view_z==2.0f && comparison==0.0f)
+                    Check(native_alpha<.003f && aware_alpha<.003f,
+                          "defocused coplanar D24 LESS source leaked hidden particle energy");
+                else if (native_alpha<.003f)
+                    Check(aware_alpha<.003f,
+                          "defocused coplanar source differs from native D24 rejection");
+                else
+                    Check(native_alpha>.05f && aware_alpha>.05f,
+                          "defocused coplanar source differs from native D24 acceptance");
+            }
+        }
+    }
+}
+
+void CheckWorldThenLateParticles(Warp& warp) {
+    SmokeScene scene;
+    scene.width=128;scene.height=512;
+    scene.scissor={0,0,128,512};
+    scene.geometry=Params(128,512,30);
+    scene.source_depth.assign(size_t(scene.width)*scene.height,1.0f);
+    scene.texture.assign(size_t(scene.tex_width)*scene.tex_height,Rgba(255,24,24,255));
+    const std::array<D3D12_RECT,3> particle_rects{{
+        {50,75,78,125},{50,225,78,275},{50,375,78,425}}};
+    scene.vertices.clear();
+    for (const auto& r:particle_rects) {
+        auto q=Quad(float(r.left),float(r.top),float(r.right),float(r.bottom),
+                    1.0f/12.0f,2.25f);
+        for (auto& v:q) v.argb=0xC0FFFFFF;
+        scene.vertices.insert(scene.vertices.end(),q.begin(),q.end());
+    }
+    FillWall(scene,{48,65,64,135},5.0f);  // focused foreground, hard silhouette
+    FillWall(scene,{48,215,64,285},4.0f); // defocused foreground, narrow aperture
+    FillWall(scene,{48,365,82,435},4.0f); // every particle source texel hidden
+    EnableAwareCoverage(scene);
+    for (bool cinematic : {false,true}) {
+        scene.world_blurred=warp.BlurWorld(scene,cinematic);
+        CheckFinite(scene.world_blurred);
+        const auto composed=warp.Render(scene,true,true,1,false,false,false,false,true);
+        CheckFinite(composed);
+        const auto focused_index=At(scene,63,100),soft_index=At(scene,63,250),
+                   hidden_index=At(scene,64,400);
+        auto red_delta=[&](size_t i) {return composed[i].r-scene.world_blurred[i].r;};
+        const float focused_delta=red_delta(focused_index),soft_delta=red_delta(soft_index),
+                    hidden_delta=red_delta(hidden_index);
+        Check(std::abs(focused_delta)<0.004f && std::abs(hidden_delta)<0.004f,
+              "late smoke appeared through a focused or fully occluding building");
+        Check(soft_delta>focused_delta+0.002f && soft_delta<0.25f,
+              "late smoke retained a hard edge against a blurred building");
+        WriteBmp(cinematic?"cinematic-world-before-smoke.bmp":"standard-world-before-smoke.bmp",
+                 scene,scene.world_blurred,false);
+        WriteBmp(cinematic?"cinematic-world-late-smoke.bmp":"standard-world-late-smoke.bmp",
+                 scene,composed,false);
+        std::printf("%s production world+late smoke red delta focused/soft/hidden "
+                    "%.5f/%.5f/%.5f\n",cinematic?"Cinematic":"Standard",
+                    focused_delta,soft_delta,hidden_delta);
+    }
+}
+
+void CheckAwareSampleCovariance(Warp& warp) {
+    // Distinct D24 depths and destination colors within one pixel make the
+    // production pixel-frequency transmission averaging observable. The
+    // reference runs the same production atlas composite once per MS sample,
+    // with atlas lookup fixed at the pixel center; only Ti and blend vary.
+    for (uint32_t samples : {4u,8u}) {
+        if (!warp.SupportsDepthSamples(samples)) continue;
+        auto scene=Scene(12.0f);
+        scene.geometry.globals.optics[1]=24;
+        scene.clear={.05f,.08f,.15f,1};
+        FillWall(scene,{40,24,49,40},4.0f);
+        scene.sample_occluder={44,28,50,37};
+        scene.sample_occluder_depth=RawDepth(3.0f);
+        scene.mixed_sample_color=true;
+        scene.sample_color_rect={44,28,54,37};
+        auto blue=Quad(43,22,60,42,1.0f/11.0f,2.25f);
+        for (auto& v:blue) v.argb=0x902040FF;
+        scene.vertices.insert(scene.vertices.end(),blue.begin(),blue.end());
+        EnableAwareCoverage(scene);
+        const auto pixel_frequency=warp.Render(scene,true,true,samples,true,
+                                                false,false,false,true);
+        auto reference_scene=scene;
+        reference_scene.sample_frequency_reference=true;
+        const auto sample_frequency=warp.Render(reference_scene,true,true,samples,true,
+                                                 false,false,false,true);
+        CheckFinite(pixel_frequency);CheckFinite(sample_frequency);
+        double rgb_squared=0,alpha_squared=0;
+        float rgb_max=0,alpha_max=0;
+        size_t count=0;
+        for (uint32_t y=28;y<37;++y) for (uint32_t x=44;x<54;++x) {
+            const auto& p=pixel_frequency[At(scene,x,y)];
+            const auto& r=sample_frequency[At(scene,x,y)];
+            const float dr=std::abs(p.r-r.r),dg=std::abs(p.g-r.g),
+                        db=std::abs(p.b-r.b),da=std::abs(p.a-r.a);
+            rgb_squared+=dr*dr+dg*dg+db*db;
+            alpha_squared+=da*da;
+            rgb_max=std::max({rgb_max,dr,dg,db});
+            alpha_max=std::max(alpha_max,da);
+            ++count;
+        }
+        const float rgb_rms=float(std::sqrt(rgb_squared/(3*count)));
+        const float alpha_rms=float(std::sqrt(alpha_squared/count));
+        std::printf("%ux blurred-wall two-plume colored-MS covariance: "
+                    "RGB RMS/max %.6f/%.6f, alpha RMS/max %.6f/%.6f\n",
+                    samples,rgb_rms,rgb_max,alpha_rms,alpha_max);
+        WriteBmp(samples==4?"aware-ms4-pixel-frequency.bmp":"aware-ms8-pixel-frequency.bmp",
+                 scene,pixel_frequency,false);
+        WriteBmp(samples==4?"aware-ms4-sample-reference.bmp":"aware-ms8-sample-reference.bmp",
+                 scene,sample_frequency,false);
+        Check(rgb_rms<.06f && rgb_max<.12f && alpha_rms<.04f && alpha_max<.10f,
+              "pixel-frequency blur-aware transmission exceeds the bounded MSAA covariance error");
+        if (samples==4)
+            Check(rgb_max>.001f,
+                  "colored-MS covariance fixture did not distinguish varying per-sample transmission");
+    }
+}
+
+void CheckAwareAdditiveAndOrder(Warp& warp) {
+    auto scene=Scene(12.0f);
+    scene.geometry.globals.optics[1]=24;
+    scene.clear={.25f,.30f,.35f,.50f};
+    FillWall(scene,{40,24,48,40},4.0f);
+    EnableAwareCoverage(scene);
+    const auto add=warp.Render(scene,true,true,1,false,false,true,false,true);
+    scene.reverse_subtract=true;
+    const auto subtract=warp.Render(scene,true,true,1,false,false,true,false,true);
+    CheckFinite(add);CheckFinite(subtract);
+    for (uint32_t x : {47u,50u}) {
+        const auto a=add[At(scene,x,32)],b=subtract[At(scene,x,32)];
+        const float rgb_up=a.r-scene.clear.r,rgb_down=scene.clear.r-b.r;
+        const float alpha_up=a.a-scene.clear.a,alpha_down=scene.clear.a-b.a;
+        Check(rgb_up>0 && alpha_up>0 &&
+              std::abs(rgb_up-rgb_down)<.015f && std::abs(alpha_up-alpha_down)<.015f,
+              "blur-aware SRC_ALPHA/ONE reverse subtract changed premultiplied RGB or Q alpha energy");
+        std::printf("aware additive/reverse x%u RGB %.5f/%.5f alpha %.5f/%.5f\n",
+                    x,rgb_up,rgb_down,alpha_up,alpha_down);
+    }
+
+    scene.reverse_subtract=false;
+    auto blue=Quad(44,23,62,41,1.0f/12.0f,2.25f);
+    for (auto& v:blue) v.argb=0xA02040FF;
+    auto ordered=scene;
+    ordered.vertices.insert(ordered.vertices.end(),blue.begin(),blue.end());
+    auto reversed=scene;
+    reversed.vertices.insert(reversed.vertices.begin(),blue.begin(),blue.end());
+    const auto front=warp.Render(ordered,true,true,1,false,false,false,false,true);
+    const auto back=warp.Render(reversed,true,true,1,false,false,false,false,true);
+    CheckFinite(front);CheckFinite(back);
+    const auto i=At(scene,50,32);
+    Check(std::abs(front[i].r-back[i].r)>.008f ||
+          std::abs(front[i].b-back[i].b)>.008f,
+          "blur-aware late alpha particles lost native draw order");
+    std::printf("aware two-plume order RGB (%.4f,%.4f) / (%.4f,%.4f)\n",
+                front[i].r,front[i].b,back[i].r,back[i].b);
+}
+
 void CheckAtlasFallbackAndOrder(Warp& warp) {
     auto s=Scene(3.0f);
     for (auto& v:s.vertices) {v.uv[0]=.25f+.5f*v.uv[0];}
@@ -2166,10 +3002,14 @@ int main(int argc,char** argv) {
         std::setvbuf(stderr,nullptr,_IONBF,0);
         Check(argc==1 || (argc==2 &&
               (std::strcmp(argv[1],"--optimization-only")==0 ||
-               std::strcmp(argv[1],"--small-radius-only")==0)),
-              "usage: new_smoke_dof_warp [--optimization-only|--small-radius-only]");
+               std::strcmp(argv[1],"--small-radius-only")==0 ||
+               std::strcmp(argv[1],"--coverage-only")==0 ||
+               std::strcmp(argv[1],"--mixed-focus-only")==0)),
+              "usage: new_smoke_dof_warp [--optimization-only|--small-radius-only|--coverage-only|--mixed-focus-only]");
         g_small_radius_only=argc==2 && std::strcmp(argv[1],"--small-radius-only")==0;
-        g_optimization_only=argc==2;
+        g_coverage_only=argc==2 && std::strcmp(argv[1],"--coverage-only")==0;
+        g_mixed_focus_only=argc==2 && std::strcmp(argv[1],"--mixed-focus-only")==0;
+        g_optimization_only=argc==2 && !g_coverage_only && !g_mixed_focus_only;
         if (g_optimization_only) {
             Warp warp;
             std::puts("RUN small-radius optimization fixtures");
@@ -2179,6 +3019,25 @@ int main(int argc,char** argv) {
                 CheckAlternatePixelFilter(warp);
             }
             std::puts("production particle smoke DoF WARP optimization checks PASS");
+            return 0;
+        }
+        if (g_coverage_only) {
+            Warp warp;
+            std::puts("RUN focused blur-aware coverage and world-composite fixtures");
+            CheckAwareDestinationCoverage(warp);
+            CheckAwareMultisampleAndNativeFallback(warp);
+            CheckAwareDefocusedCoplanarDepth(warp);
+            CheckWorldThenLateParticles(warp);
+            CheckAwareSampleCovariance(warp);
+            CheckAwareAdditiveAndOrder(warp);
+            std::puts("production particle smoke DoF WARP coverage checks PASS");
+            return 0;
+        }
+        if (g_mixed_focus_only) {
+            Warp warp;
+            std::puts("RUN 4x active-batch focused/native diagnostic only");
+            CheckAwareMultisampleAndNativeFallback(warp);
+            std::puts("production particle smoke DoF WARP mixed-focus check PASS");
             return 0;
         }
         std::puts("RUN particle shader canonicalization and geometry");
@@ -2199,6 +3058,12 @@ int main(int argc,char** argv) {
         CheckAdditiveFire(warp);
         CheckAtlasImageQuality(warp);
         CheckAtlasOcclusionAndMsaa(warp);
+        CheckAwareDestinationCoverage(warp);
+        CheckAwareMultisampleAndNativeFallback(warp);
+        CheckAwareDefocusedCoplanarDepth(warp);
+        CheckWorldThenLateParticles(warp);
+        CheckAwareSampleCovariance(warp);
+        CheckAwareAdditiveAndOrder(warp);
         CheckAtlasFallbackAndOrder(warp);
         CheckAtlasAdditive(warp);
         CheckAtlasClippedAlphaTest(warp);

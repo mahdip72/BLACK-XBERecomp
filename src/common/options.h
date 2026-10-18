@@ -17,9 +17,9 @@ struct Options {
     uint32_t fmv_scale = 0;  // 4:3 films on a wider screen: 0 fill it, top and bottom cut; 1 kept 4:3
     bool hdr_output = true;  // HDR10 on a display with Windows HDR on
     bool reload_blur = true;
-    bool modern_reload_dof = true;  // depth-aware bokeh instead of the original reload blur
-    bool fidelityfx_dof = true;  // AMD FidelityFX world DOF; false selects the Balanced comparison
-    bool dof_cinematic_quality = true;  // FidelityFX native-resolution gather; false retains the Standard path
+    bool modern_reload_dof = true;  // official FidelityFX DOF instead of the original reload blur
+    bool fidelityfx_dof = true;  // retained for saved-setting compatibility; modern mode uses FidelityFX
+    bool dof_cinematic_quality = true;  // FidelityFX High; false selects Medium
     bool dof_preview = false;  // session-only: hold modern world DOF outside reload
     uint32_t dof_focus_distance = 5;  // world units (not verified as metres), 1..30
     uint32_t dof_near_strength = 75;  // percent, 0..150

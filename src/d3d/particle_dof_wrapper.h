@@ -34,10 +34,13 @@ inline PixelKey ParticleDofNativePixelKey(TexInfo texture) {
 
 inline bool IsParticleDofNativePixel(const PixelKey& k) {
     if (k.tex[0].kind != kTex2D || k.tex[0].rect || k.tex[0].shadow ||
-        (k.tex[0].flags & (kTexWide | kTexTarget)) || k.flat || k.two_sided || k.quad || k.proj ||
+        (k.tex[0].flags & (kTexWide | kTexTarget)) || k.flat > 1 || k.two_sided || k.quad || k.proj ||
         (k.alphakill & ~1u)) return false;
     auto expected = ParticleDofNativePixelKey(k.tex[0]);
     expected.alphakill = k.alphakill;
+    // Native emitter 158B70 selects both shade modes. The current SDK stores this bit
+    // in PixelKey but does not consume it in either shader translator.
+    expected.flat = k.flat;
     // Bound unused textures do not affect this program; only stage zero is sampled.
     std::copy(std::begin(k.tex), std::end(k.tex), std::begin(expected.tex));
     return expected == k;
@@ -46,8 +49,10 @@ inline bool IsParticleDofNativePixel(const PixelKey& k) {
 inline PixelKey CanonicalParticleDofPixelKey(PixelKey k) {
     // The verified program samples only t0. Stale unused texture/sampler types otherwise
     // produce different source hashes and repeat the expensive particle shader compilation.
-    if (IsParticleDofNativePixel(k))
+    if (IsParticleDofNativePixel(k)) {
+        k.flat = 0;
         for (int i = 1; i < 4; ++i) k.tex[i] = {};
+    }
     return k;
 }
 

@@ -155,6 +155,11 @@ void Load(const void* table) {
 // after the settings load, before boot
 void Init() {
     Options& o = Opt();
+    // Older profiles selected the custom comparison filter; its replacement is FidelityFX Medium.
+    if (o.modern_reload_dof && !o.fidelityfx_dof) {
+        o.fidelityfx_dof = true;
+        o.dof_cinematic_quality = false;
+    }
     o.dof_focus_distance = std::clamp(o.dof_focus_distance, 1u, 30u);
     o.dof_near_strength = std::min(o.dof_near_strength, 150u);
     o.dof_far_strength = std::min(o.dof_far_strength, 150u);

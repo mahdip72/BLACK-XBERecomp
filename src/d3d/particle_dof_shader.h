@@ -114,6 +114,7 @@ inline constexpr char kParticleDofCbufferFields[] = R"(
     float4 particleViewport;
     float4 particleTarget;
     float4 particleAtlasTarget;
+    float4 particleProjection; // world depth numerator/offset, aware final coverage enabled, reserved
     ParticleDofQuad particleQuads[1024];
 )";
 
@@ -155,31 +156,183 @@ float4 ParticleDiffuse(uint4 colors, float2 local) {
     return ParticleDiffuseColors(ParticleColor(colors.x), ParticleColor(colors.y),
         ParticleColor(colors.z), ParticleColor(colors.w), local);
 }
+uint ParticleD24Code(float depth) {
+    // Exact floor(saturate(depth)*16777215 + .5) for a finite float input.
+    // Float multiply/add would lose odd codes at large depths. Instead use
+    // x*(2^24-1)=x*2^24-x: below .5 a mantissa remainder strictly ABOVE half
+    // rounds up; at .5 the exact tie rounds up; above .5 subtract one code.
+    uint bits = asuint(saturate(depth));
+    uint exponent = (bits >> 23) & 255u;
+    uint mantissa = (bits & 0x7fffffu) | 0x800000u;
+    if (exponent >= 127u) return 0xffffffu;
+    if (exponent == 126u) return mantissa - (bits == 0x3f000000u ? 0u : 1u);
+    if (exponent < 102u) return 0;
+    uint shift = 126u - exponent;
+    uint remainder = mantissa & ((1u << shift) - 1u);
+    return (mantissa >> shift) + (remainder > (1u << (shift - 1u)) ? 1u : 0u);
+}
+bool ParticleDepthPass(float particleDepth, float opaque, bool lessEqual) {
+    if (!ParticleFinite(particleDepth) || !ParticleFinite(opaque) || opaque < 0 || opaque > 1) return false;
+    // Hardware compares D24 codes, whereas SV_Position.z is still unsnapped.
+    // Recover the sampled D24 code too, avoiding a float read-conversion tie.
+    uint incomingCode = ParticleD24Code(particleDepth), opaqueCode = ParticleD24Code(opaque);
+    return lessEqual ? incomingCode <= opaqueCode : incomingCode < opaqueCode;
+}
 float ParticleVisible(float2 sourcePixel, float particleDepth, float2 low, float2 high, bool lessEqual) {
-    if (any(sourcePixel < low) || any(sourcePixel >= high)) return 0;
+    if (any(sourcePixel < low) || any(sourcePixel >= high) || !ParticleFinite(particleDepth)) return 0;
     int2 p = int2(sourcePixel);
+    uint incomingCode = ParticleD24Code(particleDepth);
 #if PARTICLE_DOF_SAMPLES > 1
     float2 bounds = particleDepthBounds.Load(int3(p, 0));
     if (ParticleFinite(bounds.x) && ParticleFinite(bounds.y) && bounds.x >= 0 &&
         bounds.y <= 1 && bounds.x <= bounds.y) {
-        if (lessEqual ? particleDepth <= bounds.x : particleDepth < bounds.x) return 1;
-        if (lessEqual ? particleDepth > bounds.y : particleDepth >= bounds.y) return 0;
+        uint minimumCode = ParticleD24Code(bounds.x), maximumCode = ParticleD24Code(bounds.y);
+        if (lessEqual ? incomingCode <= minimumCode : incomingCode < minimumCode) return 1;
+        if (lessEqual ? incomingCode > maximumCode : incomingCode >= maximumCode) return 0;
     }
 #endif
     float visible = 0;
-    [unroll] for (uint s = 0; s < PARTICLE_DOF_SAMPLES; ++s) {
+    // Bounds above handle uniform depths. Keep the rare mixed-sample path compact:
+    // unrolling repeats the exact D24 conversion inside every visibility probe.
+    [loop] for (uint s = 0; s < PARTICLE_DOF_SAMPLES; ++s) {
 #if PARTICLE_DOF_SAMPLES > 1
         float opaque = particleSceneDepth.Load(p, s);
 #else
         float opaque = particleSceneDepth.Load(int3(p, 0));
 #endif
         // Compare the native biased hardware depth, with the actual draw's LESS/LEQUAL convention.
-        // This source test supplements the unchanged destination depth test on the expanded quad.
-        if (ParticleFinite(opaque) && opaque >= 0 && opaque <= 1)
-            visible += lessEqual ? (particleDepth <= opaque) : (particleDepth < opaque);
+        // This is the source visibility field; aware final coverage must not apply it a second time.
+        if (ParticleFinite(opaque) && opaque >= 0 && opaque <= 1) {
+            uint opaqueCode = ParticleD24Code(opaque);
+            visible += lessEqual ? (incomingCode <= opaqueCode) : (incomingCode < opaqueCode);
+        }
     }
     return visible / PARTICLE_DOF_SAMPLES;
 }
+
+#if PARTICLE_DOF_PASS != 1
+struct ParticleFinal { float4 color : SV_Target; uint coverage : SV_Coverage; };
+float ParticleRawDepth(int2 pixel, uint sampleIndex) {
+#if PARTICLE_DOF_SAMPLES > 1
+    return particleSceneDepth.Load(pixel, sampleIndex);
+#else
+    return particleSceneDepth.Load(int3(pixel, 0));
+#endif
+}
+float ParticleActiveRadius(VOut i) {
+    if (i.particleQuad >= 1024 || i.particleQuad >= (uint)particleTarget.z ||
+        !ParticleFinite(i.particleViewZ) || i.particleViewZ <= 0) return 0;
+    ParticleDofQuad quad = particleQuads[i.particleQuad];
+    if (any(quad.uv_bounds.zw == quad.uv_bounds.xy) ||
+        any((asuint(particleOptics) & 0x7f800000u) == 0x7f800000u) ||
+        particleOptics.x <= 0 || any(particleOptics.yzw < 0)) return 0;
+    float radius = ParticleRadius(i.particleViewZ);
+    return ParticleFinite(radius) && radius > 0 ? radius : 0;
+}
+float ParticleBilinearVisibility(int2 center, float2 offset, float particleDepth,
+                                 float2 low, float2 high, bool lessEqual) {
+    // Pixel centers are p+.5. Floor/fraction share the relative offset so FXC
+    // cannot round an absolute sum in only one half of the bilinear footprint.
+    int2 p = center + int2(floor(offset));
+    float2 f = frac(offset);
+    return lerp(lerp(ParticleVisible(float2(p) + .5, particleDepth, low, high, lessEqual),
+                     ParticleVisible(float2(p + int2(1, 0)) + .5, particleDepth, low, high, lessEqual), f.x),
+                lerp(ParticleVisible(float2(p + int2(0, 1)) + .5, particleDepth, low, high, lessEqual),
+                     ParticleVisible(float2(p + 1) + .5, particleDepth, low, high, lessEqual), f.x), f.y);
+}
+float2 ParticleOccluderTransmission(int2 pixel, float opaque, float particleDepth, float particleRadius,
+                                    float2 low, float2 high, bool lessEqual, float particleVisibility) {
+    if (ParticleDepthPass(particleDepth, opaque, lessEqual)) return float2(1, particleVisibility);
+    if (!ParticleFinite(opaque) || opaque < 0 || opaque > 1 ||
+        any((asuint(particleProjection.xy) & 0x7f800000u) == 0x7f800000u)) return float2(0, particleVisibility);
+    float denominator = opaque - particleProjection.y;
+    if (abs(denominator) < 1e-7) return float2(0, particleVisibility);
+    float opaqueZ = particleProjection.x / denominator;
+    if (!ParticleFinite(opaqueZ) || opaqueZ <= 0) return float2(0, particleVisibility);
+    float opaqueRadius = ParticleRadius(opaqueZ);
+    // Focused occluders retain their exact per-sample hard rejection.
+    if (!ParticleFinite(opaqueRadius) || opaqueRadius <= .5) return float2(0, particleVisibility);
+    // Source energy already carries visibility filtered by the particle aperture.
+    // A broader opaque aperture must not independently multiply that mask again.
+    if (opaqueRadius >= particleRadius) return float2(1, particleVisibility);
+    float opaqueVisibility = 0;
+    bool evaluateParticle = particleVisibility < 0;
+    float particleSum = 0;
+    [loop] for (int tap = 0; tap < 32; ++tap) {
+        // First 32 equal-area positions of the 64 disk, normalized to unit radius.
+        float2 disk = particleDisk[tap] * 1.41421356237;
+        opaqueVisibility += ParticleBilinearVisibility(pixel, disk * opaqueRadius, particleDepth, low, high, lessEqual);
+        if (evaluateParticle)
+            particleSum += ParticleBilinearVisibility(pixel, disk * particleRadius, particleDepth, low, high, lessEqual);
+    }
+    if (evaluateParticle) particleVisibility = particleSum;
+    // Both sums have the same 32-tap denominator. No amplification or invented
+    // energy when the sampled source visibility is empty/invalid.
+    if (!ParticleFinite(particleVisibility) || particleVisibility <= 1e-6 || !ParticleFinite(opaqueVisibility))
+        return float2(0, particleVisibility);
+    return float2(saturate(opaqueVisibility / particleVisibility), particleVisibility);
+}
+float2 ParticleCoverage(VOut i, float alpha, uint rasterCoverage) {
+    rasterCoverage &= (1u << PARTICLE_DOF_SAMPLES) - 1u;
+    // Return mask/transmission as ordinary values. FXC O1 drops the computed
+    // mask when it crosses this helper's early returns through an out parameter.
+    // Supported sample masks are <=255, exactly representable as float.
+    if (!(particleProjection.z > 0)) return float2(rasterCoverage, 1);
+    float2 low = max(particleViewport.xy, 0);
+    float2 high = min(particleViewport.xy + particleViewport.zw, particleTarget.xy);
+    uint finalCoverage = 0;
+    if (any(i.pos.xy < low) || any(i.pos.xy >= high)) return 0;
+    bool lessEqual = particleTarget.w > .5;
+    float radius = ParticleActiveRadius(i);
+    int2 pixel = int2(i.pos.xy);
+    // Native/focused fallback preserves exact sample bits; no averaging changes
+    // its alpha test, material or blend behavior when hardware depth is disabled.
+    if (radius <= 0) {
+        [unroll] for (uint sampleIndex = 0; sampleIndex < PARTICLE_DOF_SAMPLES; ++sampleIndex)
+            if ((rasterCoverage & (1u << sampleIndex)) && ParticleDepthPass(i.pos.z, ParticleRawDepth(pixel, sampleIndex), lessEqual))
+                finalCoverage |= 1u << sampleIndex;
+        return float2(finalCoverage, finalCoverage ? 1 : 0);
+    }
+    if (alpha <= 0) return 0; // fully hidden source energy remains empty
+    float depths[PARTICLE_DOF_SAMPLES], transmission[PARTICLE_DOF_SAMPLES];
+    float total = 0, particleVisibility = -1;
+    [loop] for (uint sampleIndex = 0; sampleIndex < PARTICLE_DOF_SAMPLES; ++sampleIndex) {
+        depths[sampleIndex] = 0; transmission[sampleIndex] = 0;
+        if (!(rasterCoverage & (1u << sampleIndex))) continue;
+        float opaque = ParticleRawDepth(pixel, sampleIndex);
+        float value = -1;
+        // Most MSAA pixels have one depth. Reuse the complete coverage estimate
+        // across equal samples, including its 32 paired visibility probes.
+        [loop] for (uint previous = 0; previous < sampleIndex; ++previous)
+            if ((rasterCoverage & (1u << previous)) && asuint(depths[previous]) == asuint(opaque)) {
+                value = transmission[previous]; break;
+            }
+        if (value < 0) {
+            float2 estimate = ParticleOccluderTransmission(pixel, opaque, i.pos.z, radius, low, high, lessEqual, particleVisibility);
+            value = estimate.x;
+            particleVisibility = estimate.y;
+        }
+        depths[sampleIndex] = opaque; transmission[sampleIndex] = value;
+        if (value > 0) { finalCoverage |= 1u << sampleIndex; total += value; }
+    }
+    if (!finalCoverage) return 0;
+    float meanTransmission = saturate(total / countbits(finalCoverage));
+    // Pixel-frequency approximation: preserve resolved source energy and exact
+    // focused sample rejection, while spreading nonzero Ti uniformly over its
+    // surviving samples. Subsequent overlapping blends can see this difference.
+    return float2(finalCoverage, meanTransmission);
+}
+float4 ParticleTransmit(float4 color, float2 coverage) {
+    if (coverage.x == 0) return 0;
+#if PARTICLE_DOF_BLEND == 1
+    // P=C*a and Q=a*a both scale by T before reconstruction: a'=a*sqrt(T), C'=C*sqrt(T).
+    return color * sqrt(coverage.y);
+#else
+    // P and A both scale by T, so straight color is unchanged and a'=a*T.
+    return float4(color.rgb, color.a * coverage.y);
+#endif
+}
+#endif
 float4 ParticleLegacy(VOut i, bool front) {
     // Derivatives precede divergent branches. Native tc0.w is constant on the accepted affine quads.
     float2 uv = i.tc0.xy / i.tc0.w;
@@ -296,7 +449,7 @@ Texture2D<float4> particleFilteredAtlas : register(t1);
 float4 ParticleAtlasLoad(int2 p, int2 low, int2 high) {
     return all(p >= low) && all(p < high) ? particleFilteredAtlas.Load(int3(p, 0)) : 0;
 }
-float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
+float4 ParticleAtlasComposite(VOut i, bool front) {
     if (i.particleQuad >= 1024 || i.particleQuad >= (uint)particleTarget.z)
         return ParticleLegacy(i, front);
     ParticleDofQuad quad = particleQuads[i.particleQuad];
@@ -318,8 +471,23 @@ float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
 #endif
     return alpha > 0 ? float4(value.rgb / alpha, alpha) : 0;
 }
+ParticleFinal main(VOut i, bool front : SV_IsFrontFace, uint rasterCoverage : SV_Coverage) {
+    float4 color = ParticleAtlasComposite(i, front);
+    float2 coverage = ParticleCoverage(i, color.a, rasterCoverage);
+    ParticleFinal output = (ParticleFinal)0;
+    output.color = ParticleTransmit(color, coverage);
+    output.coverage = (uint)coverage.x;
+    return output;
+}
 #else
-float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target { return ParticleLegacy(i, front); }
+ParticleFinal main(VOut i, bool front : SV_IsFrontFace, uint rasterCoverage : SV_Coverage) {
+    float4 color = ParticleLegacy(i, front);
+    float2 coverage = ParticleCoverage(i, color.a, rasterCoverage);
+    ParticleFinal output = (ParticleFinal)0;
+    output.color = ParticleTransmit(color, coverage);
+    output.coverage = (uint)coverage.x;
+    return output;
+}
 #endif
 )";
 

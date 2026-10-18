@@ -183,10 +183,13 @@ if(BLACK_FIDELITYFX_DOF)
     # Offscreen software-adapter checks of the production native particle wrapper.
     add_executable(new_smoke_dof_warp
         tools/tests/new_smoke_dof_warp.cpp
-        ${SDK}/runtime/gpu/shaders.cpp)
+        ${SDK}/runtime/gpu/shaders.cpp
+        src/d3d/fidelityfx_dof.cpp)
     target_include_directories(new_smoke_dof_warp PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
-    target_link_libraries(new_smoke_dof_warp PRIVATE d3d12 dxgi dxguid d3dcompiler)
+    target_compile_definitions(new_smoke_dof_warp PRIVATE BLACK_FIDELITYFX_DOF=1)
+    target_link_libraries(new_smoke_dof_warp PRIVATE
+        ffx_dof_x64 ffx_backend_dx12_x64 d3d12 dxgi dxguid d3dcompiler)
 
     # Hardware regression for the production atlas clear, including large rectangle lists.
     add_executable(particle_clear_d3d12 tools/tests/particle_clear_d3d12.cpp)
@@ -198,6 +201,10 @@ if(BLACK_FIDELITYFX_DOF)
     target_include_directories(shader_cache_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(shader_cache_test PRIVATE d3dcompiler)
 endif()
+
+# CPU-only geometry regression for the particle DOF planner and clipping rules.
+add_executable(particle_dof_geometry tools/tests/particle_dof_geometry.cpp)
+target_include_directories(particle_dof_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # build_info.h for the version resource, rewritten only when the commit changes
 find_package(Git QUIET)

@@ -55,7 +55,8 @@ float TargetRadius = 4.0f;
 UINT CandidateOptimization=D3DCOMPILE_OPTIMIZATION_LEVEL1;
 constexpr uint32_t Samples = 8, Quads = 12, Batches = 4;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
-void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix) {
+void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix,
+                                   size_t expected_globals) {
     Microsoft::WRL::ComPtr<ID3D11ShaderReflection> reflection;
     const HRESULT hr=D3DReflect(shader->GetBufferPointer(),shader->GetBufferSize(),
         IID_ID3D11ShaderReflection,reinterpret_cast<void**>(reflection.GetAddressOf()));
@@ -66,7 +67,7 @@ void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix) {
             "atlas-filter shader omitted ParticleAtlasDraw cbuffer");
     const char* names[]{"particleTarget","particleAtlasTarget","particleQuads"};
     const UINT offsets[]{UINT(expected_prefix+32),UINT(expected_prefix+48),
-                         UINT(expected_prefix+64)};
+                         UINT(expected_prefix+expected_globals)};
     for (size_t i=0;i<3;++i) {
         D3D11_SHADER_VARIABLE_DESC variable_desc{};
         auto* variable=cbuffer->GetVariableByName(names[i]);
@@ -510,8 +511,8 @@ private:
         const auto candidate_source=gpu::ParticleDofAtlasFilterSource(true,true);
         const auto candidate_vs=Compile(candidate_source,"vs","vs_5_0");
         const auto candidate_ps=Compile(candidate_source,"filter_ps","ps_5_0",CandidateOptimization);
-        CheckAtlasFilterCbufferLayout(filter_vs.Get(),2080);
-        CheckAtlasFilterCbufferLayout(candidate_vs.Get(),2096);
+        CheckAtlasFilterCbufferLayout(filter_vs.Get(),2080,64);
+        CheckAtlasFilterCbufferLayout(candidate_vs.Get(),2096,80);
         native_pso_=Pipeline(native_vertex.Get(),native_pixel.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
         old_pso_=Pipeline(old_vs.Get(),old_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
         source_pso_=Pipeline(source_vs.Get(),source_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,false,true);
@@ -577,7 +578,10 @@ private:
         constexpr size_t old_globals=48, old_quad=32;
         constexpr size_t legacy_prefix=offsetof(gpu::DrawConstants,rtshift);
         static_assert(legacy_prefix==2080 && sizeof(gpu::DrawConstants)==2096);
-        static_assert(sizeof(gpu::ParticleDofGlobals)==64 && sizeof(gpu::ParticleDofQuad)==48);
+        static_assert(offsetof(gpu::ParticleDofGlobals,atlas_target)==48 &&
+                      offsetof(gpu::ParticleDofGlobals,projection)==64 &&
+                      sizeof(gpu::ParticleDofGlobals)==80 &&
+                      sizeof(gpu::ParticleDofQuad)==48);
         std::vector<uint8_t> old_cb(legacy_prefix+old_globals+gpu::kParticleDofMaxQuads*old_quad);
         std::memcpy(old_cb.data(),&dc,legacy_prefix);
         std::memcpy(old_cb.data()+legacy_prefix,&p.globals,old_globals);
@@ -598,16 +602,18 @@ private:
             page_dcbs_.push_back(Upload(cb.data(),cb.size()));
             constexpr size_t legacy_page_prefix=offsetof(gpu::DrawConstants,rtshift);
             static_assert(legacy_page_prefix==2080 && sizeof(dc)==2096);
-            static_assert(sizeof(gpu::ParticleDofGlobals)==64 &&
-                          sizeof(gpu::ParticleDofQuad)==48);
-            std::vector<uint8_t> legacy_cb(legacy_page_prefix+sizeof(globals)+
+            constexpr size_t legacy_globals=offsetof(gpu::ParticleDofGlobals,projection);
+            static_assert(legacy_globals==64 && sizeof(globals)==80);
+            static_assert(sizeof(gpu::ParticleDofQuad)==48);
+            std::vector<uint8_t> legacy_cb(legacy_page_prefix+legacy_globals+
                 gpu::kParticleDofMaxQuads*sizeof(gpu::ParticleDofQuad));
             std::memcpy(legacy_cb.data(),&dc,legacy_page_prefix);
-            std::memcpy(legacy_cb.data()+legacy_page_prefix,&globals,sizeof(globals));
-            std::memcpy(legacy_cb.data()+legacy_page_prefix+sizeof(globals),metadata_.data(),
+            std::memcpy(legacy_cb.data()+legacy_page_prefix,&globals,legacy_globals);
+            std::memcpy(legacy_cb.data()+legacy_page_prefix+legacy_globals,metadata_.data(),
                         metadata_.size()*sizeof(metadata_[0]));
-            Require(legacy_cb.size()+sizeof(dc)-legacy_page_prefix==cb.size(),
-                    "frozen filter constant-buffer tail is not exactly 16 bytes shorter");
+            Require(legacy_cb.size()+(sizeof(dc)-legacy_page_prefix)+
+                    (sizeof(globals)-legacy_globals)==cb.size(),
+                    "frozen filter constant-buffer tail is not exactly 32 bytes shorter");
             legacy_page_dcbs_.push_back(Upload(legacy_cb.data(),legacy_cb.size()));
             std::vector<D3D12_RECT> rectangles;
             for (uint32_t q=page.first_quad;q<page.first_quad+page.quad_count;++q) {

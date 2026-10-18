@@ -31,6 +31,8 @@ struct ParticleDofGlobals {
     float viewport[4];  // x, y, width, height in this target's pixels
     float target[4];    // width, height, quad count, 0=LESS / 1=LEQUAL
     float atlas_target[4]; // atlas width/height, first quad and count for the filter draw
+    // ViewZ = x / (raw depth - y). z enables shader destination coverage only for verified depth.
+    float projection[4];
 };
 
 struct ParticleDofGeometryParams {
@@ -48,6 +50,6 @@ struct ParticleDofGeometryStats {
 
 static_assert(sizeof(NativeParticleVertex) == 32);
 static_assert(sizeof(ParticleDofQuad) == 48);
-static_assert(sizeof(ParticleDofGlobals) == 64);
+static_assert(sizeof(ParticleDofGlobals) == 80);
 
 }  // namespace gpu
