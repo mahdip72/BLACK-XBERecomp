@@ -17,7 +17,8 @@ using namespace kernel;
 using namespace layout;
 
 namespace d3d {
-void ViewScale(float xy, bool close_near = false);
+void ViewScale(float xy);
+void NearDepth(float plane);
 }
 
 namespace {
@@ -191,13 +192,20 @@ void FieldOfView(X86Context& ctx, uint8_t*) {
     if (view != 1) fov = std::atan(std::tan(fov * kHalf) * view) / kHalf;
 }
 
-// The list of the first person models, gun, arms and muzzle mesh: drawn at the viewmodel setting
+constexpr float kNearPlane = 0.08f;  // every camera's, set once at renderer init
+
+// The list of the first person models, gun, arms and muzzle mesh: drawn at the viewmodel setting.
+// Wider than the game's 70 it shows parts nearer than the near plane, which are kept
 X86_EXTERN_FUNC(__imp__sub_00176F60);
 X86_FUNC(sub_00176F60) {
-    bool gun = ctx.esi == R32(kDisplay) + kDisplayDrawLists + kGunDrawList * kDrawListSize;
-    if (gun) d3d::ViewScale(g_gun, game::Opt().viewmodel_fov > 70);
+    bool list = ctx.esi == R32(kDisplay) + kDisplayDrawLists + kGunDrawList * kDrawListSize;
+    bool scale = list && g_gun != 1;
+    bool keep_near = list && game::Opt().viewmodel_fov > 70;
+    if (scale) d3d::ViewScale(g_gun);
+    if (keep_near) d3d::NearDepth(kNearPlane);
     __imp__sub_00176F60(ctx, base);
-    if (gun) d3d::ViewScale(1);
+    if (scale) d3d::ViewScale(1);
+    if (keep_near) d3d::NearDepth(0);
 }
 
 static uint32_t Player() { return R32(kWorld) + kWorldPlayer; }
