@@ -37,7 +37,6 @@
 #include "d3d/occlusion.h"
 #include "d3d/smaa_shader.h"
 #include "d3d/smaa_textures.h"
-#include "d3d/texture_pack.h"
 #include "gpu/backend.h"
 #include "gpu/ext.h"
 #include "gpu/shaders.h"
@@ -705,7 +704,6 @@ struct Tex {
     uint64_t frame = 0;
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     uint8_t flags = 0;  // Extension::Decoded's
-    bool replacement = false;
 };
 
 struct PsoKey {
@@ -2196,10 +2194,10 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
            tx.d.depth == d.depth && tx.d.levels == d.levels && tx.d.cube == d.cube && tx.d.pitch == d.pitch;
 }
 
-// Keep the previous resource if allocation fails, so an HD upload can fall back.
+// false when the texture could not be made, its entry dropped
 bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key) {
     g_perf.newtex++;
-    Tex previous = tx;
+    if (tx.res) CurrentFrame().garbage.push_back(tx.res);
     tx = Tex{};
     tx.d = d;
     tx.fmt = HostFormat(fi.host);
@@ -2223,11 +2221,9 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
     td.SampleDesc.Count = 1;
     if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                              IID_PPV_ARGS(&tx.res)))) {
-        LOGR("textures: GPU allocation failed for resource %llx (%ux%u)", static_cast<unsigned long long>(key), w, h);
-        tx = std::move(previous);
+        textures_.erase(key);
         return false;
     }
-    if (previous.res) CurrentFrame().garbage.push_back(std::move(previous.res));
     return true;
 }
 
@@ -2340,35 +2336,9 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
         if (sig != tx.sig || !same) {
             PerfScope perf_up{g_perf.texup};
             g_perf.texups++;
-            TextureDesc hd;
-            std::vector<uint8_t> blocks;
-            bool replaced = texture_pack::Load(d, p, palette.va ? palette.colours : nullptr, hd, blocks);
-            TextureDesc upload = replaced ? hd : d;
-            const FormatInfo* format = replaced ? &Format(hd.format) : &fi;
-            auto resource = tx.res->GetDesc();
-            if (tx.replacement != replaced || resource.Width != upload.width || resource.Height != upload.height ||
-                tx.levels != upload.levels) {
-                if (CreateTexture(tx, upload, *format, key)) {
-                    same = false;
-                } else {
-                    if (!replaced) return nullptr;
-                    replaced = false;
-                    upload = d;
-                    format = &fi;
-                    if (tx.replacement || !SameTexture(tx, d)) {
-                        if (!CreateTexture(tx, d, fi, key)) return nullptr;
-                        same = false;
-                    }
-                }
-            }
-            tx.d = d;
-            tx.replacement = replaced;
+            g_perf.texup_bytes += total;
             tx.sig = sig;
-            tx.frame = presents_ + 1;
-            tx.palette = palette.hash;
-            g_perf.texup_bytes += TotalSize(upload);
-            UploadTexture(tx, upload, *format, replaced ? blocks.data() : p,
-                          replaced ? nullptr : (palette.va ? palette.colours : nullptr), same);
+            UploadTexture(tx, d, fi, p, palette.va ? palette.colours : nullptr, same);
         }
     }
     FillTextureView(tx, d, stages.sv[stage]);
@@ -3686,7 +3656,7 @@ void D3D12Backend::ReleaseOldTextures() {
     constexpr size_t kTexturesKept = 2048;  // no sweep below this many
     constexpr uint64_t kIdleFrames = 600;
     // textures unused for ten seconds go, levels stream theirs in and out
-    if (presents_ % kSweepEvery != 0 || (!texture_pack::Enabled() && textures_.size() <= kTexturesKept)) return;
+    if (presents_ % kSweepEvery != 0 || textures_.size() <= kTexturesKept) return;
     for (auto it = textures_.begin(); it != textures_.end();) {
         if (it->second.frame + kIdleFrames < presents_) {
             CurrentFrame().garbage.push_back(it->second.res);
