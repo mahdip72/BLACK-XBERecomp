@@ -2,7 +2,7 @@
 from pathlib import Path
 from PIL import Image,ImageDraw
 import json,struct,unicodedata,hashlib,io,argparse
-from import_hd_textures import Disc
+from pbrify_assets import Disc, fingerprint, sha256
 import numpy as np
 parser=argparse.ArgumentParser(description="Repack the mod font atlases for the Xbox glyph layout")
 parser.add_argument("--iso",type=Path,required=True)
@@ -27,6 +27,7 @@ maps=json.loads((r/'font-mapping.json').read_text())
 big={'S':1,'0':97,'O':134,'Q':135}
 small={'O':52,'Q':125,'\u00a5':120}
 marks={'Big':{'\u0300':[9],'\u0301':[8],'\u0302':[37],'\u0308':[25,26],'\u0303':[70]},'Small':{'\u0300':[15],'\u0301':[14],'\u0302':[6],'\u0308':[28,29],'\u0303':[80]}}
+records={}
 
 def ink(im):
  box=im.getchannel('A').point(lambda x:255 if x>60 else 0).getbbox()
@@ -85,3 +86,11 @@ for name,num,scale,factor in [('Big',65,4,4),('Small',56,10,8)]:
  for byte in b[off+128:off+128+orig.width*orig.height]:key=((key^byte)*1099511628211)&((1<<64)-1)
  assert key == {'Big':0xc64bc320db173a0c,'Small':0xd9489cbe3cdb34f1}[name], 'Unsupported original font layout'
  print('key',hex(key),'sha256',hashlib.sha256((out/f'{name}.png').read_bytes()).hexdigest())
+ pixels=b[off+128:off+128+orig.width*orig.height]
+ key=fingerprint(orig.width,orig.height,14,pixels)
+ # Preserve the reviewed font edges exactly; the original font also has one mip.
+ atlas.save(out/f'{key}.dds',format='DDS')
+ records[name]=dict(key=key,source='BLACK HD Reimagined font',source_file=font_files[name],
+                    source_sha256=sha256(args.mod/font_files[name]),original_sha256=hashlib.sha256(pixels).hexdigest(),
+                    png_sha256=sha256(out/f'{name}.png'),dds_sha256=sha256(out/f'{key}.dds'),size=list(atlas.size),format='BGRA8')
+(out/'fonts.json').write_text(json.dumps(records,indent=2)+'\n')

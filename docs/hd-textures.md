@@ -1,29 +1,45 @@
-# Optional HD fonts and menus
+# PBRify textures with HD Reimagined fonts
 
-This branch builds on the finalized FOV/weapon fix at `914edcb`. Replacements are limited to the approved fonts and menu map/loading graphics. The BLACK logos retain their original artwork. World, weapon, character and effect textures retain their original artwork.
+The combined pack uses 2,019 original Xbox textures upscaled with
+[4x-PBRify_UpscalerV4](../tools/PBRIFY.md) and two adapted font atlases from
+[BLACK HD Reimagined](https://www.moddb.com/mods/black-hd-reimagined/addons/black-hd-reimagined-texture-pack)
+by HDREIMAGINED. Only the fonts use mod artwork. Menu maps, loading graphics,
+BLACK logos, world textures, weapons and effects use the upscaled Xbox artwork.
 
-The repository contains source and mapping metadata. Artwork is imported locally from [BLACK HD Reimagined](https://www.moddb.com/mods/black-hd-reimagined/addons/black-hd-reimagined-texture-pack) by HDREIMAGINED. The mod is proprietary; its artwork is supplied separately and is not licensed by this repository.
+The shared Big and Small fonts cover HUD and menu text while retaining original
+glyph positions, spacing and character tables. Controller symbols retain Xbox
+artwork. Text baked into other images follows the PBRify texture replacement.
+Big is 1024x1024 and Small is 1024x2048. These are detailed bitmap fonts suitable
+for high display resolutions. PBRify enlarges each original dimension four times.
 
-## Prepare the optional assets
+## Prepare one pack
 
-The import tools require Python, Pillow and NumPy (NumPy is only needed for fonts), your own US Xbox XISO, and the extracted mod's `SLUS-21376/replacements` directory. The reviewed mod archive has MD5 `f7384ede03583784f68de43da83742c5`.
+First generate and validate the complete original-only pack using the
+[PBRify instructions](../tools/PBRIFY.md). Then run these commands with Python,
+Pillow and NumPy, your own US Xbox XISO, and the extracted mod's
+`SLUS-21376/replacements` directory:
 
 ```powershell
-python tools/import_hd_textures.py --iso "D:/Black.iso" --mod "D:/mod/SLUS-21376/replacements" --output "D:/Black-HD/textures"
-python tools/import_hd_fonts.py --iso "D:/Black.iso" --mod "D:/mod/SLUS-21376/replacements" --output "D:/Black-HD/fonts"
+python tools/import_hd_fonts.py --iso D:/Black.iso --mod D:/mod/SLUS-21376/replacements --output out/hd-fonts
+python tools/package_textures.py --pbrify out/pbrify-pack --fonts out/hd-fonts --output out/texture-pack
 ```
 
-Put `textures` and `fonts` beside the executable. Normal game installation requirements still apply. The tools read the game image without patching it. Rename these directories with the game closed to disable replacements.
+The font importer repacks only the Big and Small glyphs and writes lossless
+BGRA8 DDS files with one mip, matching the original font sampling. The packager
+copies the PBRify textures and replaces
+exactly those two entries with the mod fonts. It verifies source and copied
+hashes, dimensions, file layouts and complete original texture-key coverage.
+`out/texture-pack/manifest.json` records the source and hash of every output.
+The original-only PBRify pack remains unchanged.
 
-## Scope
+Put the combined pack's `textures` directory beside the newly built executable.
+No separate `fonts` directory or font resource hook is needed. Restart after
+changing the pack. Missing or malformed DDS files use the original texture.
+Rename `textures` with the game closed to disable the pack. Normal game
+installation requirements still apply. Dynamic render targets and FMV frames
+are outside this static texture pack.
 
-- Two font atlases retain the approved glyphs, Xbox text metrics and controller symbols. HUD and menu text use these shared fonts.
-- Eleven menu pages cover ten mission-map tiles and the loading bullet artwork.
-- All BLACK logo atlases retain the original game artwork.
-- Other menu icons and Xbox controller diagrams keep their original artwork where no compatible replacement was verified. Videos are unchanged.
-
-The renderer also checks a fixed list of menu texture fingerprints. Older world-texture packs cannot enable world replacements in this build. Missing or malformed DDS files keep the original textures. The importer checks original content and produces BC3 DDS with mipmaps. `tools/hd_textures/coverage.json` lists the selected assets.
-
-## Validation
-
-The Windows Release build passed against the latest fork main. The narrowed loader passed offline checks for all 11 menu pages, every mip, malformed DDS fallback and rejection of world and logo textures even with valid replacement files present. The approved font PNGs remain unchanged. Fonts and menu graphics were accepted in visual testing. Logo replacements were removed after that review.
+The repository contains only code and font mapping metadata. Game artwork,
+generated textures and model weights stay local. The mod is proprietary and its
+artwork is supplied separately. The reviewed archive has MD5
+`f7384ede03583784f68de43da83742c5`.

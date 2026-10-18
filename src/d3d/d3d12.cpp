@@ -3686,7 +3686,7 @@ void D3D12Backend::ReleaseOldTextures() {
     constexpr size_t kTexturesKept = 2048;  // no sweep below this many
     constexpr uint64_t kIdleFrames = 600;
     // textures unused for ten seconds go, levels stream theirs in and out
-    if (presents_ % kSweepEvery != 0 || textures_.size() <= kTexturesKept) return;
+    if (presents_ % kSweepEvery != 0 || (!texture_pack::Enabled() && textures_.size() <= kTexturesKept)) return;
     for (auto it = textures_.begin(); it != textures_.end();) {
         if (it->second.frame + kIdleFrames < presents_) {
             CurrentFrame().garbage.push_back(it->second.res);
