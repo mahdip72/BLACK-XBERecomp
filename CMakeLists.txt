@@ -36,6 +36,58 @@ endif()
 
 add_xbe_image(Black default.xbe game.toml ${GAME_PARTITIONS} game)
 
+# Build the project's fixed/native-particle DoF shaders independently of the optional
+# official FidelityFX host component. This library is also used by balanced/viewmodel
+# paths and by offline fallback builds with BLACK_FIDELITYFX_DOF=OFF.
+add_executable(build_dof_shaders
+    tools/build_dof_shaders.cpp
+    ${SDK}/runtime/gpu/shaders.cpp)
+target_include_directories(build_dof_shaders PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
+target_compile_definitions(build_dof_shaders PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(build_dof_shaders PRIVATE d3dcompiler)
+set(DOF_SHADER_LIBRARY_CPP "${CMAKE_CURRENT_BINARY_DIR}/generated/dof_shader_library.cpp")
+add_custom_command(
+    OUTPUT "${DOF_SHADER_LIBRARY_CPP}"
+    COMMAND $<TARGET_FILE:build_dof_shaders> "${DOF_SHADER_LIBRARY_CPP}"
+    DEPENDS build_dof_shaders
+        tools/build_dof_shaders.cpp
+        src/d3d/dof_shader_library.h
+        src/d3d/dof_shader_source.h
+        src/d3d/depth_of_field_shader.h
+        src/d3d/viewmodel_dof_shader.h
+        src/d3d/fidelityfx_dof_shader.h
+        src/d3d/particle_dof_shader.h
+        src/d3d/particle_dof_wrapper.h
+        "${SDK}/runtime/gpu/shaders.h"
+    VERBATIM)
+set_source_files_properties("${DOF_SHADER_LIBRARY_CPP}" PROPERTIES GENERATED TRUE)
+add_custom_target(embedded_dof_shaders DEPENDS "${DOF_SHADER_LIBRARY_CPP}")
+target_sources(Black PRIVATE "${DOF_SHADER_LIBRARY_CPP}")
+add_dependencies(Black embedded_dof_shaders)
+
+# CPU-only first-use contract test. It compiles the generated table and does not
+# construct a graphics device or start the game.
+add_executable(dof_first_use
+    tools/tests/dof_first_use.cpp
+    "${DOF_SHADER_LIBRARY_CPP}"
+    ${SDK}/runtime/gpu/shaders.cpp)
+target_include_directories(dof_first_use PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
+target_link_libraries(dof_first_use PRIVATE d3dcompiler)
+add_dependencies(dof_first_use embedded_dof_shaders)
+
+# Offscreen WARP regression for the asynchronous production pipeline cache. It consumes
+# only embedded shader blobs and never calls FXC or starts the game.
+add_executable(dof_pipeline_cache_test
+    tools/tests/dof_pipeline_cache_test.cpp
+    "${DOF_SHADER_LIBRARY_CPP}"
+    ${SDK}/runtime/gpu/shaders.cpp)
+target_include_directories(dof_pipeline_cache_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
+target_link_libraries(dof_pipeline_cache_test PRIVATE d3d12 dxgi dxguid d3dcompiler)
+add_dependencies(dof_pipeline_cache_test embedded_dof_shaders)
+
 # Official AMD FidelityFX DoF component and DX12 backend. The SDK itself is
 # prepared as a sparse, pinned checkout by tools/cmake/prepare_fidelityfx_sdk.ps1.
 option(BLACK_FIDELITYFX_DOF "Build BLACK's DoF adapter against the official FidelityFX SDK" ON)
@@ -106,6 +158,11 @@ if(BLACK_FIDELITYFX_DOF)
     add_executable(particle_clear_d3d12 tools/tests/particle_clear_d3d12.cpp)
     target_include_directories(particle_clear_d3d12 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(particle_clear_d3d12 PRIVATE d3d12 dxgi dxguid)
+
+    # Disk bytecode-cache regression; no graphics device is created.
+    add_executable(shader_cache_test tools/tests/shader_cache_test.cpp)
+    target_include_directories(shader_cache_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(shader_cache_test PRIVATE d3dcompiler)
 endif()
 
 # build_info.h for the version resource, rewritten only when the commit changes

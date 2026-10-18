@@ -86,9 +86,12 @@ Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) and 
 ### 4. Build the Project
 - Prepare the pinned DOF dependency once: `powershell -NoProfile -ExecutionPolicy Bypass -File tools\cmake\prepare_fidelityfx_sdk.ps1`. Only the official FidelityFX DOF component and DX12 backend are built. To build without them, configure with `-DBLACK_FIDELITYFX_DOF=OFF`.
 - Run `build.bat`. The first build recompiles the entire game and can take 30 to 90 minutes on weaker systems.
+- The build also compiles and embeds the DOF shaders. Players do not need a previously populated shader cache. Graphics pipelines and buffers prepare before play, with progress shown; changing the DOF profile, MSAA or resolution can prepare them again. Reload, preview and intensity changes reuse the prepared configuration.
 - When it finishes, run `out\build\release\BLACK.exe`.
 
 ### Depth-of-field checks
+- Build the `dof_first_use` and `dof_pipeline_cache_test` CMake targets. Run `dof_first_use.exe --no-fxc` to check every embedded DOF shader without runtime compilation or a writable cache; omit the argument for four additional byte-exact FXC comparisons. Run `dof_pipeline_cache_test.exe` for offscreen WARP pipeline ownership and shutdown checks, or add `--hardware` to use the high-performance GPU. These tests open no game window and play no audio.
+- DOF does not compile HLSL during rendering. Unexpected pipeline states prepare on one background worker and retain native drawing until ready; common native particle states are prepared before play. The optional disk cache remains for the original game's dynamically generated shaders.
 - Run `powershell -NoProfile -ExecutionPolicy Bypass -File tools\tests\run_dof_tests.ps1` from the repository root. The focused checks compile the production shader, render synthetic fixtures with the CPU-only D3D11 WARP device, and test the reload hooks. They do not start the game.
 - Results and rendered synthetic fixtures are saved under `out\tests\dof-tests`. The checks cover depth separation, continuous sloped surfaces, thin geometry, fractional-radius continuity, foreground edges, alpha, viewport bounds, and 2x/4x/8x MSAA. They do not validate the D3D12 device, gameplay appearance, or frame rate.
 - Run `tools\tests\run_viewmodel_dof.cmd` for separate CPU-only WARP checks of weapon coverage, depth falloff, silhouette protection, and alpha at 1x/2x/4x/8x MSAA. Its executable goes under `out\tests\dof-tests`.

@@ -42,6 +42,14 @@ inline bool IsParticleDofNativePixel(const PixelKey& k) {
     return expected == k;
 }
 
+inline PixelKey CanonicalParticleDofPixelKey(PixelKey k) {
+    // The verified program samples only t0. Stale unused texture/sampler types otherwise
+    // produce different source hashes and repeat the expensive particle shader compilation.
+    if (IsParticleDofNativePixel(k))
+        for (int i = 1; i < 4; ++i) k.tex[i] = {};
+    return k;
+}
+
 namespace particle_dof_detail {
 inline bool ReplaceOne(std::string& s, std::string_view from, std::string_view to) {
     auto at = s.find(from);

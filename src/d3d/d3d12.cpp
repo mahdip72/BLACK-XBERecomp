@@ -46,6 +46,10 @@
 #include "d3d/particle_dof_clear.h"
 #include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_wrapper.h"
+#include "d3d/dof_shader_source.h"
+#include "d3d/dof_shader_library.h"
+#include "d3d/dof_pipeline_cache.h"
+#include "d3d/shader_cache.h"
 #include "d3d/occlusion.h"
 #include "d3d/smaa_shader.h"
 #include "d3d/smaa_textures.h"
@@ -579,12 +583,7 @@ D3D12_STENCIL_OP StencilOp(uint32_t v) {
 // The game's 2D layer (menus, text, HUD) leaves oPos.w at 0: screen space. Clamped to 2^-64 its clip space
 // coordinates are near 1e-20 and AMD drops parts of those draws; w = 1 draws the same, as XYZRHW does
 std::string VertexProgram(const VertexShader& vs, uint16_t regs, uint64_t decode) {
-    const std::string clamp = "    p.w = magclamp(p.w);\n";
-    const std::string screen_space = "    p.w = p.w == 0 ? 1 : magclamp(p.w);\n";
-    std::string src = VertexProgramHlsl(vs.program, regs, decode);
-    size_t at = src.find(clamp);
-    if (at != std::string::npos) src.replace(at, clamp.size(), screen_space);
-    return src;
+    return ApplyScreenSpaceVertexFix(VertexProgramHlsl(vs.program, regs, decode));
 }
 
 // A small draw whose every float2 input lies in 0..1: sprites, HUD pieces, text. Upscaled, the far edge's last half
@@ -911,6 +910,7 @@ private:
     void DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS cb, uint32_t srv_slot,
                         std::optional<uint32_t> sampler_slot = {});
     ID3D12Resource* Feedback(Target& t) override;
+    bool EnsureFeedbackResource(Target& t);
     ID3D12Resource* Flat(Target& t, D3D12_RESOURCE_STATES*& st);
     uint32_t Samples(uint32_t want);
     void Resolve(Target& t) {
@@ -926,7 +926,7 @@ private:
               D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w, uint32_t h, ID3D12Resource* const src[3],
               const DXGI_FORMAT fmt[3], const float p[8], float blend);
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* vs_entry, const char* entry, DXGI_FORMAT rtv,
-                                            float blend);
+                                           float blend, bool dof = false);
     bool BindTargets(const State& s);
     bool DepthCopy(const State& s);
     bool DepthPass(ID3D12Resource* src, uint32_t src_samples, D3D12_CPU_DESCRIPTOR_HANDLE dh, uint32_t w, uint32_t h,
@@ -1023,6 +1023,9 @@ private:
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
+    ID3D12PipelineState* EnsureParticlePipeline(PsoKey k, ID3DBlob* vs, ID3DBlob* ps);
+    void PrimeDepthOfField();
+    void DrawDofPreparation(const char* phase);
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> UploadConstants(const State& s, const DrawShaders& sh,
         const PsoKey& k, const DrawTextures& stages, GuestExtent size, DrawConstants& c);
@@ -1043,6 +1046,7 @@ private:
     void UploadVertexBuffers(const Assembled& a);
     // shaders by source hash: Compile returns the bytecode and sets hash
     ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
+    ID3DBlob* CompileDof(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
     // Blit's pipeline
     ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
@@ -1168,6 +1172,10 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
+    std::unique_ptr<DofPipelineCache> dof_pipelines_;
+    uint64_t dof_prime_signature_ = 0, dof_embedded_loads_ = 0, dof_embedded_missing_ = 0;
+    bool dof_preparing_ = false, dof_priming_ = false;
+    const char* dof_preparation_phase_ = "";
     std::unordered_map<uint64_t, uint32_t> samplers_;
     uint32_t smp_used_ = 0;
     std::unordered_map<uint64_t, Target> targets_;
@@ -1328,6 +1336,9 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
     Begin();
+    try { dof_pipelines_ = std::make_unique<DofPipelineCache>(dev_.Get()); }
+    catch (...) { LOGR("Particle DOF pipeline worker unavailable; native particles retained"); }
+    PrimeDepthOfField();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
 }
@@ -1608,6 +1619,10 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
         LOGE("d3d12: no %ux%u target with %u samples", t.w, t.h, td.SampleDesc.Count);
         return false;
     }
+    // Reserve the scene snapshot with its target, before a reload can need it. This allocates only;
+    // Feedback still performs the first real copy/resolve when the effect consumes the scene.
+    if (!t.depth && t.gw == guest_w_ && t.gh == guest_h_ &&
+        game::Opt().reload_blur && game::Opt().modern_reload_dof) EnsureFeedbackResource(t);
     return true;
 }
 
@@ -1913,19 +1928,13 @@ bool D3D12Backend::OcclusionPass(const AoPass& a, float c[kAoConstants], const D
 ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(const char* entry, DXGI_FORMAT out, uint32_t samples,
                                                            uint32_t input_samples) {
     uint64_t bits = uint64_t(out) | uint64_t(input_samples) << 32 | uint64_t(samples) << 40;
-    auto [it, added] = blit_psos_.try_emplace(Hash(entry, std::strlen(entry), bits));
-    auto& pso = it->second;
-    // A failed format/sample combination stays disabled rather than retrying a failed pipeline every frame.
-    if (!added) return pso.Get();
-    std::string text;
-    if (input_samples > 1) text = "#define MS 1\n#define DOF_SAMPLES " + std::to_string(input_samples) + "\n";
-    if (!std::strcmp(entry, "depth_of_field")) text += "#define DOF_COMPOSE 1\n";
-    if (!std::strcmp(entry, "ffx_dof_present")) text += "#define FFX_DOF_PRESENT 1\n";
-    text += !std::strncmp(entry, "ffx_dof_", 8) ? kFidelityFxDofHlsl :
-        !std::strncmp(entry, "viewmodel_", 10) ? kViewmodelDofHlsl : kDepthOfFieldHlsl;
+    const uint64_t key = Hash(entry, std::strlen(entry), bits);
+    auto found = blit_psos_.find(key);
+    if (found != blit_psos_.end()) return found->second.Get();
+    const auto text = DofStaticPassSource(entry, input_samples);
     uint64_t hash;
-    ID3DBlob* vs = Compile(text, "vs", "vs_5_0", hash);
-    ID3DBlob* ps = Compile(text, entry, "ps_5_0", hash);
+    ID3DBlob* vs = CompileDof(text, "vs", "vs_5_0", hash);
+    ID3DBlob* ps = CompileDof(text, entry, "ps_5_0", hash);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, out);
     // Filter passes write color/coverage and depth. Only the final scene pass preserves destination alpha.
@@ -1945,6 +1954,12 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthOfFieldPipeline(const char* entry,
         d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     }
     d.SampleDesc.Count = samples;
+    if (!dof_priming_) {
+        auto* ready = dof_pipelines_ ? dof_pipelines_->Request(key ^ 0x444F465354415449ull, d, vs, ps) : nullptr;
+        if (ready) blit_psos_[key] = ready;
+        return ready; // Pending is not a permanent null cache entry. A later frame can use the ready PSO.
+    }
+    auto& pso = blit_psos_[key];
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
 }
@@ -2071,6 +2086,7 @@ void D3D12Backend::DepthOfFieldMipState(uint32_t mip, D3D12_RESOURCE_STATES stat
 }
 
 D3D12Backend::~D3D12Backend() {
+    if (dof_pipelines_) dof_pipelines_->Wait();
     // The SDK owns resources referenced by recorded/in-flight commands, including a failed dispatch.
     bool particle_resources = false;
     for (const auto& snapshot : particle_dof_.snapshots) particle_resources |= bool(snapshot.depth);
@@ -2138,7 +2154,9 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     uint32_t samples = Ms(rt);
     auto* prepare = EnsureDepthOfFieldPipeline("ffx_dof_prepare", DXGI_FORMAT_R16G16B16A16_FLOAT, 1, samples);
     auto* present = EnsureDepthOfFieldPipeline("ffx_dof_present", rt.fmt, samples);
-    if (!prepare || !present) return fail("adapter shader or pipeline creation failed");
+    // Unusual format/sample combinations are prepared asynchronously. Do not permanently disable
+    // this profile while a pipeline is pending; the Balanced/native path can cover this frame.
+    if (!prepare || !present) return false;
     if (!EnsureFidelityFxTargets(processing.width, processing.height)) return fail("adapter target allocation failed");
     ID3D12Resource* source = Feedback(rt);
     if (!source) return fail("scene snapshot allocation failed");
@@ -2333,8 +2351,8 @@ void D3D12Backend::ParticleDofSkipped(uint32_t reason, const char* message) {
 
 bool D3D12Backend::ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* range,
     D3D12_RESOURCE_STATES& range_state, uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h) {
-    const std::string source = "#define PARTICLE_DOF_SAMPLES " + std::to_string(samples) + "\n" + kParticleDofDepthRangeHlsl;
-    auto* pipeline = EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_FLOAT, -1);
+    const auto source = DofParticleRangeSource(samples);
+    auto* pipeline = EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_FLOAT, -1, true);
     if (!pipeline) return false;
     const uint32_t slot = AllocSrvSlots(4);
     for (uint32_t i = 0; i < 4; ++i) {
@@ -2364,7 +2382,7 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
     p.marker = false;  // a marker authorizes exactly one draw
     ++p.batches;
     if (!p.world_valid || p.world_frame != frame_) { ++p.early; return false; }
-    if (!sh.prog || !s.vs || s.vs->program.size() != kParticleDofNativeProgram.size() ||
+    if (g_shader_hooks || !sh.prog || !s.vs || s.vs->program.size() != kParticleDofNativeProgram.size() ||
         !std::equal(s.vs->program.begin(), s.vs->program.end(), kParticleDofNativeProgram.begin()) ||
         s.vs->decl.size() != kParticleDofNativeDeclaration.size() ||
         !std::equal(s.vs->decl.begin(), s.vs->decl.end(), kParticleDofNativeDeclaration.begin()) ||
@@ -2458,6 +2476,13 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
     ParticleDof::Snapshot* snapshot = nullptr;
     for (auto& candidate : p.snapshots) {
         if (candidate.source == ds->res.Get() && compatible(candidate)) {
+            snapshot = &candidate; break;
+        }
+    }
+    if (!snapshot) {
+        // Startup reserves one main-size slot and two small particle-target slots. Prefer an unused
+        // compatible allocation so the first bucket order cannot immediately evict that reservation.
+        for (auto& candidate : p.snapshots) if (!candidate.source && compatible(candidate)) {
             snapshot = &candidate; break;
         }
     }
@@ -2828,23 +2853,63 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
 
 ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
     // one source can hold several entry points
-    uint64_t profile_seed = Hash(profile, std::strlen(profile));
+    constexpr UINT flags1 = D3DCOMPILE_OPTIMIZATION_LEVEL1, flags2 = 0;
+    constexpr uint64_t compiler_flags = uint64_t(flags1) | (uint64_t(flags2) << 32);
+    uint64_t profile_seed = Hash(profile, std::strlen(profile), Hash(&compiler_flags, sizeof(compiler_flags)));
     uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
     hash = Hash(src.data(), src.size(), entry_seed);
     auto it = blobs_.find(hash);
     if (it != blobs_.end()) return it->second.Get();
-    ComPtr<ID3DBlob> code;
+    // Cache initialization is optional too: path/identity allocation must not prevent compilation.
+    static const auto disk_cache = []() -> std::optional<ShaderCache> {
+        try { return std::optional<ShaderCache>{std::in_place}; }
+        catch (...) { return {}; }
+    }();
+    static uint64_t disk_hits = 0, disk_misses = 0;
+    ComPtr<ID3DBlob> code = disk_cache ? disk_cache->Load(src, entry, profile, compiler_flags) : nullptr;
+    if (code) {
+        if (++disk_hits == 1)
+            LOGR("d3d12: shader bytecode cache hit (%llu hits, %llu misses this process)",
+                 (unsigned long long)disk_hits, (unsigned long long)disk_misses);
+        blobs_[hash] = code;
+        return code.Get();
+    }
+    if (++disk_misses == 1)
+        LOGR("d3d12: shader bytecode cache miss (%llu hits, %llu misses this process)",
+             (unsigned long long)disk_hits, (unsigned long long)disk_misses);
     ComPtr<ID3DBlob> err;
     PerfScope perf_compile{g_perf.compile};
     g_perf.shaders++;
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
+                            flags1, flags2, &code, &err);
+    const double compile_ms = PerfMs(perf_compile.t);
+    if (compile_ms >= 250.0)
+        LOGR("d3d12: cold shader compile %s %s %016llX took %.1f ms", entry, profile,
+             (unsigned long long)hash, compile_ms);
     if (FAILED(hr)) {
         LOGE("d3d12: %s compile failed: %s", profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
         LOGE("%s", src.c_str());
         blobs_[hash] = nullptr;
         return nullptr;
     }
+    if (disk_cache) disk_cache->Store(src, entry, profile, compiler_flags, code.Get());
+    blobs_[hash] = code;
+    return code.Get();
+}
+
+ID3DBlob* D3D12Backend::CompileDof(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
+    constexpr uint64_t flags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    const uint64_t profile_seed = Hash(profile, std::strlen(profile), Hash(&flags, sizeof(flags)));
+    hash = Hash(src.data(), src.size(), Hash(entry, std::strlen(entry), profile_seed));
+    auto found = blobs_.find(hash);
+    if (found != blobs_.end()) return found->second.Get();
+    auto code = LoadDofShaderBytecode(src, entry, profile, flags);
+    if (!code) {
+        ++dof_embedded_missing_;
+        LOGR("d3d12: embedded DOF shader missing: %s %s %016llX; effect variant disabled", entry, profile,
+             (unsigned long long)hash);
+    } else ++dof_embedded_loads_;
+    // A missing pack entry is a build/configuration error. Never compile or touch the disk cache here.
     blobs_[hash] = code;
     return code.Get();
 }
@@ -2892,16 +2957,17 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
 
 // Pass's pipeline for the shader, kept in blit_psos_; null when it can't be made
 ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const char* vs_entry, const char* entry,
-                                                      DXGI_FORMAT rtv, float blend) {
+                                                      DXGI_FORMAT rtv, float blend, bool dof) {
     uint64_t seed = uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0);
     uint64_t source_seed = Hash(hlsl, std::strlen(hlsl), seed);
     uint64_t entry_seed = Hash(entry, std::strlen(entry), source_seed);
-    auto& pso = blit_psos_[Hash(vs_entry, std::strlen(vs_entry), entry_seed)];
-    if (pso) return pso.Get();
+    const uint64_t key = Hash(vs_entry, std::strlen(vs_entry), entry_seed);
+    auto found = blit_psos_.find(key);
+    if (found != blit_psos_.end() && (found->second || dof)) return found->second.Get();
     uint64_t hv;
     uint64_t hp;
-    ID3DBlob* vs = Compile(hlsl, vs_entry, "vs_5_0", hv);
-    ID3DBlob* ps = Compile(hlsl, entry, "ps_5_0", hp);
+    ID3DBlob* vs = dof ? CompileDof(hlsl, vs_entry, "vs_5_0", hv) : Compile(hlsl, vs_entry, "vs_5_0", hv);
+    ID3DBlob* ps = dof ? CompileDof(hlsl, entry, "ps_5_0", hp) : Compile(hlsl, entry, "ps_5_0", hp);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
     if (blend >= 0) {
@@ -2911,6 +2977,12 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
         b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_BLEND_FACTOR;
         b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
+    if (dof && !dof_priming_) {
+        auto* ready = dof_pipelines_ ? dof_pipelines_->Request(key ^ 0x444F465041535300ull, d, vs, ps) : nullptr;
+        if (ready) blit_psos_[key] = ready;
+        return ready;
+    }
+    auto& pso = blit_psos_[key];
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
 }
@@ -2943,27 +3015,28 @@ bool D3D12Backend::Pass(const char* hlsl, const char* vs_entry, const char* entr
 }
 
 // a single sample copy of the target to read: while drawing to it, or of a multisampled one
+bool D3D12Backend::EnsureFeedbackResource(Target& t) {
+    if (t.fb) return true;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = t.res->GetDesc();
+    td.SampleDesc.Count = 1;
+    td.Alignment = 0;
+    if (!t.depth) td.Flags = D3D12_RESOURCE_FLAG_NONE;
+    t.fb_state = t.depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_COPY_DEST;
+    return SUCCEEDED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.fb_state, nullptr,
+                                                   IID_PPV_ARGS(&t.fb)));
+}
+
 ID3D12Resource* D3D12Backend::Feedback(Target& t) {
     uint32_t samples = Ms(t);
     // every write takes a multisampled target out of this state: the last copy still holds
     D3D12_RESOURCE_STATES read = t.depth ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                                          : D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
-    if (t.fb && samples > 1 && t.state == read) {
+    if (t.fb && samples > 1 && t.state == read && t.fb_state == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
         Transition(t.fb.Get(), t.fb_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         return t.fb.Get();
     }
-    if (!t.fb) {
-        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
-        D3D12_RESOURCE_DESC td = t.res->GetDesc();
-        td.SampleDesc.Count = 1;
-        td.Alignment = 0;
-        if (!t.depth) td.Flags = D3D12_RESOURCE_FLAG_NONE;
-        t.fb_state = t.depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_COPY_DEST;
-        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.fb_state, nullptr,
-                                                 IID_PPV_ARGS(&t.fb)))) {
-            return nullptr;
-        }
-    }
+    if (!EnsureFeedbackResource(t)) return nullptr;
     if (t.depth) {
         if (free_dsv_.empty()) return nullptr;
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -3079,6 +3152,211 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) LOGE("d3d12: pipeline creation failed");
     psos_[h] = pso;
     return pso.Get();
+}
+
+ID3D12PipelineState* D3D12Backend::EnsureParticlePipeline(PsoKey k, ID3DBlob* vs, ID3DBlob* ps) {
+    if (!dof_pipelines_ || !vs || !ps) return nullptr;
+    // Normalize descriptor-equivalent inherited state, especially the source pass with no DS/blending.
+    if (!k.blend) k.src = k.dst = k.op = 0;
+    if (!k.zen) k.zwrite = k.zfunc = 0;
+    if (!k.sten) k.sfunc = k.smask = k.swmask = k.sfail = k.szfail = k.spass = 0;
+    if (!k.cull) k.ccw = 0;
+    if (k.fill != kFillWireframe) k.fill = 0;
+    D3D12_INPUT_ELEMENT_DESC elements[16];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.InputLayout = {elements, FillInputLayout(k, elements)};
+    FillPipelineDesc(k, vs, ps, desc);
+    return dof_pipelines_->Request(Hash(&k, sizeof(k)), desc, vs, ps);
+}
+
+void D3D12Backend::PrimeDepthOfField() {
+    const auto& options = game::Opt();
+    const bool enabled = options.reload_blur && options.modern_reload_dof;
+    const uint32_t profile = options.fidelityfx_dof ? (options.dof_cinematic_quality ? 2u : 1u) : 0u;
+    const uint32_t width = std::max(1u, uint32_t(std::lround(guest_w_ * scale_)));
+    const uint32_t height = std::max(1u, uint32_t(std::lround(guest_h_ * scale_)));
+    const uint32_t key[] = {width, height, msaa_, profile, uint32_t(enabled)};
+    const uint64_t signature = Hash(key, sizeof(key));
+    if (dof_prime_signature_ == signature) return;
+    if (!enabled) { dof_prime_signature_ = signature; return; }
+    const auto started = PerfClock::now();
+    dof_preparing_ = !app::HandingOver();
+    dof_priming_ = true;
+    // Init runs before the title's render thread starts. Later calls only follow render/profile changes;
+    // fence before replacing any resources or fixed RTVs used by the previous configuration.
+    if (dof_prime_signature_) Flush();
+    if (ffx_dof_failed_) {
+        // A changed configuration is an explicit retry boundary. Discard a poisoned SDK context
+        // before clearing the latch; Matches alone would otherwise retain its failed backend jobs.
+        ffx_dof_.Reset();
+        ffx_dof_failed_ = 0;
+    }
+    dof_prime_signature_ = signature;
+    DrawDofPreparation("Loading graphics shaders");
+    bool ready = true;
+    const uint32_t sample_counts[] = {1, msaa_};
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (i && msaa_ == 1) continue;
+        const uint32_t samples = sample_counts[i];
+        ready &= EnsureDepthOfFieldPipeline("depth_of_field_pack", kDofFormats[0], 1, samples) != nullptr;
+        ready &= EnsureDepthOfFieldPipeline("depth_of_field", kBgra, samples) != nullptr;
+        ready &= EnsureDepthOfFieldPipeline("viewmodel_dof_pack", kDofFormats[0], 1, samples) != nullptr;
+        ready &= EnsureDepthOfFieldPipeline("viewmodel_dof", kBgra, samples) != nullptr;
+        ready &= EnsureDepthOfFieldPipeline("ffx_dof_prepare", kDofFormats[0], 1, samples) != nullptr;
+        ready &= EnsureDepthOfFieldPipeline("ffx_dof_present", kBgra, samples) != nullptr;
+        if (samples > 1) {
+            const auto source = DofParticleRangeSource(samples);
+            ready &= EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_FLOAT, -1, true) != nullptr;
+        }
+        // Native 15BB00 uses GREATER; disabled alpha testing maps to ALWAYS. Other alpha/raster/mask
+        // states remain supported by the same embedded library and a single asynchronous PSO worker.
+        for (uint32_t pass = 0; pass < 3; ++pass) {
+            uint64_t vertex_hash;
+            auto* vs = CompileDof(DofParticleVertexSource(pass), "main", "vs_5_0", vertex_hash);
+            if (!vs) { ready = false; continue; }
+            for (int alpha : {4, 7}) for (bool kill : {false, true}) for (uint32_t blend = 0; blend < 2; ++blend) {
+                uint64_t pixel_hash;
+                auto* ps = CompileDof(DofParticlePixelSource(samples, blend, alpha, kill, pass),
+                                      "main", "ps_5_0", pixel_hash);
+                if (!ps) { ready = false; continue; }
+                for (uint32_t cull = 0; cull < 2; ++cull)
+                    for (uint32_t mask : {7u, 15u}) for (uint32_t depth : {0x201u, 0x203u}) {
+                        PsoKey state{};
+                        state.vs = vertex_hash; state.ps = pixel_hash;
+                        state.regs = 0x209; state.topo = uint32_t(Topology::Triangles);
+                        state.elements[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                        state.elements[3] = DXGI_FORMAT_B8G8R8A8_UNORM | (16u << 16);
+                        state.elements[9] = DXGI_FORMAT_R32G32_FLOAT | (20u << 16);
+                        state.has_rt = 1; state.rtfmt = kBgra;
+                        state.has_ds = state.zen = state.blend = 1;
+                        state.zfunc = depth; state.src = 0x302; state.dst = blend ? 1 : 0x303; state.op = 0x8006;
+                        state.wmask = mask; state.cull = state.ccw = cull;
+                        state.msaa = samples > 1 ? samples : 0;
+                        if (pass == 1) {
+                            state.has_ds = state.zen = state.blend = state.msaa = 0;
+                            state.rtfmt = kDofFormats[0]; state.wmask = D3D12_COLOR_WRITE_ENABLE_ALL;
+                        }
+                        EnsureParticlePipeline(state, vs, ps);
+                    }
+            }
+            DrawDofPreparation("Preparing particle pipelines");
+        }
+    }
+    ready &= EnsureDepthOfFieldPipeline("depth_of_field_gather", kDofFormats[0], 1) != nullptr;
+    ready &= EnsureDepthOfFieldPipeline("depth_of_field_downsample", kDofFormats[0], 1) != nullptr;
+    ready &= EnsurePassPipeline(kParticleDofAtlasFilterHlsl.c_str(), "vs", "filter_ps",
+                                kDofFormats[0], -1, true) != nullptr;
+
+    bool world_ready = false;
+    if (profile) {
+        DrawDofPreparation("Preparing cinematic graphics");
+        const bool cinematic = profile == 2;
+        const auto extent = FidelityFxDofProcessingSize(width, height, cinematic ? 2 : 1);
+        const uint32_t failure_bit = cinematic ? 2u : 1u;
+        world_ready = !(ffx_dof_failed_ & failure_bit) && extent.width && ffx_dof_.Create(dev_.Get(), extent.width, extent.height,
+                                                      cinematic ? 8 : 4, cinematic);
+        if (world_ready) world_ready = EnsureFidelityFxTargets(extent.width, extent.height);
+        if (world_ready) {
+            // The SDK creates its private upload ring on first dispatch. Exercise it on initialized,
+            // zero-CoC scratch images during preparation, without invoking a game effect or scene draw.
+            for (uint32_t i = 0; i < 2; ++i)
+                Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const float color[4] = {};
+            const float depth[4] = {.5f, .5f, .5f, .5f};
+            cl_->ClearRenderTargetView(FidelityFxView(0), color, 0, nullptr);
+            cl_->ClearRenderTargetView(FidelityFxView(1), depth, 0, nullptr);
+            for (uint32_t i = 0; i < 2; ++i)
+                Transition(ffx_dof_targets_[i].Get(), ffx_dof_states_[i], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            world_ready = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
+                                           ffx_dof_targets_[2].Get(), 1.0f);
+            Begin(); // SDK dispatch changes descriptor heaps/root bindings, including a failed dispatch.
+            Flush(); // Scratch/private resources are retired before gameplay or fallback recreation.
+        }
+        if (!world_ready) {
+            ffx_dof_failed_ |= failure_bit;
+            LOGR("DOF preparation: FidelityFX profile %u unavailable; preparing Balanced fallback", profile);
+        }
+        ffx_dof_reported_ = false;
+    }
+    DrawDofPreparation("Preparing depth and particle buffers");
+    if (!world_ready) {
+        ready &= EnsureDepthOfFieldFilter(width, height);
+        ready &= EnsureDepthOfFieldLayers((width + 1) / 2, (height + 1) / 2);
+    }
+    ready &= EnsureWeaponDofTargets(width, height);
+    for (auto& [id, target] : targets_)
+        if (!target.depth && target.gw == guest_w_ && target.gh == guest_h_) ready &= EnsureFeedbackResource(target);
+    // At high native resolutions a small-CoC full-size quad may need a 4096 cell. Reserve that page
+    // before gameplay instead of allocating it and flushing the current frame during the first reload.
+    ready &= EnsureParticleDofAtlas(std::max(width, height) > 2044 ? 4096 : 2048);
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    const auto prepare_depth = [&](ComPtr<ID3D12Resource>& resource, D3D12_RESOURCE_STATES& state,
+                                   uint32_t w, uint32_t h, uint32_t samples) {
+        if (resource) {
+            const auto old = resource->GetDesc();
+            if (old.Width == w && old.Height == h && old.SampleDesc.Count == samples) return true;
+        }
+        auto desc = Texture2DDesc(DXGI_FORMAT_R24G8_TYPELESS, w, h);
+        desc.SampleDesc.Count = samples;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        ComPtr<ID3D12Resource> next;
+        if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&next)))) return false;
+        if (resource) Release(std::move(resource));
+        resource = std::move(next); state = D3D12_RESOURCE_STATE_COPY_DEST;
+        return true;
+    };
+    ready &= prepare_depth(weapon_dof_.before, weapon_dof_.before_state, width, height, msaa_);
+    for (uint32_t i = 0; i < kParticleDofSnapshots; ++i) {
+        auto& snapshot = particle_dof_.snapshots[i];
+        const uint32_t w = i ? std::max(1u, uint32_t(std::lround((guest_w_ / 8) * scale_))) : width;
+        const uint32_t h = i ? std::max(1u, uint32_t(std::lround((guest_h_ / 8) * scale_))) : height;
+        const uint32_t samples = i ? 1 : msaa_;
+        ready &= prepare_depth(snapshot.depth, snapshot.state, w, h, samples);
+        snapshot.source = nullptr;
+        if (samples > 1 && (!snapshot.range || snapshot.range->GetDesc().Width != w || snapshot.range->GetDesc().Height != h)) {
+            auto desc = Texture2DDesc(DXGI_FORMAT_R32G32_FLOAT, w, h);
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            ComPtr<ID3D12Resource> range;
+            if (SUCCEEDED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&range)))) {
+                if (snapshot.range) Release(std::move(snapshot.range));
+                snapshot.range = std::move(range);
+                snapshot.range_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                dev_->CreateRenderTargetView(snapshot.range.Get(), nullptr, ParticleDofRangeView(i));
+                snapshot.range_view_used = true;
+            } else ready = false;
+        }
+    }
+    if (dof_pipelines_) {
+        if (dof_preparing_) {
+            while (!dof_pipelines_->WaitFor(std::chrono::milliseconds(33)))
+                DrawDofPreparation("Preparing particle pipelines");
+        } else dof_pipelines_->Wait();
+    }
+    const auto pipelines = dof_pipelines_ ? dof_pipelines_->GetStats() : DofPipelineCache::Stats{};
+    ready &= dof_pipelines_ && pipelines.pending == 0 && pipelines.failed == 0;
+    DrawDofPreparation("Graphics ready");
+    dof_preparing_ = dof_priming_ = false;
+    LOGR("DOF preparation complete: %ux%u %ux MSAA profile %u, %llu embedded shaders/%llu missing, "
+         "%llu particle PSOs ready/%llu pending/%llu failed, resources %s, %.1f ms; no runtime DOF HLSL compiler",
+         width, height, msaa_, profile, (unsigned long long)dof_embedded_loads_, (unsigned long long)dof_embedded_missing_,
+         (unsigned long long)pipelines.ready, (unsigned long long)pipelines.pending, (unsigned long long)pipelines.failed,
+         ready ? "ready" : "partial", PerfMs(started));
+}
+
+void D3D12Backend::DrawDofPreparation(const char* phase) {
+    if (!dof_preparing_) return;
+    dof_preparation_phase_ = phase;
+    Begin();
+    DrawFrame(nullptr, swap_->GetCurrentBackBufferIndex());
+    Submit(false);
+    swap_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (presents_ == 0) app::SplashFirstFrame();
+    // These are host preparation frames, not Xbox presents. Do not advance native pacing/delivery counters.
+    ++frame_;
+    ResetFrame();
 }
 
 TexKind TextureKind(const TextureDesc& d) {
@@ -3419,9 +3697,9 @@ void DrawShaderKeys(const State& s, const Assembled& a, const PixelKey& pk, Draw
 }
 
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
+    if (sh.particle_samples) return DofParticleVertexSource(sh.particle_pass);
     if (sh.prog) {
-        auto source = VertexProgram(*s.vs, a.regs, a.decode);
-        return sh.particle_samples ? MakeParticleDofVertexShader(std::move(source), sh.particle_pass) : source;
+        return VertexProgram(*s.vs, a.regs, a.decode);
     }
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
 }
@@ -3434,7 +3712,9 @@ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawSh
         sh.vs_code = blobs_[sh.vh].Get();
         return;
     }
-    sh.vs_code = Compile(VertexHlsl(s, a, sh), "main", "vs_5_0", sh.vh);
+    const auto source = VertexHlsl(s, a, sh);
+    sh.vs_code = sh.particle_samples ? CompileDof(source, "main", "vs_5_0", sh.vh) :
+                                      Compile(source, "main", "vs_5_0", sh.vh);
     shader_src_[sh.vkey] = sh.vh;
 }
 
@@ -3462,10 +3742,10 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
         sh.ps_code = blobs_[sh.ph].Get();
         return;
     }
-    auto source = PixelHlsl(pk);
-    if (sh.particle_samples) source = MakeParticleDofPixelShader(std::move(source), sh.particle_samples,
-        sh.particle_blend, sh.particle_alpha_function, sh.particle_pass);
-    sh.ps_code = Compile(source, "main", "ps_5_0", sh.ph);
+    const auto source = sh.particle_samples ? DofParticlePixelSource(sh.particle_samples, sh.particle_blend,
+        sh.particle_alpha_function, pk.alphakill != 0, sh.particle_pass) : PixelHlsl(pk);
+    sh.ps_code = sh.particle_samples ? CompileDof(source, "main", "ps_5_0", sh.ph) :
+                                      Compile(source, "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
 
@@ -3815,9 +4095,8 @@ void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::stri
 
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
     CaptureShader("vs", sh.vkey, VertexHlsl(s, a, sh));
-    auto source = PixelHlsl(pk);
-    if (sh.particle_samples) source = MakeParticleDofPixelShader(std::move(source), sh.particle_samples,
-        sh.particle_blend, sh.particle_alpha_function, sh.particle_pass);
+    const auto source = sh.particle_samples ? DofParticlePixelSource(sh.particle_samples, sh.particle_blend,
+        sh.particle_alpha_function, pk.alphakill != 0, sh.particle_pass) : PixelHlsl(pk);
     CaptureShader("ps", sh.pkey, source);
 }
 
@@ -3988,18 +4267,18 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             key.rtfmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
             key.wmask = D3D12_COLOR_WRITE_ENABLE_ALL;
         }
-        return EnsurePipeline(key, variant.vs_code, variant.ps_code);
+        return EnsureParticlePipeline(key, variant.vs_code, variant.ps_code);
     };
     // Every fallible resource/pipeline operation precedes the first native-target composite.
     // A failure can therefore fall back to the complete original draw without double blending.
     auto* source_pso = pipeline(source, true);
     auto* composite_pso = pipeline(composite, false);
     auto* filter_pso = EnsurePassPipeline(kParticleDofAtlasFilterHlsl.c_str(), "vs", "filter_ps",
-                                         DXGI_FORMAT_R16G16B16A16_FLOAT, -1);
+                                         DXGI_FORMAT_R16G16B16A16_FLOAT, -1, true);
     if (!source_pso || !composite_pso || !filter_pso) {
         if (!(p.reported & (1u << 8))) {
             p.reported |= 1u << 8;
-            LOGR("Particle DOF: atlas pipeline unavailable; retaining direct aperture filtering");
+            LOGR("Particle DOF: atlas pipeline pending/unavailable; using the ready direct or native path");
         }
         return false;
     }
@@ -4051,6 +4330,10 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         p.globals.atlas_target[3] = float(page.quad_count);
         DrawConstants constants{};
         const auto cb = UploadConstants(s, source, native_key, stages, size, constants);
+        if (cap_ && page.first_quad == 0) {
+            CaptureDraw(s, 8, a.vertex_count, native_key, constants, stages);
+            EndDrawCapture(s, a, a.vertex_count, constants);
+        }
         p.atlas_rects.clear();
         for (uint32_t q = page.first_quad; q < page.first_quad + page.quad_count; ++q) {
             const auto& map = p.quads[q];
@@ -4140,7 +4423,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
     if (!BindStageTexturesAndTargets(s, stages)) return;
-    PixelKey pk = MakePixelKey(s, stages.info);
+    const PixelKey native_pk = MakePixelKey(s, stages.info);
+    PixelKey pk = native_pk;
     // Preserve the native sampler heuristic: expanded UV support intentionally extends outside 0..1.
     const bool native_clamp = AnyStageWraps(s) && UnitTexcoords(a);
     const uint8_t* native_vertices = a.buffers[0].src;
@@ -4149,48 +4433,50 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     ID3D12Resource* native_t3 = stages.res[3];
     const auto native_t3_view = stages.sv[3];
     PrepareParticleDof(s, a, pk, sh, stages);
+    if (sh.particle_samples) pk = CanonicalParticleDofPixelKey(pk);
     PsoKey k;
-    auto pipeline = [&]() -> ID3D12PipelineState* {
-        DrawShaderKeys(s, a, pk, sh);
-        EnsureVertexShader(s, a, sh);
-        EnsurePixelShader(pk, sh);
-        if (!sh.vs_code || !sh.ps_code) return nullptr;
-        BuildPipelineKey(s, a, sh.vh, sh.ph, k);
-        return EnsurePipeline(k, sh.vs_code, sh.ps_code);
-    };
-    ID3D12PipelineState* pso = pipeline();
-    if (!pso && sh.particle_samples) {
-        ParticleDofSkipped(6, "native shader wrapper compilation/pipeline failed");
-        a.buffers[0].src = native_vertices;
-        stages.res[2] = native_t2;
-        stages.sv[2] = native_t2_view;
-        stages.res[3] = native_t3;
-        stages.sv[3] = native_t3_view;
-        sh.particle_samples = 0;
-        sh.particle_blend = 0;
-        sh.particle_alpha_function = -1;
-        pso = pipeline();
-    }
-    if (!pso) return;
-    cl_->SetPipelineState(pso);
-
-    // constants
-    GuestExtent size;
-    SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
-    DrawConstants c{};
-    UploadConstants(s, sh, k, stages, size, c);
-
-    if (cap_) {
-        CaptureDraw(s, prim, count, k, c, stages);
-        EndDrawCapture(s, a, count, c);
-        CaptureShaders(s, a, sh, pk);
-    }
-
+    if (sh.particle_samples) BuildPipelineKey(s, a, 0, 0, k);
+    // The atlas composite already handles individual unpacked quads. Compile the separate
+    // direct-aperture pipeline only if the complete batch cannot use the atlas.
     const bool atlas = sh.particle_samples && DrawParticleDofAtlas(s, a, pk, sh, stages, k, native_clamp);
     if (!atlas) {
+        auto pipeline = [&]() -> ID3D12PipelineState* {
+            DrawShaderKeys(s, a, pk, sh);
+            EnsureVertexShader(s, a, sh);
+            EnsurePixelShader(pk, sh);
+            if (!sh.vs_code || !sh.ps_code) return nullptr;
+            BuildPipelineKey(s, a, sh.vh, sh.ph, k);
+            return sh.particle_samples ? EnsureParticlePipeline(k, sh.vs_code, sh.ps_code) :
+                                         EnsurePipeline(k, sh.vs_code, sh.ps_code);
+        };
+        ID3D12PipelineState* pso = pipeline();
+        if (!pso && sh.particle_samples) {
+            ParticleDofSkipped(6, "particle pipeline pending/unavailable");
+            a.buffers[0].src = native_vertices;
+            stages.res[2] = native_t2;
+            stages.sv[2] = native_t2_view;
+            stages.res[3] = native_t3;
+            stages.sv[3] = native_t3_view;
+            pk = native_pk;
+            sh.particle_samples = 0;
+            sh.particle_blend = 0;
+            sh.particle_alpha_function = -1;
+            pso = pipeline();
+        }
+        if (!pso) return;
+        cl_->SetPipelineState(pso);
+
+        GuestExtent size;
+        SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+        DrawConstants c{};
+        UploadConstants(s, sh, k, stages, size, c);
+        if (cap_) {
+            CaptureDraw(s, prim, count, k, c, stages);
+            EndDrawCapture(s, a, count, c);
+            CaptureShaders(s, a, sh, pk);
+        }
         // Texture views and samplers, viewport/scissor and native blend/depth behavior are unchanged
         // for ordinary draws and for any particle batch that cannot use the bounded atlas.
-        cl_->SetPipelineState(pso);
         SetTextureViewsAndSamplers(s, stages, native_clamp);
         SetViewportScissor(s, size.w);
         SetBlendFactorStencilRef(s);
@@ -4748,7 +5034,24 @@ void D3D12Backend::RenderUi() {
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    if (app::kGame.ui) app::kGame.ui(fps_);
+    if (dof_preparing_) {
+        const auto* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(.5f, .5f));
+        ImGui::Begin("Graphics preparation", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::TextUnformatted("Preparing graphics...");
+        ImGui::TextUnformatted(dof_preparation_phase_);
+        if (dof_pipelines_) {
+            const auto stats = dof_pipelines_->GetStats();
+            const uint64_t total = stats.ready + stats.pending + stats.failed;
+            if (total) {
+                ImGui::Text("Particle pipelines: %llu / %llu", (unsigned long long)(stats.ready + stats.failed),
+                            (unsigned long long)total);
+                ImGui::ProgressBar(float(stats.ready + stats.failed) / float(total), ImVec2(280, 0));
+            }
+        }
+        ImGui::End();
+    } else if (app::kGame.ui) app::kGame.ui(fps_);
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     cl_->SetDescriptorHeaps(1, uh);
@@ -4957,6 +5260,7 @@ void D3D12Backend::ApplySettings() {
         if (ext_) ext_->Reset(*this);
         bound_rt_ = bound_ds_ = nullptr;
     }
+    PrimeDepthOfField();
 }
 
 // the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure

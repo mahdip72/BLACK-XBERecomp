@@ -71,6 +71,84 @@ void Check(bool okay, const char* why) {
     if (!okay) throw std::runtime_error(why);
 }
 
+void CheckParticleShaderCanonicalization() {
+    const gpu::TexInfo unused_types[]{
+        {}, {gpu::kTex2D}, {gpu::kTex3D}, {gpu::kTexCube},
+        {gpu::kTex2D, 0, 1}, {gpu::kTex2D, 0, 2},
+        {gpu::kTex2D, 1, 0, gpu::kTexWide}};
+    const auto source_hash = [](const std::string& source) {
+        const auto profile = gpu::Hash("ps_5_0", 6);
+        const auto entry = gpu::Hash("main", 4, profile);
+        return gpu::Hash(source.data(), source.size(), entry);
+    };
+    size_t comparisons = 0;
+    for (uint32_t alphakill : {0u, 1u}) {
+        auto base = gpu::ParticleDofNativePixelKey(gpu::TexInfo{gpu::kTex2D});
+        base.alphakill = alphakill;
+        Check(gpu::CanonicalParticleDofPixelKey(base) == base,
+              "canonicalization changed an already canonical particle key");
+        const auto base_native = gpu::PixelHlsl(base);
+        std::vector<gpu::PixelKey> variants;
+        for (int stage = 1; stage < 4; ++stage) {
+            for (const auto type : unused_types) {
+                auto variant = base;
+                variant.tex[stage] = type;
+                variants.push_back(variant);
+            }
+        }
+        auto mixed = base;
+        mixed.tex[1] = {gpu::kTexCube};
+        mixed.tex[2] = {gpu::kTex2D, 0, 1};
+        mixed.tex[3] = {gpu::kTex3D};
+        variants.push_back(mixed);
+        Check(gpu::PixelHlsl(mixed) != base_native,
+              "unused-stage fixture no longer exercises different translator source");
+        for (uint32_t pass : {0u, 1u, 2u}) {
+            for (uint32_t samples : {1u, 8u}) {
+                for (uint32_t blend : {0u, 1u}) {
+                    const auto expected = gpu::MakeParticleDofPixelShader(base_native, samples, blend, 7, pass);
+                    Check(!expected.empty(), "canonical particle baseline wrapper rejected source");
+                    for (const auto& variant : variants) {
+                        Check(gpu::IsParticleDofNativePixel(variant),
+                              "unused-stage fixture unexpectedly changes particle eligibility");
+                        const auto canonical = gpu::CanonicalParticleDofPixelKey(variant);
+                        Check(canonical == base && gpu::Hash(&canonical, sizeof(canonical)) ==
+                              gpu::Hash(&base, sizeof(base)), "unused stages still split particle cache keys");
+                        const auto actual = gpu::MakeParticleDofPixelShader(
+                            gpu::PixelHlsl(canonical), samples, blend, 7, pass);
+                        Check(actual == expected && source_hash(actual) == source_hash(expected),
+                              "unused stages still split generated particle shader source/hash");
+                        ++comparisons;
+                    }
+                    auto other_alpha = base;
+                    other_alpha.alphakill ^= 1;
+                    Check(gpu::CanonicalParticleDofPixelKey(other_alpha) == other_alpha &&
+                          gpu::MakeParticleDofPixelShader(gpu::PixelHlsl(other_alpha), samples, blend, 7, pass)
+                              != expected, "canonicalization erased sampled-stage alpha kill behavior");
+                }
+            }
+        }
+        // A changed sampled texture or combiner is outside this optimization's proven contract.
+        for (int change = 0; change < 3; ++change) {
+            auto unsupported = mixed;
+            if (change == 0) unsupported.tex[0] = {gpu::kTexCube};
+            if (change == 1) unsupported.rgb_in[0] ^= 1;
+            if (change == 2) unsupported.alphakill |= 2;
+            Check(!gpu::IsParticleDofNativePixel(unsupported) &&
+                  gpu::CanonicalParticleDofPixelKey(unsupported) == unsupported,
+                  "canonicalization changed an unsupported material or sampled texture");
+        }
+        auto sampled_flags = mixed;
+        sampled_flags.tex[0].flags = 1; // Backend extension bits are part of the sampled-stage key.
+        auto expected_flags = base;
+        expected_flags.tex[0].flags = 1;
+        Check(gpu::CanonicalParticleDofPixelKey(sampled_flags) == expected_flags &&
+              !(expected_flags == base), "canonicalization erased sampled texture metadata");
+    }
+    std::printf("particle unused-stage canonicalization: %zu source/hash comparisons across passes 0/1/2 PASS\n",
+                comparisons);
+}
+
 void Hr(HRESULT hr, const char* action) {
     if (FAILED(hr)) {
         char text[160];
@@ -1765,6 +1843,7 @@ void CheckAtlasClippedAlphaTest(Warp& warp) {
 
 int main() {
     try {
+        CheckParticleShaderCanonicalization();
         CheckGeometry();
         Warp warp;
         CheckFocusAndMixedBatch(warp);
