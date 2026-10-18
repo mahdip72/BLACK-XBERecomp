@@ -10,24 +10,6 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 - Put your game files in the `assets` folder. This can be an ISO, or the extracted data files, of the USA or Europe release.
 - Run `BLACK.exe`.
 - Recomp settings can be adjusted in the in-game options menu while the game is running, or through the Settings overlay, which is opened with F10 by default.
-
-### Install an HD texture pack
-
-If you have a prepared `BLACK-HD-Textures-4x.zip`, close the game and extract it
-into the folder containing `BLACK.exe`. The `textures` folder must be directly
-beside the executable:
-
-```text
-BLACK.exe
-assets/       your existing game files
-textures/     the DDS files from the texture pack
-```
-
-Start the game normally. Keep your existing `assets`, settings and saves.
-The ISO does not need to be changed. To disable the pack, rename or remove
-`textures` and restart. Use a build with texture-pack support and a pack matching
-your Xbox game files. See [pack contents and local preparation](docs/hd-textures.md).
-
 <img width="1920" height="1080" alt="{5852D359-24A0-48C8-9319-07C3A619E355}" src="https://github.com/user-attachments/assets/e0156eb8-c1b5-49d9-ab93-3abb46bf5f47" />
 
 
@@ -46,7 +28,7 @@ your Xbox game files. See [pack contents and local preparation](docs/hd-textures
 - **FMV Scale** - Choose between Fill, which zooms the 4:3 FMVs to fill widescreen displays, and 4:3, which keeps them at their original aspect ratio.
 
 ### Graphics
-- **Optional HD Textures** - Use original Xbox textures upscaled 4x with PBRify and the HD Reimagined fonts in one pack. See [setup and coverage](docs/hd-textures.md); artwork is prepared locally.
+- **HD Textures** - Extract the pack's `textures` folder beside `BLACK.exe` and restart the game. No ISO changes are needed.
 - **Multisample Antialiasing (MSAA)** - Enables 2x, 4x or 8x MSAA to smooth jagged edges while preserving a sharp image.
 - **Subpixel Morphological Antialiasing (SMAA)** - Enables SMAA to smooth jagged edges across the whole frame with a softer image. SMAA also smooths alpha-tested edges such as fences and foliage, and can be combined with MSAA.
 - **Anisotropic Filtering** - Forces the selected anisotropic filtering level on all textures.

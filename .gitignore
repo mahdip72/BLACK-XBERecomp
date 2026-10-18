@@ -19,7 +19,6 @@ black.toml
 /hdd/
 /CrashDumps/
 /textures/
-__pycache__/
 
 # editors
 .vs/
@@ -28,4 +27,3 @@ __pycache__/
 
 # Local temporary folder
 .local
-/temp/
