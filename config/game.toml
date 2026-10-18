@@ -388,6 +388,11 @@ at = 0x79327
 call = "JointTurnBack"
 
 [[hook]]
+at = 0x14B4F5
+call = "SoundCountdownTick"
+on_false = 0x14B559
+
+[[hook]]
 at = 0x169160
 call = "ShardTick"
 on_false = 0x169167
@@ -576,3 +581,8 @@ after = true
 at = 0x1F813B
 call = "GameLanguage"
 after = true
+
+# src/game/hooks.cpp, the 0.8 step of the move speed
+[[hook]]
+at = 0x1CC672
+call = "MoveEase"
