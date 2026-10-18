@@ -30,6 +30,31 @@ constexpr uint32_t kControllerYaw = 0x18;
 constexpr uint32_t kControllerPitch = 0x1C;
 constexpr uint32_t kControllerAimWanted = 0x45;
 constexpr uint32_t kControllerAimHeld = 0x104;
+// degrees a second at full stick, and the power the stick is raised to
+constexpr uint32_t kControllerYawSpeed = 0xB8;
+constexpr uint32_t kControllerPitchSpeed = 0xBC;
+constexpr uint32_t kControllerCurve = 0xC8;
+// the right stick this frame, turn left and turn up; the gun's sway reads them as player+0x5C8 and +0x5CC
+constexpr uint32_t kControllerStickYaw = 0xD8;
+constexpr uint32_t kControllerStickPitch = 0xDC;
+
+// the stick deflection that turns as far through the game's curve, full the turn of a full stick
+float Deflection(float degrees, float full, float curve) {
+    if (!(full > 0)) return 0.0f;
+    float x = std::min(std::fabs(degrees) / full, 1.0f);
+    if (curve > 0) x = std::pow(x, 1.0f / curve);
+    return std::copysign(x, degrees);
+}
+
+// The gun sways with the right stick: while it rests, the stick that turns the view as fast as the mouse did
+void UpdateSway(X86Context& ctx, float yaw, float pitch) {
+    uint32_t c = ctx.esi;
+    if (G<float>(c + kControllerStickYaw) != 0 || G<float>(c + kControllerStickPitch) != 0) return;
+    float frame = ctx.xmm[2].f[0] * G<float>(ctx.edi + kTimerDt);  // edi the world, xmm2 the stick's zoom scale
+    float curve = G<float>(c + kControllerCurve);
+    G<float>(c + kControllerStickYaw) = Deflection(yaw, frame * G<float>(c + kControllerYawSpeed), curve);
+    G<float>(c + kControllerStickPitch) = Deflection(-pitch, frame * G<float>(c + kControllerPitchSpeed), curve);
+}
 
 // esi the player's controller, xmm2 the zoom scale. The game adds the stick, clamps the pitch and wraps the yaw
 // after this.
@@ -38,8 +63,11 @@ void MouseLook(X86Context& ctx, uint8_t*) {
     float dy;
     if (!input::TakeMouse(dx, dy)) return;
     float scale = kDegrees * ctx.xmm[2].f[0];
-    G<float>(ctx.esi + kControllerYaw) -= std::remainder(dx * scale, 360.0f);
-    G<float>(ctx.esi + kControllerPitch) += dy * scale;
+    float yaw = -std::remainder(dx * scale, 360.0f);
+    float pitch = dy * scale;
+    G<float>(ctx.esi + kControllerYaw) += yaw;
+    G<float>(ctx.esi + kControllerPitch) += pitch;
+    UpdateSway(ctx, yaw, pitch);
 }
 
 // false with the keyboard or mouse used last: no pull of the view to a target, no shots bent to one
