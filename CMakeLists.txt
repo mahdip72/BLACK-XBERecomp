@@ -13,13 +13,16 @@ elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../XboxXBE-Recomp/cmake/XbeRecomp.cmak
     set(SDK ${CMAKE_CURRENT_SOURCE_DIR}/../XboxXBE-Recomp)
 else()
     include(FetchContent)
-    # SDK support for render-target pixel offsets, before the compiler/DLL build changes.
+    # This revision contains the compiler/DLL path; its immediate successor reverted it.
     FetchContent_Declare(xbe_sdk GIT_REPOSITORY https://github.com/TGP482/XboxXBE-Recomp.git
-        GIT_TAG 09f0a371ecc47e4210273c85f6719a9b22e89451)
+        GIT_TAG b47e2e93cdb2166b03354cb299f679a236551d57)
     FetchContent_MakeAvailable(xbe_sdk)
     set(SDK ${xbe_sdk_SOURCE_DIR})
 endif()
 include(${SDK}/cmake/XbeRecomp.cmake)
+if(NOT TARGET compiler_files)
+    message(FATAL_ERROR "The SDK must support first-start game DLL compilation (b47e2e93cdb2166b03354cb299f679a236551d57).")
+endif()
 # src/sound, src/d3d, src/audio and src/common/game_files.cpp replace the SDK ones
 list(FILTER XBE_RUNTIME_SOURCES EXCLUDE REGEX "/(xdk/dsound|xdk/d3d8|gpu/d3d12|gpu/render_thread|audio/xaudio2|app/game_files)\\.cpp$")
 
