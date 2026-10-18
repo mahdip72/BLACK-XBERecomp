@@ -229,7 +229,8 @@ enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFps
              kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
              kAmbientOcclusion, kAudioOutput, kHdrOutput, kMonitor, kLanguage, kSmaa,
              kPauseOnFocusLoss, kFmvScale,
-             kControllerHoldAim, kControllerSensitivity, kRumbleIntensity, kMenuAnimations };
+             kControllerHoldAim, kControllerSensitivity, kRumbleIntensity, kMenuAnimations,
+             kGyroAiming, kGyroSensitivity };
 
 using rows::Kind;
 using rows::Row;
@@ -283,6 +284,8 @@ constexpr Row kControllerRows[] = {
     {Kind::Value, kControllerHoldAim, "HOLD TO AIM"},
     {Kind::Value, kControllerSensitivity, "SENSITIVITY"},
     {Kind::Value, kRumbleIntensity, "RUMBLE INTENSITY"},
+    {Kind::Value, kGyroAiming, "GYRO AIMING"},
+    {Kind::Value, kGyroSensitivity, "GYRO SENSITIVITY"},
 };
 
 // the setting an ON / OFF row flips, nullptr for any other row
@@ -300,6 +303,7 @@ bool* ToggleFlag(Settings& s, int id) {
         case kInvertMouse: return &o.invert_mouse;
         case kHoldAim: return &o.hold_aim;
         case kControllerHoldAim: return &o.controller_hold_aim;
+        case kGyroAiming: return &o.gyro_aiming;
         default: return nullptr;
     }
 }
@@ -478,6 +482,9 @@ void StepInputRow(int id, int step, char (&text)[64]) {
         case kControllerSensitivity:
             StepSensitivity(o.controller_sensitivity, step, text);
             break;
+        case kGyroSensitivity:
+            StepSensitivity(o.gyro_sensitivity, step, text);
+            break;
         case kRumbleIntensity:
             // 10% to 200% in steps of 10
             if (step) o.rumble_intensity = uint32_t(StepRange(int(o.rumble_intensity), 10, 200, 10, step));
@@ -536,6 +543,8 @@ void RestoreDefaults(int page) {
         o.controller_hold_aim = false;
         o.controller_sensitivity = game::Options{}.controller_sensitivity;
         o.rumble_intensity = game::Options{}.rumble_intensity;
+        o.gyro_aiming = false;
+        o.gyro_sensitivity = game::Options{}.gyro_sensitivity;
         Save();
         return;
     }
@@ -557,6 +566,8 @@ void RestoreDefaults(int page) {
     o.controller_hold_aim = keep.controller_hold_aim;
     o.controller_sensitivity = keep.controller_sensitivity;
     o.rumble_intensity = keep.rumble_intensity;
+    o.gyro_aiming = keep.gyro_aiming;
+    o.gyro_sensitivity = keep.gyro_sensitivity;
     o.keys = keep.keys;
     Changed(true);
 }

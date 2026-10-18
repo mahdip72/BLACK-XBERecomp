@@ -31,6 +31,7 @@ constexpr uint32_t kControllerYaw = 0x18;
 constexpr uint32_t kControllerPitch = 0x1C;
 constexpr uint32_t kControllerAimWanted = 0x45;
 constexpr uint32_t kControllerAimHeld = 0x104;
+constexpr uint32_t kControllerInvertY = 0x101;  // the game's invert look, for the stick
 // degrees a second at full stick, and the power the stick is raised to
 constexpr uint32_t kControllerYawSpeed = 0xB8;
 constexpr uint32_t kControllerPitchSpeed = 0xBC;
@@ -72,12 +73,25 @@ void UpdateSway(X86Context& ctx, float yaw, float pitch) {
 
 // esi the player's controller. The game adds the stick, clamps the pitch and wraps the yaw after this.
 void MouseLook(X86Context& ctx, uint8_t*) {
+    float yaw = 0.0f;
+    float pitch = 0.0f;
     float dx;
     float dy;
-    if (!input::TakeMouse(dx, dy)) return;
-    float scale = kDegrees * ViewZoom();
-    float yaw = -std::remainder(dx * scale, 360.0f);
-    float pitch = dy * scale;
+    if (input::TakeMouse(dx, dy)) {
+        yaw -= dx * kDegrees;
+        pitch += dy * kDegrees;
+    }
+    float gyro_yaw;
+    float gyro_pitch;
+    if (input::TakeGyro(gyro_yaw, gyro_pitch)) {
+        bool invert = G<uint8_t>(ctx.esi + kControllerInvertY);
+        yaw += gyro_yaw;
+        pitch += invert ? -gyro_pitch : gyro_pitch;
+    }
+    if (yaw == 0.0f && pitch == 0.0f) return;
+    float zoom = ViewZoom();
+    yaw = std::remainder(yaw * zoom, 360.0f);
+    pitch *= zoom;
     G<float>(ctx.esi + kControllerYaw) += yaw;
     G<float>(ctx.esi + kControllerPitch) += pitch;
     UpdateSway(ctx, yaw, pitch);

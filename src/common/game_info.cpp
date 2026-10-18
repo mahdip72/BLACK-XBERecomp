@@ -109,6 +109,7 @@ void Load(const void* table) {
     o.monitor = t["monitor"].value_or(o.monitor);
     o.mouse_sensitivity = float(t["mouse_sensitivity"].value_or(double(o.mouse_sensitivity)));
     o.controller_sensitivity = float(t["controller_sensitivity"].value_or(double(o.controller_sensitivity)));
+    o.gyro_sensitivity = float(t["gyro_sensitivity"].value_or(double(o.gyro_sensitivity)));
     std::string language = t["language"].value_or(o.language);
     bool known = std::find(std::begin(kLanguages), std::end(kLanguages), language) != std::end(kLanguages);
     if (known) o.language = language;
@@ -130,6 +131,7 @@ void Save(void* table) {
     t.insert("monitor", o.monitor);
     t.insert("mouse_sensitivity", double(o.mouse_sensitivity));
     t.insert("controller_sensitivity", double(o.controller_sensitivity));
+    t.insert("gyro_sensitivity", double(o.gyro_sensitivity));
     t.insert("language", o.language);
     toml::table keys;
     for (const auto& [id, value] : o.keys) keys.insert(id, value);
@@ -178,6 +180,7 @@ const app::GameInfo app::kGame = {
                 {"audio_output", nullptr, &game::Opt().audio_output},
                 {"controller_hold_aim", &game::Opt().controller_hold_aim, nullptr},
                 {"rumble_intensity", nullptr, &game::Opt().rumble_intensity},
+                {"gyro_aiming", &game::Opt().gyro_aiming, nullptr},
                 {"menu_animations", &game::Opt().menu_animations, nullptr}},
     .load = game::Load,
     .save = game::Save,
