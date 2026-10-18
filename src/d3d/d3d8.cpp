@@ -22,6 +22,10 @@
 
 using namespace kernel;
 
+namespace dispatch {
+bool InCode(uint32_t va);  // cpu/dispatch.cpp
+}
+
 // configs written before the SDK knew the name
 #ifndef SYM_D3DDevice_BeginPush
 #define SYM_D3DDevice_BeginPush FFFFFE00
@@ -439,7 +443,7 @@ void LogBlockOnce(X86Context& ctx, uint32_t data) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < 32 && n < 4; i++) {
         uint32_t v = R32(ctx.esp + i * 4);
-        if (v >= X86CodeBase && v < X86CodeEnd) code[n++] = v;
+        if (dispatch::InCode(v)) code[n++] = v;
     }
     LOGI("d3d: BlockOnResource on surface %08X, stack %08X %08X %08X %08X", data, code[0], code[1], code[2], code[3]);
 }

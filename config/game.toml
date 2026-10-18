@@ -6,6 +6,7 @@ title = 0x45410083
 entry = 0x25A3F
 xdk = 5849
 out = "generated/game"
+library = "Black.dll"  # <exe>.dll, which the executable delay loads
 partitions = 64
 code_sections = [".text", "DSOUND", "WMADEC", "XMV", "XGRPH", "D3D", "XPP"]
 
