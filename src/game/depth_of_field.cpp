@@ -86,7 +86,9 @@ bool IdleIdentity(IdleSample& sample) {
     sample.weapon = R32(sample.player + 0x29C);
     sample.controller = R32(sample.player + 0x328);
     if (!sample.weapon || R32(sample.weapon + 0xF0) != sample.player || !sample.controller ||
-        R32(sample.controller) != sample.player || G<uint8_t>(sample.controller + 0xB4)) return false;
+        R32(sample.controller) != sample.player) return false;
+    // 18029A also sets controller+B4 for every looping descriptor, including S001.
+    // Only the animation instance's native completion state can terminate this idle graph.
     sample.instance = R32(sample.controller + 0x54);
     if (!sample.instance || (R32(sample.instance) & 0x02000001u)) return false;
     float duration = G<float>(sample.instance + 0x1C);

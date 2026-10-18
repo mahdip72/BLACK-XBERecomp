@@ -93,6 +93,14 @@ if(BLACK_FIDELITYFX_DOF)
     target_include_directories(new_smoke_dof_warp PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
     target_link_libraries(new_smoke_dof_warp PRIVATE d3d12 dxgi dxguid d3dcompiler)
+
+    # Explicit hardware-only, offscreen GPU timestamps for the smoke DoF shader path.
+    add_executable(new_smoke_dof_gpu_bench
+        tools/tests/new_smoke_dof_gpu_bench.cpp
+        ${SDK}/runtime/gpu/shaders.cpp)
+    target_include_directories(new_smoke_dof_gpu_bench PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${SDK}/runtime")
+    target_link_libraries(new_smoke_dof_gpu_bench PRIVATE d3d12 dxgi dxguid d3dcompiler)
 endif()
 
 # build_info.h for the version resource, rewritten only when the commit changes

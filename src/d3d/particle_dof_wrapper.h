@@ -71,19 +71,24 @@ inline std::string MakeParticleDofVertexShader(std::string s) {
     return s;
 }
 
-inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples) {
+inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples, uint32_t blend = 0,
+                                             int alphaFunction = -1) {
     using namespace particle_dof_detail;
-    if (samples != 1 && samples != 2 && samples != 4 && samples != 8) return {};
+    if ((samples != 1 && samples != 2 && samples != 4 && samples != 8) || blend > 1 ||
+        alphaFunction < -1 || alphaFunction > 7) return {};
     if (!Common(s)) return {};
-    // The game's unused stage 3 may retain a stale 2D/cube/shadow texture binding. Its declaration
-    // is unused by this exact PS and must make room for our depth-copy view of any sample count.
-    auto t3 = s.find(" tex3 : register(t3);");
-    if (t3 == std::string::npos) return {};
-    auto line = s.rfind('\n', t3);
-    if (line == std::string::npos) return {};
-    auto line_end = s.find('\n', t3);
-    if (line_end == std::string::npos) return {};
-    s.erase(line + 1, line_end - line);
+    // Unused native stages can retain stale 2D/cube/shadow bindings. Remove their declarations
+    // to make room for the exact MSAA bounds at t2 and original-sample depth copy at t3.
+    for (int stage : {2, 3}) {
+        const auto declaration = " tex" + std::to_string(stage) + " : register(t" + std::to_string(stage) + ");";
+        auto at = s.find(declaration);
+        if (at == std::string::npos) return {};
+        auto line = s.rfind('\n', at);
+        if (line == std::string::npos) return {};
+        auto line_end = s.find('\n', at);
+        if (line_end == std::string::npos) return {};
+        s.erase(line + 1, line_end - line);
+    }
     const std::string entry = "float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target";
     auto at = s.find(entry);
     if (at == std::string::npos || s.find(entry, at + entry.size()) != std::string::npos) return {};
@@ -110,7 +115,7 @@ inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples) {
     if (tap.find("discard") != std::string::npos) return {};
     s.resize(at);
     s += "float4 ParticleNativeExact(VOut i, bool front)" + body;
-    s += R"(
+    if (alphaFunction < 0) s += R"(
 bool ParticleNativeAlphaPass(float a) {
     int f = (int)misc.y;
     int v = (int)round(a * 255), r = (int)misc.x;
@@ -118,8 +123,19 @@ bool ParticleNativeAlphaPass(float a) {
         f == 4 ? v > r : f == 5 ? v != r : f == 6 ? v >= r : true;
 }
 )";
+    else {
+        // Specialize only the repeated source test. The native zero-CoC callback and dynamic
+        // alpha reference retain exactly the translator's round-to-byte comparison semantics.
+        constexpr std::array<const char*, 8> expression = {
+            "false", "v < r", "v == r", "v <= r", "v > r", "v != r", "v >= r", "true"};
+        s += "\nbool ParticleNativeAlphaPass(float a) {\n";
+        if (alphaFunction != 0 && alphaFunction != 7)
+            s += "    int v = (int)round(a * 255), r = (int)misc.x;\n";
+        s += "    return " + std::string(expression[alphaFunction]) + ";\n}\n";
+    }
     s += "float4 ParticleNativeTap(VOut i, bool front, float2 uvDx, float2 uvDy)" + tap;
     s += "\n#define PARTICLE_DOF_SAMPLES " + std::to_string(samples) + "\n";
+    s += "#define PARTICLE_DOF_BLEND " + std::to_string(blend) + "\n";
     s += kParticleDofHlsl;
     return s;
 }

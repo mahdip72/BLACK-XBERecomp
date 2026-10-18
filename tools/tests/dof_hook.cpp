@@ -758,6 +758,8 @@ void IdleFixture() {
     R32(kIdleWeapon + 0xF0) = kIdlePlayer;
     R32(kIdleController) = kIdlePlayer;
     R32(kIdleController + 0x54) = kIdleInstance;
+    // 18029A/1802AD set this for looping S001 even while its graph is actively sampling.
+    G<uint8_t>(kIdleController + 0xB4) = 1;
     const char name[] = "FP_SMG_S_001";
     std::memcpy(&G<char>(kIdleController + 0x5C), name, sizeof(name));
     R32(kIdleInstance + 0x10) = 0x72E8A37E; // native 9CD30 key for FP_SMG_S_001
@@ -821,12 +823,16 @@ void AdvanceIdle(unsigned frames, float sample_time) {
 
 void TestIdlePhaseAndLoop() {
     Reset(); IdleFixture();
+    G<uint8_t>(kIdleController + 0xB4) = 0;
     SampleIdle(39.999f); TickPreview(0.1f);
     Check(!DeferPreview(), "ordinary idle lead-in enabled world focus");
     BeginGun(); EndGun();
     Check(weapon_begin_calls == 1 && weapon_end_calls == 1,
           "ordinary idle lost normal weapon blur");
-    SampleIdle(40); TickPreview(0.1f);
+    SampleIdle(40);
+    // The controller update sets B4 after its pose sample and before the render hook reads it.
+    G<uint8_t>(kIdleController + 0xB4) = 1;
+    TickPreview(0.1f);
     Check(DeferPreview(), "exact cumulative boundary did not enter the inspection tail");
     PreviewRenderFrame();
     Check(std::abs(queued_strength - CinematicDofStrength(0.125f)) < 1e-6f,
@@ -864,7 +870,6 @@ void TestIdleRejectsUnknownAndInvalid() {
     denied([] { R32(kIdleController) += 4; }, "foreign controller owner enabled idle focus");
     denied([] { R32(kIdleWeapon + 0xF0) += 4; }, "foreign weapon enabled idle focus");
     denied([] { R32(kIdleInstance) = 0x02000000; }, "completed animation enabled idle focus");
-    denied([] { G<uint8_t>(kIdleController + 0xB4) = 1; }, "completed controller enabled idle focus");
     denied([] { G<float>(kIdleInstance + 0x1C) = NAN; }, "nonfinite playback duration enabled focus");
     denied([] { G<float>(kIdleInstance + 0x1C) = 1; }, "terminal-pose duration enabled focus");
     denied([] { ++R32(kIdleInstance + 0x980); }, "outgoing fade generation enabled idle focus");

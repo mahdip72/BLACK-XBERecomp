@@ -32,6 +32,21 @@
 #include "d3d/particle_dof_wrapper.h"
 #include "gpu/shaders.h"
 
+// These two headers are byte-for-byte copies from commit a5777a9. Nesting their
+// namespace keeps the old generated wrapper callable beside the current one.
+namespace smoke_reference {
+namespace gpu {
+using ::gpu::PixelKey;
+using ::gpu::TexInfo;
+using ::gpu::kTex2D;
+using ::gpu::kTexWide;
+}
+#include "reference/particle_dof_shader.h"
+#define ParticleDofNativePixelKey A5777a9ParticleDofNativePixelKey
+#include "reference/particle_dof_wrapper.h"
+#undef ParticleDofNativePixelKey
+}
+
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -172,11 +187,12 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     return b;
 }
 
-ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile) {
+ComPtr<ID3DBlob> Compile(const std::string& source, const char* profile,
+                         const char* entry = "main") {
     Check(!source.empty(), "production particle shader wrapper rejected native source");
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "production particle shader",
-                                  nullptr, nullptr, "main", profile,
+                                  nullptr, nullptr, entry, profile,
                                   D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &errors);
     if (FAILED(hr) && errors)
         std::fprintf(stderr, "%s: %s\n", profile,
@@ -235,14 +251,54 @@ public:
         Check(native_vs_.find("q.xyz *= p.w") != std::string::npos,
               "actual native VS lost its W-canceling raster transform");
         wrapped_vs_ = gpu::MakeParticleDofVertexShader(native_vs_);
-        wrapped_ps_[0] = gpu::MakeParticleDofPixelShader(native_ps_, 1);
-        wrapped_ps_[1] = gpu::MakeParticleDofPixelShader(native_ps_, 2);
-        wrapped_ps_[2] = gpu::MakeParticleDofPixelShader(native_ps_, 4);
-        wrapped_ps_[3] = gpu::MakeParticleDofPixelShader(native_ps_, 8);
+        wrapped_ps_[0] = gpu::MakeParticleDofPixelShader(native_ps_, 1, 0, 7);
+        wrapped_ps_[1] = gpu::MakeParticleDofPixelShader(native_ps_, 2, 0, 7);
+        wrapped_ps_[2] = gpu::MakeParticleDofPixelShader(native_ps_, 4, 0, 7);
+        wrapped_ps_[3] = gpu::MakeParticleDofPixelShader(native_ps_, 8, 0, 7);
+        for (uint32_t i = 0; i < wrapped_ps_.size(); ++i)
+            additive_ps_[i] = gpu::MakeParticleDofPixelShader(native_ps_, 1u << i, 1, 7);
+        reference_vs_ = smoke_reference::gpu::MakeParticleDofVertexShader(native_vs_);
+        reference_ps_[0] = smoke_reference::gpu::MakeParticleDofPixelShader(native_ps_, 1);
+        reference_ps_[1] = smoke_reference::gpu::MakeParticleDofPixelShader(native_ps_, 2);
+        reference_ps_[2] = smoke_reference::gpu::MakeParticleDofPixelShader(native_ps_, 4);
+        reference_ps_[3] = smoke_reference::gpu::MakeParticleDofPixelShader(native_ps_, 8);
         Compile(native_vs_, "vs_5_0"); Compile(native_ps_, "ps_5_0");
         Compile(wrapped_vs_, "vs_5_0");
         for (const auto& source : wrapped_ps_) Compile(source, "ps_5_0");
-        std::puts("actual native particle VS/PS and wrapped 1x/2x/4x/8x shaders compiled");
+        for (const auto& source : additive_ps_) Compile(source, "ps_5_0");
+        for (uint32_t samples : {2u, 4u, 8u}) {
+            const std::string range = "#define PARTICLE_DOF_SAMPLES " +
+                std::to_string(samples) + "\n" + gpu::kParticleDofDepthRangeHlsl;
+            Compile(range, "vs_5_0", "vs");
+            Compile(range, "ps_5_0", "range_ps");
+        }
+        Compile(reference_vs_, "vs_5_0");
+        for (const auto& source : reference_ps_) Compile(source, "ps_5_0");
+        auto assembly = [&](const std::string& source) {
+            const auto code = Compile(source, "ps_5_0");
+            ComPtr<ID3DBlob> disassembled;
+            Hr(D3DDisassemble(code->GetBufferPointer(), code->GetBufferSize(), 0, nullptr,
+                              &disassembled), "D3DDisassemble(smoke pixel shader)");
+            return std::string(static_cast<const char*>(disassembled->GetBufferPointer()),
+                               disassembled->GetBufferSize());
+        };
+        const auto old_assembly = assembly(reference_ps_[3]);
+        const auto new_assembly = assembly(wrapped_ps_[3]);
+        auto count_op = [](const std::string& source, const char* op) {
+            size_t n = 0, at = 0;
+            while ((at = source.find(op, at)) != std::string::npos) { ++n; at += std::strlen(op); }
+            return n;
+        };
+        const auto old_trig = count_op(old_assembly, "sincos");
+        const auto new_trig = count_op(new_assembly, "sincos");
+        const auto old_sqrt = count_op(old_assembly, "sqrt");
+        const auto new_sqrt = count_op(new_assembly, "sqrt");
+        Check(old_trig > 0 && new_trig == 0 && new_sqrt == 0 &&
+              wrapped_ps_[3].find("#define PARTICLE_DOF_TAPS 64") != std::string::npos,
+              "64-tap LUT optimization did not remove per-tap transcendental instructions");
+        std::printf("64-tap PS disassembly: frozen sincos/sqrt %zu/%zu, optimized %zu/%zu\n",
+                    old_trig, old_sqrt, new_trig, new_sqrt);
+        std::puts("actual native particle VS/PS and current/reference 1x/2x/4x/8x wrappers compiled");
         MakeRoot();
     }
 
@@ -258,7 +314,11 @@ public:
 
     std::vector<Pixel> Render(const SmokeScene& scene, bool wrapped, bool blend,
                               uint32_t depth_samples = 1,
-                              bool one_sample_occluded = false) {
+                              bool one_sample_occluded = false,
+                              bool reference = false,
+                              bool additive = false) {
+        Check(!additive || blend, "additive smoke needs its native blend state");
+        Check(!additive || !reference, "the frozen reference predates additive smoke");
         Check(scene.width && scene.height && scene.tex_width && scene.tex_height &&
               scene.texture.size() == size_t(scene.tex_width) * scene.tex_height &&
               scene.source_depth.size() == size_t(scene.width) * scene.height &&
@@ -266,7 +326,8 @@ public:
               "invalid smoke fixture dimensions");
         Check(scene.vertices.size() / 4 <= gpu::kParticleDofMaxQuads,
               "smoke fixture exceeds production metadata capacity");
-        Check(depth_samples == 1 || depth_samples == 4 || depth_samples == 8,
+        Check(depth_samples == 1 || depth_samples == 2 || depth_samples == 4 ||
+              depth_samples == 8,
               "unsupported smoke depth sample count");
         Check(!one_sample_occluded || depth_samples > 1,
               "fractional source visibility requires multisampled depth");
@@ -284,6 +345,12 @@ public:
                                                 depth_samples);
         ComPtr<ID3D12Resource> depth_copy = NewDepthCopy(scene.width, scene.height,
                                                           depth_samples);
+        ComPtr<ID3D12Resource> depth_range;
+        if (depth_samples > 1)
+            depth_range = NewTexture(scene.width, scene.height,
+                                     DXGI_FORMAT_R32G32_FLOAT,
+                                     D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         ComPtr<ID3D12Resource> target = NewTexture(scene.width, scene.height,
                                                    DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -340,10 +407,14 @@ public:
         view.Texture2D.MipLevels = 1;
         view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         device_->CreateShaderResourceView(texture.Get(), &view, cpu);
-        for (int i = 1; i <= 2; ++i) {
-            cpu.ptr += increment;
+        cpu.ptr += increment;
+        device_->CreateShaderResourceView(nullptr, &view, cpu);
+        cpu.ptr += increment;
+        view.Format = DXGI_FORMAT_R32G32_FLOAT;
+        if (depth_samples > 1)
+            device_->CreateShaderResourceView(depth_range.Get(), &view, cpu);
+        else
             device_->CreateShaderResourceView(nullptr, &view, cpu);
-        }
         cpu.ptr += increment;
         view.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
         view.ViewDimension = depth_samples == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
@@ -352,11 +423,15 @@ public:
 
         D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
         rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtv_heap_desc.NumDescriptors = 1;
+        rtv_heap_desc.NumDescriptors = 2;
         ComPtr<ID3D12DescriptorHeap> rtvs;
         Hr(device_->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtvs)), "Create RTV heap");
         const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
         device_->CreateRenderTargetView(target.Get(), nullptr, rtv);
+        auto range_rtv = rtv;
+        range_rtv.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        if (depth_samples > 1)
+            device_->CreateRenderTargetView(depth_range.Get(), nullptr, range_rtv);
 
         D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{};
         dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -371,11 +446,23 @@ public:
                                                     D3D12_DSV_DIMENSION_TEXTURE2DMS;
         device_->CreateDepthStencilView(depth.Get(), &dsv_desc, dsv);
 
-        const auto vs = Compile(wrapped ? wrapped_vs_ : native_vs_, "vs_5_0");
-        const auto ps = Compile(wrapped ? wrapped_ps_[depth_samples == 8 ? 3 :
-                                                     depth_samples == 4 ? 2 : 0] : native_ps_,
+        const uint32_t ps_index = depth_samples == 8 ? 3 : depth_samples == 4 ? 2 :
+                                  depth_samples == 2 ? 1 : 0;
+        const auto vs = Compile(wrapped ? (reference ? reference_vs_ : wrapped_vs_) : native_vs_,
+                                "vs_5_0");
+        const int alpha_function = int(scene.alpha_function);
+        Check(alpha_function >= 0 && alpha_function <= 7 &&
+              float(alpha_function) == scene.alpha_function,
+              "smoke fixture alpha function is not a native 0..7 state");
+        const std::string specialized = wrapped && !reference && alpha_function != 7 ?
+            gpu::MakeParticleDofPixelShader(native_ps_, depth_samples,
+                                            additive ? 1 : 0, alpha_function) : std::string{};
+        const auto ps = Compile(wrapped ? (reference ? reference_ps_[ps_index] :
+                                          (alpha_function != 7 ? specialized :
+                                           additive ? additive_ps_[ps_index] :
+                                                      wrapped_ps_[ps_index])) : native_ps_,
                                 "ps_5_0");
-        ComPtr<ID3D12PipelineState> pso = Pipeline(vs.Get(), ps.Get(), blend);
+        ComPtr<ID3D12PipelineState> pso = Pipeline(vs.Get(), ps.Get(), blend, additive);
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
         Hr(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -408,6 +495,30 @@ public:
                            Transition(depth_copy.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(2, to_read);
+        ComPtr<ID3D12PipelineState> range_pso;
+        if (depth_samples > 1) {
+            const std::string source = "#define PARTICLE_DOF_SAMPLES " +
+                std::to_string(depth_samples) + "\n" + gpu::kParticleDofDepthRangeHlsl;
+            const auto range_vs = Compile(source, "vs_5_0", "vs");
+            const auto range_ps = Compile(source, "ps_5_0", "range_ps");
+            range_pso = RangePipeline(range_vs.Get(), range_ps.Get());
+            list->SetGraphicsRootSignature(root_.Get());
+            ID3D12DescriptorHeap* range_heaps[] = {srvs.Get()};
+            list->SetDescriptorHeaps(1, range_heaps);
+            list->SetGraphicsRootDescriptorTable(0, srvs->GetGPUDescriptorHandleForHeapStart());
+            list->SetPipelineState(range_pso.Get());
+            list->OMSetRenderTargets(1, &range_rtv, FALSE, nullptr);
+            D3D12_VIEWPORT full{0, 0, float(scene.width), float(scene.height), 0, 1};
+            const D3D12_RECT full_scissor{0, 0, LONG(scene.width), LONG(scene.height)};
+            list->RSSetViewports(1, &full);
+            list->RSSetScissorRects(1, &full_scissor);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->DrawInstanced(3, 1, 0, 0);
+            const auto range_to_read = Transition(depth_range.Get(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &range_to_read);
+        }
         const float clear[] = {scene.clear.r, scene.clear.g, scene.clear.b, scene.clear.a};
         list->ClearRenderTargetView(rtv, clear, 0, nullptr);
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -666,7 +777,8 @@ private:
             serialized->GetBufferSize(), IID_PPV_ARGS(&root_)), "CreateRootSignature(smoke)");
     }
 
-    ComPtr<ID3D12PipelineState> Pipeline(ID3DBlob* vs, ID3DBlob* ps, bool blend) {
+    ComPtr<ID3D12PipelineState> Pipeline(ID3DBlob* vs, ID3DBlob* ps, bool blend,
+                                          bool additive = false) {
         D3D12_INPUT_ELEMENT_DESC attributes[] = {
             {"ATTR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -693,14 +805,35 @@ private:
         b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         b.BlendEnable = blend;
         b.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        b.DestBlend = additive ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
         b.BlendOp = D3D12_BLEND_OP_ADD;
-        b.SrcBlendAlpha = D3D12_BLEND_ONE;
-        b.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        b.SrcBlendAlpha = D3D12_BLEND_SRC_ALPHA;
+        b.DestBlendAlpha = additive ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
         b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
         ComPtr<ID3D12PipelineState> result;
         Hr(device_->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&result)),
            "CreateGraphicsPipelineState(smoke)");
+        return result;
+    }
+
+    ComPtr<ID3D12PipelineState> RangePipeline(ID3DBlob* vs, ID3DBlob* ps) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};
+        p.pRootSignature = root_.Get();
+        p.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+        p.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+        p.SampleMask = UINT_MAX;
+        p.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        p.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        p.RasterizerState.DepthClipEnable = TRUE;
+        p.DepthStencilState.DepthEnable = FALSE;
+        p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        p.NumRenderTargets = 1;
+        p.RTVFormats[0] = DXGI_FORMAT_R32G32_FLOAT;
+        p.SampleDesc.Count = 1;
+        p.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        ComPtr<ID3D12PipelineState> result;
+        Hr(device_->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&result)),
+           "CreateGraphicsPipelineState(smoke depth range)");
         return result;
     }
 
@@ -734,6 +867,9 @@ private:
     bool debug_enabled_ = false;
     std::string native_vs_, native_ps_, wrapped_vs_;
     std::array<std::string, 4> wrapped_ps_;
+    std::array<std::string, 4> additive_ps_;
+    std::string reference_vs_;
+    std::array<std::string, 4> reference_ps_;
 };
 
 size_t At(const SmokeScene& scene, uint32_t x, uint32_t y) {
@@ -1017,6 +1153,137 @@ void CheckMixedMsaaVisibility(Warp& warp) {
     }
 }
 
+void CompareToFrozenReference(Warp& warp, const char* name, const SmokeScene& scene,
+                              uint32_t samples = 1, bool mixed = false,
+                              bool blend = false) {
+    const auto before = warp.Render(scene, true, blend, samples, mixed, true);
+    const auto after = warp.Render(scene, true, blend, samples, mixed, false);
+    CheckFinite(before); CheckFinite(after);
+    float max_rgb = 0, max_alpha = 0, squared = 0;
+    float before_alpha = 0, after_alpha = 0;
+    for (size_t i = 0; i < before.size(); ++i) {
+        const auto& a = before[i];
+        const auto& b = after[i];
+        const float dr = std::abs(a.r-b.r), dg = std::abs(a.g-b.g),
+                    db = std::abs(a.b-b.b), da = std::abs(a.a-b.a);
+        max_rgb = std::max({max_rgb, dr, dg, db});
+        max_alpha = std::max(max_alpha, da);
+        squared += dr*dr + dg*dg + db*db;
+        before_alpha += a.a;
+        after_alpha += b.a;
+    }
+    const float rms = std::sqrt(squared / (3 * before.size()));
+    const float relative_alpha = std::abs(after_alpha-before_alpha) /
+        std::max(before_alpha, 1.0f);
+    std::printf("reference %-18s %ux: max RGB %.6f, max alpha %.6f, RGB RMS %.6f, alpha energy delta %.5f%%\n",
+                name, samples, max_rgb, max_alpha, rms, relative_alpha*100);
+    Check(max_rgb < 0.02f && max_alpha < 0.012f && rms < 0.003f &&
+          relative_alpha < 0.01f,
+          "optimized smoke output differs materially from frozen pre-optimization shader");
+    if (std::strcmp(name,"near") == 0 && samples == 1) {
+        WriteBmp("reference-near-before.bmp", scene, before, !blend);
+        WriteBmp("optimized-near-after.bmp", scene, after, !blend);
+    }
+}
+
+void CheckReferenceQuality(Warp& warp) {
+    auto near_scene = Scene(3.0f);
+    CompareToFrozenReference(warp,"near",near_scene);
+    CompareToFrozenReference(warp,"focus",Scene(5.0f));
+    CompareToFrozenReference(warp,"far",Scene(12.0f));
+    auto occluded = near_scene;
+    for (uint32_t y = 24; y < 40; ++y)
+        for (uint32_t x = 40; x < 56; ++x)
+            occluded.source_depth[At(occluded,x,y)] = 0.1f;
+    CompareToFrozenReference(warp,"occluded",occluded);
+    for (uint32_t samples : {2u,4u,8u}) {
+        if (warp.SupportsDepthSamples(samples))
+            CompareToFrozenReference(warp,"mixed-source",near_scene,samples,true);
+        else std::printf("reference %ux D24S8: UNSUPPORTED on WARP\n", samples);
+    }
+}
+
+void CheckAlphaFunctionModes(Warp& warp) {
+    auto scene = Scene(3.0f);
+    scene.alpha_reference = 127;
+    for (auto& v : scene.vertices) v.argb = 0xFFFFFFFF;
+    // These texels straddle the integer alpha-test reference after round(a*255).
+    // The old dynamic shader is the independent oracle for all eight Xbox states.
+    constexpr uint8_t alphas[]{0, 126, 127, 128, 255};
+    for (uint32_t y=0; y<scene.tex_height; ++y)
+        for (uint32_t x=0; x<scene.tex_width; ++x)
+            scene.texture[size_t(y)*scene.tex_width+x] =
+                Rgba(255, 80, 32, alphas[std::min<size_t>(4, x*5/scene.tex_width)]);
+    for (int state=0; state<8; ++state) {
+        scene.alpha_function = float(state);
+        char label[32];
+        std::snprintf(label, sizeof(label), "alpha-state-%d", state);
+        CompareToFrozenReference(warp, label, scene);
+    }
+    std::puts("all eight specialized native alpha functions at byte reference 127 PASS");
+}
+
+void CheckAdditiveFire(Warp& warp) {
+    // The traced native additive-particle material uses SRC_ALPHA/ONE for RGB and alpha.
+    // A uniform-alpha quad gives an independent moment identity:
+    // E[a^2 v] = a * E[a v], including partial MSAA source visibility.
+    auto fire = Scene(3.0f);
+    std::fill(fire.texture.begin(), fire.texture.end(), Rgba(255,255,255,255));
+    for (auto& v : fire.vertices) v.argb = 0x80FF6020;
+    fire.clear = {0.04f, 0.07f, 0.11f, 0.15f};
+    auto focus = fire;
+    focus.geometry.globals.optics[0] = 3.0f;
+    const auto native_focus = warp.Render(focus, false, true, 1, false, false, true);
+    const auto wrapper_focus = warp.Render(focus, true, true, 1, false, false, true);
+    CheckFinite(native_focus); CheckFinite(wrapper_focus);
+    float max_focus = 0;
+    for (size_t i = 0; i < native_focus.size(); ++i)
+        max_focus = std::max({max_focus,
+            std::abs(native_focus[i].r-wrapper_focus[i].r),
+            std::abs(native_focus[i].g-wrapper_focus[i].g),
+            std::abs(native_focus[i].b-wrapper_focus[i].b),
+            std::abs(native_focus[i].a-wrapper_focus[i].a)});
+    Check(max_focus < 0.003f, "additive fire zero-CoC changed exact native drawing");
+    std::printf("additive fire zero-CoC native/wrapper max RGBA %.6f\n", max_focus);
+
+    for (uint32_t samples : {1u, 4u, 8u}) {
+        if (samples > 1 && !warp.SupportsDepthSamples(samples)) {
+            std::printf("additive fire %ux D24S8 UNSUPPORTED on WARP\n", samples);
+            continue;
+        }
+        const bool mixed = samples > 1;
+        const auto raw_standard = warp.Render(fire, true, false, samples, mixed);
+        const auto additive = warp.Render(fire, true, true, samples, mixed, false, true);
+        CheckFinite(raw_standard); CheckFinite(additive);
+        const float native_alpha = 128.0f / 255.0f;
+        float max_rgb_energy = 0, max_alpha_energy = 0;
+        size_t covered = 0;
+        for (size_t i = 0; i < additive.size(); ++i) {
+            const auto& r = raw_standard[i];
+            const auto& a = additive[i];
+            // Outside the rasterized aperture, an unblended readback is the
+            // fixture's clear color, not the standard shader's source value.
+            if (std::abs(r.r-fire.clear.r)<0.0001f &&
+                std::abs(r.g-fire.clear.g)<0.0001f &&
+                std::abs(r.b-fire.clear.b)<0.0001f &&
+                std::abs(r.a-fire.clear.a)<0.0001f) continue;
+            if (r.a <= 0.04f) continue;
+            ++covered;
+            max_rgb_energy = std::max({max_rgb_energy,
+                std::abs(a.r - (fire.clear.r + r.r*r.a)),
+                std::abs(a.g - (fire.clear.g + r.g*r.a)),
+                std::abs(a.b - (fire.clear.b + r.b*r.a))});
+            max_alpha_energy = std::max(max_alpha_energy,
+                std::abs(a.a - (fire.clear.a + native_alpha*r.a)));
+        }
+        std::printf("additive fire %ux%s: covered %zu, max RGB energy %.5f, alpha energy %.5f\n",
+                    samples, mixed ? " mixed" : "", covered,
+                    max_rgb_energy, max_alpha_energy);
+        Check(covered > 50 && max_rgb_energy < 0.04f && max_alpha_energy < 0.04f,
+              "additive fire lost RGB or alpha energy under native SRC_ALPHA/ONE blending");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1031,6 +1298,9 @@ int main() {
         CheckLayerOrderAndBlend(warp);
         CheckViewportAndDownscale(warp);
         CheckMixedMsaaVisibility(warp);
+        CheckReferenceQuality(warp);
+        CheckAlphaFunctionModes(warp);
+        CheckAdditiveFire(warp);
         std::puts("production particle smoke DoF WARP checks PASS");
         return 0;
     } catch (const std::exception& e) {
