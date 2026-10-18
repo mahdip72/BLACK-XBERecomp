@@ -152,7 +152,7 @@ void ReloadAnimationDof(X86Context& ctx, uint8_t* base) {
     }
 }
 
-// After world meshes and particles, before the original post-effect capture, bloom and HUD.
+// After opaque world rendering and the early particles, before capture, later particle layers, bloom and HUD.
 // Type 1 keeps the weapon in the late draw list until all screen effects have finished.
 void ReloadDepthOfField(X86Context&, uint8_t*) {
     g_replaced = false;

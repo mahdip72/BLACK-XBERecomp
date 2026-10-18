@@ -1,0 +1,12 @@
+diff --git a/sdk/include/FidelityFX/host/ffx_util.h b/sdk/include/FidelityFX/host/ffx_util.h
+index f06a368..609d9e6 100644
+--- a/sdk/include/FidelityFX/host/ffx_util.h
++++ b/sdk/include/FidelityFX/host/ffx_util.h
+@@ -22,6 +22,7 @@
+ 
+ #pragma once
+ 
++#include <bit>
+ #include <FidelityFX/host/ffx_types.h>
+ 
+ /// @defgroup Utils Utilities

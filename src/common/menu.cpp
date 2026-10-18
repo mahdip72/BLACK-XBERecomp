@@ -35,6 +35,8 @@ namespace app {
 namespace {
 
 std::atomic<bool> g_open{false};
+bool g_dof_panel = true;
+bool g_dof_dirty = false;  // slider edits are saved when released or the panel is left
 
 // the cover art's brass on black
 constexpr ImVec4 kPanelBg{0.035f, 0.03f, 0.025f, 0.94f};
@@ -66,8 +68,8 @@ constexpr uint32_t kMsaaValues[] = {0, 2, 4, 8};
 const char* const kMsaaNames[] = {"OFF", "2x", "4x", "8x"};
 constexpr uint32_t kAoValues[] = {0, 1, 2};
 const char* const kAoNames[] = {"OFF", "SSAO", "GTAO"};
-constexpr uint32_t kReloadBlurModes[] = {0, 1, 2};
-const char* const kReloadBlurNames[] = {"OFF", "ORIGINAL", "MODERN DOF"};
+constexpr uint32_t kReloadBlurModes[] = {0, 1, 2, 3};
+const char* const kReloadBlurNames[] = {"OFF", "ORIGINAL", "BALANCED DOF", "FIDELITYFX DOF"};
 constexpr uint32_t kFmvScales[] = {0, 1};
 const char* const kFmvScaleNames[] = {"FILL", "4:3"};
 constexpr uint32_t kAudioOutputs[] = {audio::kOutputAuto, audio::kOutputMono, audio::kOutputStereo,
@@ -75,6 +77,19 @@ constexpr uint32_t kAudioOutputs[] = {audio::kOutputAuto, audio::kOutputMono, au
 const char* const kAudioOutputNames[] = {"AUTOMATIC", "MONO", "2.0 STEREO", "5.1 SURROUND"};
 const char* const kLanguageNames[] = {"ENGLISH", "FRENCH", "GERMAN", "ITALIAN", "SPANISH"};  // as game::kLanguages
 constexpr uint32_t kFpsCaps[] = {30, 60, 75, 90, 120, 144, 165, 240, 360, kFpsCapRefresh, 0};
+
+uint32_t ReloadBlurMode(const game::Options& o) {
+    if (!o.reload_blur) return 0;
+    if (!o.modern_reload_dof) return 1;
+    return o.fidelityfx_dof ? 3 : 2;
+}
+
+void SetReloadBlurMode(game::Options& o, uint32_t mode) {
+    o.reload_blur = mode != 0;
+    o.modern_reload_dof = mode >= 2;
+    o.fidelityfx_dof = mode == 3;
+    if (mode < 2) o.dof_preview = false;
+}
 
 int StepIndex(int index, int step, int count) {
     if (count <= 0) return 0;
@@ -459,13 +474,9 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
             std::snprintf(text, sizeof(text), "%s", kAoNames[StepTable(kAoValues, o.ambient_occlusion, step)]);
             return true;
         case kReloadBlur: {
-            uint32_t mode = o.reload_blur ? (o.modern_reload_dof ? 2u : 1u) : 0u;
+            uint32_t mode = ReloadBlurMode(o);
             int index = StepTable(kReloadBlurModes, mode, step);
-            if (step) {
-                o.reload_blur = mode != 0;
-                o.modern_reload_dof = mode == 2;
-                if (mode != 2) o.dof_preview = false;
-            }
+            if (step) SetReloadBlurMode(o, mode);
             std::snprintf(text, sizeof(text), "%s", kReloadBlurNames[index]);
             return true;
         }
@@ -498,7 +509,7 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
                 o.dof_bokeh_radius = defaults.dof_bokeh_radius;
                 o.dof_weapon_blur = defaults.dof_weapon_blur;
             }
-            std::snprintf(text, sizeof(text), "BALANCED");
+            std::snprintf(text, sizeof(text), "DEFAULTS");
             return true;
         case kDrawDistance:
             std::snprintf(text, sizeof(text), "%s", kDistanceNames[StepTable(kDistances, o.draw_distance, step)]);
@@ -775,9 +786,20 @@ void DrawTitle() {
     ImGui::TextUnformatted(title.c_str());
 }
 
+void SaveDofChanges() {
+    if (!g_dof_dirty) return;
+    Save();
+    g_dof_dirty = false;
+}
+
 // the hint line, then Back, Defaults and Apply on the right
 void DrawFooter(float em) {
     ImGui::Separator();
+    if (ImGui::Button(Ui("DOF tuning", false).c_str())) {
+        g_capture = -1;
+        g_dof_panel = true;
+    }
+    ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, kDim);
     const char* hint = "";
     if (g_capture >= 0) hint = "Press a key or mouse button to bind, Escape cancels";
@@ -817,6 +839,90 @@ void DrawPanel() {
         DrawRows(g_page);
         ImGui::EndChild();
         DrawFooter(em);
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(int(std::size(kPanelColors)));
+}
+
+void DofSlider(const char* label, uint32_t& setting, int lo, int hi, const char* format) {
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(Ui(label, false).c_str());
+    ImGui::SetNextItemWidth(-1);
+    int value = int(std::clamp(setting, uint32_t(lo), uint32_t(hi)));
+    if (ImGui::SliderInt("##value", &value, lo, hi, format, ImGuiSliderFlags_AlwaysClamp)) {
+        setting = uint32_t(value);
+        g_dof_dirty = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) SaveDofChanges();
+    ImGui::PopID();
+}
+
+// Keep the scene visible while reload DOF is adjusted live.
+void DrawDofPanel() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    float em = ImGui::GetFontSize();
+    float width = std::max(1.0f, std::min(em * 29, vp->WorkSize.x - em * 2));
+    float height = std::max(1.0f, std::min(em * 30, vp->WorkSize.y - em * 2));
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - em, vp->WorkPos.y + em),
+                            ImGuiCond_Always, ImVec2(1, 0));
+    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+    for (const auto& [col, color] : kPanelColors) ImGui::PushStyleColor(col, color);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(em * 1.2f, em));
+    constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                                        ImGuiWindowFlags_NoCollapse |
+                                        ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::Begin("DOF tuning", nullptr, kFlags)) {
+        game::Options& o = game::Opt();
+        ImGui::TextUnformatted(Ui("RELOAD BLUR").c_str());
+        int mode = int(ReloadBlurMode(o));
+        std::string mode_labels[std::size(kReloadBlurNames)];
+        const char* mode_items[std::size(kReloadBlurNames)];
+        for (size_t i = 0; i < std::size(kReloadBlurNames); i++) {
+            mode_labels[i] = Ui(kReloadBlurNames[i]);
+            mode_items[i] = mode_labels[i].c_str();
+        }
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##reload_mode", &mode, mode_items, int(std::size(mode_items)))) {
+            SetReloadBlurMode(o, uint32_t(mode));
+            Changed(false);
+            g_dof_dirty = false;
+        }
+        ImGui::BeginDisabled(!o.reload_blur || !o.modern_reload_dof);
+        if (ImGui::Checkbox(Ui("Preview reload DOF", false).c_str(), &o.dof_preview)) {
+            Changed(false);
+            g_dof_dirty = false;
+        }
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        DofSlider("Focus distance", o.dof_focus_distance, 1, 30, "%d units");
+        DofSlider("Near blur", o.dof_near_strength, 0, 150, "%d%%");
+        DofSlider("Distant blur", o.dof_far_strength, 0, 150, "%d%%");
+        DofSlider("Bokeh size", o.dof_bokeh_radius, 4, 30, "%d px");
+        DofSlider("Gameplay weapon blur", o.dof_weapon_blur, 0, 100, "%d%%");
+        ImGui::Separator();
+        if (ImGui::Button(Ui("Reset DOF tuning", false).c_str())) {
+            RowText(kResetDofTuning, 1);
+            g_dof_dirty = false;
+        }
+        float spacing = ImGui::GetStyle().ItemSpacing.x;
+        float bw = (ImGui::GetContentRegionAvail().x - spacing * 2) / 3;
+        if (ImGui::Button(Ui("Settings...", false).c_str(), ImVec2(bw, 0))) {
+            SaveDofChanges();
+            g_page = kSettingsPage;
+            g_dof_panel = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(Ui("Keyboard...", false).c_str(), ImVec2(bw, 0))) {
+            SaveDofChanges();
+            g_page = kKeyboardPage;
+            g_dof_panel = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(Ui("Close", false).c_str(), ImVec2(bw, 0))) ToggleMenu();
     }
     ImGui::End();
     ImGui::PopStyleVar(4);
@@ -898,10 +1004,14 @@ bool Capturing() { return g_capture >= 0; }
 
 void ToggleMenu() {
     bool open = !MenuOpen();
+    if (!open) SaveDofChanges();
     g_open.store(open, std::memory_order_relaxed);
     g_capture = -1;
     g_display_held = false;
-    if (open) input::ReleaseCursor();
+    if (open) {
+        g_dof_panel = true;
+        input::ReleaseCursor();
+    }
 }
 
 void DrawUi(double fps) {
@@ -914,7 +1024,8 @@ void DrawUi(double fps) {
     io.FontGlobalScale = std::max(1.0f, io.DisplaySize.y / 720.0f);
     if (MenuOpen()) {
         PollCapture();
-        DrawPanel();
+        if (g_dof_panel) DrawDofPanel();
+        else DrawPanel();
     }
 }
 

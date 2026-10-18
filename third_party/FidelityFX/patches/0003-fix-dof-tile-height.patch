@@ -1,0 +1,12 @@
+diff --git a/sdk/src/components/dof/ffx_dof.cpp b/sdk/src/components/dof/ffx_dof.cpp
+--- a/sdk/src/components/dof/ffx_dof.cpp
++++ b/sdk/src/components/dof/ffx_dof.cpp
+@@ -356,7 +356,7 @@ static FfxErrorCode dofCreate(FfxDofContext_Private* context, const FfxDofContext
+     uint32_t halfWidth = (contextDescription->resolution.width + 1) / 2;
+     uint32_t halfHeight = (contextDescription->resolution.height + 1) / 2;
+     uint32_t tileWidth = (halfWidth + 3) / 4;
+-    uint32_t tileHeight = (halfHeight + 4) / 4;
++    uint32_t tileHeight = (halfHeight + 3) / 4;
+     bool is16bit = context->deviceCapabilities.fp16Supported;
+     FfxInternalResourceDescription internalSurfaceDesc[] = {
+         {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_BILAT_COLOR,

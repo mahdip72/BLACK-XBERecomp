@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-// the F10 settings panel, drawn by DrawUi (GameInfo::ui)
+// F10 opens the scene-visible DOF tuner; the full settings panel remains available from it
 namespace app {
 
 bool MenuOpen();

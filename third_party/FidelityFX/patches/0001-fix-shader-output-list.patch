@@ -1,0 +1,6 @@
+diff --git a/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt b/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt
+--- a/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt
++++ b/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt
+@@ -130,1 +130,1 @@
+-	set(${PERMUTATION_OUTPUTS} ${PERMUTATION_OUTPUTS} PARENT_SCOPE)
++	set(${PERMUTATION_OUTPUTS} ${${PERMUTATION_OUTPUTS}} PARENT_SCOPE)

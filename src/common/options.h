@@ -18,11 +18,12 @@ struct Options {
     bool hdr_output = true;  // HDR10 on a display with Windows HDR on
     bool reload_blur = true;
     bool modern_reload_dof = true;  // depth-aware bokeh instead of the original reload blur
+    bool fidelityfx_dof = true;  // AMD FidelityFX world DOF; false selects the Balanced comparison
     bool dof_preview = false;  // session-only: hold modern world DOF outside reload
     uint32_t dof_focus_distance = 5;  // world units (not verified as metres), 1..30
-    uint32_t dof_near_strength = 100;  // percent, 0..150
-    uint32_t dof_far_strength = 45;  // percent, 0..150
-    uint32_t dof_bokeh_radius = 18;  // pixels at nominal 1080p, 4..30
+    uint32_t dof_near_strength = 75;  // percent, 0..150
+    uint32_t dof_far_strength = 25;  // percent, 0..150
+    uint32_t dof_bokeh_radius = 12;  // pixels at nominal 1080p, 4..30
     uint32_t dof_weapon_blur = 25;  // normal gameplay weapon blur, percent, 0..100
     uint32_t ambient_occlusion = 0;  // screen space, from the scene's depth: 0 off, 1 SSAO, 2 GTAO
     uint32_t msaa = 0;  // samples a pixel of the scene, 0 off

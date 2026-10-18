@@ -165,6 +165,7 @@ const app::GameInfo app::kGame = {
                 {"fps_counter", &game::Opt().fps_counter, nullptr},
                 {"reload_blur", &game::Opt().reload_blur, nullptr},
                 {"modern_reload_dof", &game::Opt().modern_reload_dof, nullptr},
+                {"fidelityfx_dof", &game::Opt().fidelityfx_dof, nullptr},
                 {"dof_focus_distance", nullptr, &game::Opt().dof_focus_distance},
                 {"dof_near_strength", nullptr, &game::Opt().dof_near_strength},
                 {"dof_far_strength", nullptr, &game::Opt().dof_far_strength},

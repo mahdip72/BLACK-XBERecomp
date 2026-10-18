@@ -36,6 +36,57 @@ endif()
 
 add_xbe_image(Black default.xbe game.toml ${GAME_PARTITIONS} game)
 
+# Official AMD FidelityFX DoF component and DX12 backend. The SDK itself is
+# prepared as a sparse, pinned checkout by tools/cmake/prepare_fidelityfx_sdk.ps1.
+option(BLACK_FIDELITYFX_DOF "Build BLACK's DoF adapter against the official FidelityFX SDK" ON)
+if(BLACK_FIDELITYFX_DOF)
+    set(BLACK_FIDELITYFX_SDK_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/out/deps/FidelityFX-SDK" CACHE PATH
+        "Pinned FidelityFX-SDK source checkout")
+    if(NOT EXISTS "${BLACK_FIDELITYFX_SDK_SOURCE}/sdk/CMakeLists.txt")
+        message(FATAL_ERROR
+            "FidelityFX SDK source is missing. Run tools/cmake/prepare_fidelityfx_sdk.ps1 first.")
+    endif()
+
+    set(FFX_API_BACKEND DX12_X64 CACHE STRING "FidelityFX backend" FORCE)
+    set(FFX_DOF ON CACHE BOOL "Build the FidelityFX DoF component" FORCE)
+    set(FFX_ALL OFF CACHE BOOL "Build all FidelityFX components" FORCE)
+    set(FFX_BUILD_AS_DLL OFF CACHE BOOL "Build FidelityFX as static libraries" FORCE)
+    set(FFX_AUTO_COMPILE_SHADERS ON CACHE BOOL "Compile FidelityFX shader permutations" FORCE)
+
+    # The SDK determines its library suffix from this variable. Ninja has no
+    # generator platform setting, so tell the SDK explicitly that this target
+    # is x64 while leaving CMake's active compiler/generator untouched.
+    set(_BLACK_FFX_SAVED_GENERATOR_PLATFORM "${CMAKE_GENERATOR_PLATFORM}")
+    set(CMAKE_GENERATOR_PLATFORM x64)
+    add_subdirectory("${BLACK_FIDELITYFX_SDK_SOURCE}/sdk" "${CMAKE_BINARY_DIR}/fidelityfx-sdk")
+    set(CMAKE_GENERATOR_PLATFORM "${_BLACK_FFX_SAVED_GENERATOR_PLATFORM}")
+    # The upstream Windows toolchain also forces this cache entry, which makes
+    # a later Ninja `cmake --build` reject the unsupported -A/platform value.
+    set(CMAKE_GENERATOR_PLATFORM "${_BLACK_FFX_SAVED_GENERATOR_PLATFORM}" CACHE STRING "" FORCE)
+
+    # Upstream CMake defaults libraries to <source>/bin/ffx_sdk. Keep all
+    # generated files in this build directory instead.
+    set_target_properties(ffx_dof_x64 ffx_backend_dx12_x64 PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/fidelityfx-sdk/lib")
+    foreach(_config Debug Release RelWithDebInfo)
+        string(TOUPPER "${_config}" _config_upper)
+        set_target_properties(ffx_dof_x64 ffx_backend_dx12_x64 PROPERTIES
+            ARCHIVE_OUTPUT_DIRECTORY_${_config_upper} "${CMAKE_BINARY_DIR}/fidelityfx-sdk/lib/${_config}")
+    endforeach()
+
+    target_compile_definitions(Black PRIVATE BLACK_FIDELITYFX_DOF=1)
+    target_link_libraries(Black PRIVATE ffx_dof_x64 ffx_backend_dx12_x64 d3d12 dxgi)
+
+    # CPU-driven WARP harness: creates a D3D12 WARP device only when run.
+    # It is independent of the game executable and shares the production adapter.
+    add_executable(newffx_dof_warp
+        tools/tests/newffx_dof_warp.cpp
+        src/d3d/fidelityfx_dof.cpp)
+    target_include_directories(newffx_dof_warp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_definitions(newffx_dof_warp PRIVATE BLACK_FIDELITYFX_DOF=1)
+    target_link_libraries(newffx_dof_warp PRIVATE ffx_dof_x64 ffx_backend_dx12_x64 d3d12 dxgi dxguid d3dcompiler)
+endif()
+
 # build_info.h for the version resource, rewritten only when the commit changes
 find_package(Git QUIET)
 set(BUILD_INFO ${CMAKE_CURRENT_BINARY_DIR}/build_info.h)
