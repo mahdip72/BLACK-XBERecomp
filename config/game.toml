@@ -225,6 +225,7 @@ WSASend                                              = 0
 WSASendTo                                            = 0
 WSAStartup                                           = 0
 XAudioDownloadEffectsImage                           = 0
+XGetAudioFlags                                       = 0x22AD2
 XInitDevices                                         = 0x27D058
 XInputClose                                          = 0x27DDEC
 XInputGetState                                       = 0x27DDF8
