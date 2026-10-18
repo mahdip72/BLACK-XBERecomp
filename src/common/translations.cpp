@@ -20,6 +20,7 @@ constexpr Entry kEntries[] = {
     // options menu pages and the RECOMP SETTINGS sections
     {"RECOMP SETTINGS", {u"Paramètres Recomp", u"Recomp-Einstellungen", u"Impostazioni Recomp", u"Configuración de Recomp"}},
     {"MOUSE AND KEYBOARD", {u"Souris et clavier", u"Maus und Tastatur", u"Mouse e tastiera", u"Ratón y teclado"}},
+    {"CONTROLLER", {u"Manette", u"Controller", u"Controller", u"Mando"}},
     {"GENERAL", {u"Général", u"Allgemein", u"Generale", u"General"}},
     {"DISPLAY", {u"Affichage", u"Anzeige", u"Video", u"Pantalla"}},
     {"GRAPHICS", {u"Graphismes", u"Grafik", u"Grafica", u"Gráficos"}},
@@ -105,6 +106,10 @@ constexpr Entry kEntries[] = {
     {"LOOK DOWN", {u"Regarder en bas", u"Nach unten sehen", u"Guarda in basso", u"Mirar abajo"}},
     {"LOOK LEFT", {u"Regarder à gauche", u"Nach links sehen", u"Guarda a sinistra", u"Mirar a la izquierda"}},
     {"LOOK RIGHT", {u"Regarder à droite", u"Nach rechts sehen", u"Guarda a destra", u"Mirar a la derecha"}},
+
+    // CONTROLLER rows
+    {"SENSITIVITY", {u"Sensibilité", u"Empfindlichkeit", u"Sensibilità", u"Sensibilidad"}},
+    {"RUMBLE INTENSITY", {u"Intensité des vibrations", u"Vibrationsstärke", u"Intensità della vibrazione", u"Intensidad de la vibración"}},
 
     // a hint's "PRESS (A) :" with the key in place of the button
     {"PRESS", {u"Appuyez sur", u"Drücke", u"Premi", u"Pulsa"}},

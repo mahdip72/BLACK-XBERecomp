@@ -45,9 +45,17 @@ void MouseLook(X86Context& ctx, uint8_t*) {
 // false with the keyboard or mouse used last: no pull of the view to a target, no shots bent to one
 bool AimAssist(X86Context&, uint8_t*) { return !input::KeyboardActive(); }
 
+// the look update: xmm3 the stick's yaw speed, xmm0 its pitch speed, before the zoom scale and frame time
+void StickLook(X86Context& ctx, uint8_t*) {
+    if (input::KeyboardActive()) return;
+    ctx.xmm[3].f[0] *= game::Opt().controller_sensitivity;
+    ctx.xmm[0].f[0] *= game::Opt().controller_sensitivity;
+}
+
 // ebx the player's controller past the game's toggle aim, scopes and all
 void HoldAim(X86Context& ctx, uint8_t*) {
-    if (!game::Opt().hold_aim || !input::KeyboardActive()) return;
+    bool hold = input::KeyboardActive() ? game::Opt().hold_aim : game::Opt().controller_hold_aim;
+    if (!hold) return;
     G<uint8_t>(ctx.ebx + kControllerAimWanted) = G<uint8_t>(ctx.ebx + kControllerAimHeld);
 }
 

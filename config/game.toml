@@ -586,3 +586,8 @@ after = true
 [[hook]]
 at = 0x1CC672
 call = "MoveEase"
+
+# src/game/mouse.cpp, the right stick look at the controller sensitivity
+[[hook]]
+at = 0x1BD69F
+call = "StickLook"

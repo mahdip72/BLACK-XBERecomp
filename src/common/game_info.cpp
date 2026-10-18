@@ -92,11 +92,12 @@ void Pad(int port, input::Pad& pad) {
     else if (port == 0) input::Keyboard(pad);
 }
 
-// no vibration while the keyboard and mouse are in use
+// the vibration at the rumble intensity, none while the keyboard and mouse are in use
 void Rumble(int port, uint16_t& left, uint16_t& right) {
-    if (port != 0 || !input::KeyboardActive()) return;
-    left = 0;
-    right = 0;
+    uint32_t percent = std::min(Opt().rumble_intensity, 200u);
+    if (port == 0 && input::KeyboardActive()) percent = 0;
+    left = uint16_t(std::min(left * percent / 100, 0xFFFFu));  // past 100% the motors saturate
+    right = uint16_t(std::min(right * percent / 100, 0xFFFFu));
 }
 
 // what the options list cannot hold
@@ -107,6 +108,7 @@ void Load(const void* table) {
     o.viewmodel_fov = std::clamp(o.viewmodel_fov, 45u, 100u);
     o.monitor = t["monitor"].value_or(o.monitor);
     o.mouse_sensitivity = float(t["mouse_sensitivity"].value_or(double(o.mouse_sensitivity)));
+    o.controller_sensitivity = float(t["controller_sensitivity"].value_or(double(o.controller_sensitivity)));
     std::string language = t["language"].value_or(o.language);
     bool known = std::find(std::begin(kLanguages), std::end(kLanguages), language) != std::end(kLanguages);
     if (known) o.language = language;
@@ -127,6 +129,7 @@ void Save(void* table) {
     const Options& o = Opt();
     t.insert("monitor", o.monitor);
     t.insert("mouse_sensitivity", double(o.mouse_sensitivity));
+    t.insert("controller_sensitivity", double(o.controller_sensitivity));
     t.insert("language", o.language);
     toml::table keys;
     for (const auto& [id, value] : o.keys) keys.insert(id, value);
@@ -172,7 +175,9 @@ const app::GameInfo app::kGame = {
                 {"draw_distance", nullptr, &game::Opt().draw_distance},
                 {"ambient_occlusion", nullptr, &game::Opt().ambient_occlusion},
                 {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},
-                {"audio_output", nullptr, &game::Opt().audio_output}},
+                {"audio_output", nullptr, &game::Opt().audio_output},
+                {"controller_hold_aim", &game::Opt().controller_hold_aim, nullptr},
+                {"rumble_intensity", nullptr, &game::Opt().rumble_intensity}},
     .load = game::Load,
     .save = game::Save,
     .init = game::Init,
