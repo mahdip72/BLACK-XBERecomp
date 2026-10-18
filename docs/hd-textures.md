@@ -1,6 +1,6 @@
 # Optional HD fonts and menus
 
-This branch builds on the finalized FOV/weapon fix at `914edcb`. Replacements are limited to the approved fonts, menu map/loading graphics. The BLACK logos retain their original artwork. World, weapon, character and effect textures retain their original artwork.
+This branch builds on the finalized FOV/weapon fix at `914edcb`. Replacements are limited to the approved fonts and menu map/loading graphics. The BLACK logos retain their original artwork. World, weapon, character and effect textures retain their original artwork.
 
 The repository contains source and mapping metadata. Artwork is imported locally from [BLACK HD Reimagined](https://www.moddb.com/mods/black-hd-reimagined/addons/black-hd-reimagined-texture-pack) by HDREIMAGINED. The mod is proprietary; its artwork is supplied separately and is not licensed by this repository.
 
@@ -26,4 +26,4 @@ The renderer also checks a fixed list of menu texture fingerprints. Older world-
 
 ## Validation
 
-The earlier loader passed a Windows Release build. The narrowed loader passed offline checks for all 11 menu pages, every mip, malformed DDS fallback and rejection of world and logo textures even with valid replacement files present. The approved font PNGs remain unchanged. Fonts and menu graphics were accepted in visual testing. Logo replacements were removed after that review.
+The Windows Release build passed against the latest fork main. The narrowed loader passed offline checks for all 11 menu pages, every mip, malformed DDS fallback and rejection of world and logo textures even with valid replacement files present. The approved font PNGs remain unchanged. Fonts and menu graphics were accepted in visual testing. Logo replacements were removed after that review.
