@@ -175,7 +175,7 @@ constexpr uint32_t kGameFov = 70;  // the view's and the viewmodel's
 
 // tangent of a setting's half angle over that of the game's
 static float Widen(uint32_t degrees) {
-    return std::tan(std::clamp(degrees, 45u, 100u) * kHalf) / std::tan(kGameFov * kHalf);
+    return std::tan(std::clamp(degrees, 45u, 140u) * kHalf) / std::tan(kGameFov * kHalf);
 }
 
 static float g_gun = 1.0f;  // the gun's picture over the view's

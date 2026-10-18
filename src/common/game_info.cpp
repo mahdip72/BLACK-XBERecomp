@@ -140,8 +140,6 @@ std::string SystemLanguage() {
 void Load(const void* table) {
     const toml::table& t = *static_cast<const toml::table*>(table);
     Options& o = Opt();
-    o.fov = std::clamp(o.fov, 45u, 100u);
-    o.viewmodel_fov = std::clamp(o.viewmodel_fov, 45u, 100u);
     o.monitor = t["monitor"].value_or(o.monitor);
     o.mouse_sensitivity = float(t["mouse_sensitivity"].value_or(double(o.mouse_sensitivity)));
     o.controller_sensitivity = float(t["controller_sensitivity"].value_or(double(o.controller_sensitivity)));
