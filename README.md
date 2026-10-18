@@ -8,7 +8,7 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 ## Installation
 - Put your game files in the `assets` folder. This can be an ISO, or the extracted data files, of the USA or Europe release.
-- Run `BLACK.exe`.
+- Run `BLACK.exe`. The first start compiles the game's code for your PC, this only happens once.
 - Recomp settings can be adjusted in the in-game options menu while the game is running, or through the Settings overlay, which is opened with F10 by default.
 <img width="1920" height="1080" alt="{5852D359-24A0-48C8-9319-07C3A619E355}" src="https://github.com/user-attachments/assets/e0156eb8-c1b5-49d9-ab93-3abb46bf5f47" />
 
@@ -62,7 +62,7 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 - **Memory**
   - 4 GB
 - **Storage**
-  - 2 GB for the game files and saves
+  - 3 GB for the game files, the compiled game code and saves
 
 ## Building
 ### 1. Clone the Repository
