@@ -45,6 +45,7 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 
 ### Miscellaneous
 - **Custom Menu Cursor** - Place a `cursor.png` (or `cursor.dds`) beside the exe to replace the Windows arrow in the game's menus.
+- **Optional texture pack** - Generate 4x replacements from your original Xbox assets with [PBRify](tools/PBRIFY.md), then place the generated `textures` folder beside the exe.
 
 ## System Requirements
 ### Minimum
