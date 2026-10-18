@@ -18,6 +18,8 @@ black.toml
 /logs/
 /hdd/
 /CrashDumps/
+/textures/
+__pycache__/
 
 # editors
 .vs/
@@ -26,3 +28,4 @@ black.toml
 
 # Local temporary folder
 .local
+/temp/
