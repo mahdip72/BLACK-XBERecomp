@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <vector>
 #include "d3d/particle_dof_shared_coverage.h"
+#include "d3d/particle_dof_visibility.h"
 
 namespace {
 constexpr uint32_t kMaximum = 0xffffffu, kInvalid = 0xffffffffu;
@@ -152,11 +153,201 @@ void TestRejections() {
     Reject([](auto& f) { for (uint32_t q = 0; q < 4; ++q) f.Rect(q, float(q * 30), 20, float(q * 30 + 10), 40); },
            R::Overlap, "low-overlap page admitted");
 }
+
+struct VisibilityFixture {
+    gpu::ParticleDofGlobals globals{};
+    std::vector<gpu::ParticleDofQuad> quads;
+    std::vector<gpu::ParticleDofAtlasPage> color_pages;
+    std::vector<gpu::ParticleDofVisibilityMap> maps;
+    uint32_t extent = 256, halo = 14;
+    explicit VisibilityFixture(uint32_t count = 1) : quads(count), color_pages{{0, count}} {
+        globals.optics[0] = 5; globals.optics[1] = 12;
+        globals.optics[2] = 1; globals.optics[3] = .45f;
+        globals.target[0] = globals.viewport[2] = 513;
+        globals.target[1] = globals.viewport[3] = 385;
+        globals.target[2] = float(count);
+        for (uint32_t q = 0; q < count; ++q) Rect(q, 32, 32, 64, 64);
+    }
+    void Rect(uint32_t q, uint32_t x, uint32_t y, uint32_t width, uint32_t height, float scale = 1) {
+        auto& quad = quads[q];
+        quad = {};
+        quad.uv_bounds[2] = quad.uv_bounds[3] = 1;
+        quad.screen_xy = x | (y << 16);
+        quad.atlas_size = (uint32_t(std::ceil(width * scale)) + 4) |
+                         ((uint32_t(std::ceil(height * scale)) + 4) << 16);
+        quad.atlas_scale = scale;
+    }
+    std::vector<gpu::ParticleDofVisibilityPage> Plan() {
+        return gpu::BuildParticleDofVisibilityPages(color_pages, quads, globals, extent, halo, maps);
+    }
+};
+
+void CheckVisibilityPartition(const VisibilityFixture& f, std::span<const gpu::ParticleDofVisibilityPage> plan) {
+    Check(f.maps.size() == f.quads.size(), "visibility map count mismatch");
+    size_t cursor = 0;
+    uint32_t next = 0;
+    for (const auto& color : f.color_pages) {
+        Check(color.first_quad == next, "invalid test color-page partition");
+        const uint32_t end = color.first_quad + color.quad_count;
+        while (next < end) {
+            Check(cursor < plan.size(), "visibility plan omitted native quads");
+            const auto& page = plan[cursor++];
+            Check(page.first_quad == next && page.quad_count > 0 && page.quad_count <= end - next,
+                  "visibility plan reordered quads or crossed a color-page boundary");
+            for (uint32_t q = next; q < next + page.quad_count; ++q) {
+                Check((f.maps[q].atlas_xy != kInvalid) == page.cached, "visibility map disagrees with page mode");
+                if (!page.cached) Check(f.maps[q].screen_xy == 0, "fallback retained stale screen mapping");
+            }
+            next += page.quad_count;
+        }
+    }
+    Check(cursor == plan.size() && next == f.quads.size(), "visibility plan duplicated or omitted quads");
+}
+
+// Expected screen rectangles are supplied independently, including the complete halo.
+// Their translated atlas rectangles must fit and remain disjoint within each page.
+void CheckVisibilityCells(const VisibilityFixture& f, std::span<const gpu::ParticleDofVisibilityPage> plan,
+                          std::span<const std::array<uint32_t, 4>> boxes) {
+    Check(boxes.size() == f.quads.size(), "invalid test halo rectangle count");
+    for (const auto& page : plan) {
+        if (!page.cached) continue;
+        for (uint32_t q = page.first_quad; q < page.first_quad + page.quad_count; ++q) {
+            const auto& box = boxes[q];
+            const auto& map = f.maps[q];
+            Check((map.screen_xy & 0xffffu) == box[0] && (map.screen_xy >> 16) == box[1],
+                  "visibility cell lost its native-screen halo origin");
+            const uint32_t x = map.atlas_xy & 0xffffu, y = map.atlas_xy >> 16;
+            const uint32_t width = box[2] - box[0], height = box[3] - box[1];
+            Check(width > 0 && height > 0 && x + width <= f.extent && y + height <= f.extent,
+                  "visibility halo extends outside its atlas page");
+            for (uint32_t other = page.first_quad; other < q; ++other) {
+                const uint32_t ox = f.maps[other].atlas_xy & 0xffffu, oy = f.maps[other].atlas_xy >> 16;
+                const auto& ob = boxes[other];
+                Check(x + width <= ox || ox + ob[2] - ob[0] <= x ||
+                      y + height <= oy || oy + ob[3] - ob[1] <= y,
+                      "visibility cells overlap within one atlas page");
+            }
+        }
+    }
+}
+
+void TestVisibilityCells() {
+    VisibilityFixture f(6);
+    f.Rect(0, 0, 0, 64, 64);
+    f.Rect(1, 17, 19, 66, 70);
+    f.Rect(2, 449, 321, 64, 64);
+    f.Rect(3, 448, 320, 65, 65, .5f);
+    f.Rect(4, 14, 14, 64, 64, .5f);
+    f.Rect(5, 32, 32, 65, 67, .5f);
+    f.quads[2].uv_bounds[0] = f.quads[2].uv_bounds[1] = 1;
+    f.quads[2].uv_bounds[2] = f.quads[2].uv_bounds[3] = 0;
+    const auto old_quads = f.quads;
+    const auto old_globals = f.globals;
+    const auto plan = f.Plan();
+    CheckVisibilityPartition(f, plan);
+    const std::array<std::array<uint32_t, 4>, 6> boxes{{
+        {0, 0, 78, 78}, {3, 5, 97, 103}, {435, 307, 513, 385},
+        {434, 306, 513, 385}, {0, 0, 92, 92}, {18, 18, 112, 114}
+    }};
+    CheckVisibilityCells(f, plan, boxes);
+    for (const auto& page : plan) Check(page.cached, "eligible odd-target or half-scale cell rejected");
+    Check(std::memcmp(old_quads.data(), f.quads.data(), old_quads.size() * sizeof(old_quads[0])) == 0 &&
+          std::memcmp(&old_globals, &f.globals, sizeof(old_globals)) == 0, "visibility planner mutated native inputs");
+    // All vertex colors are transparent: material alpha must not trim the visibility halo.
+    for (const auto& map : f.maps) Check(map.atlas_xy != kInvalid, "transparent material removed visibility support");
+}
+
+void TestVisibilityPages() {
+    VisibilityFixture f(12);
+    f.extent = 184; // Four complete 92x92 cells fit exactly; the fifth needs a new page.
+    f.color_pages = {{0, 8}, {8, 2}, {10, 2}};
+    for (uint32_t q : {5u, 6u, 9u, 10u}) f.quads[q].atlas_scale = 0;
+    const auto plan = f.Plan();
+    CheckVisibilityPartition(f, plan);
+    const std::array<gpu::ParticleDofVisibilityPage, 8> expected{{
+        {0, 4, true}, {4, 1, true}, {5, 2, false}, {7, 1, true},
+        {8, 1, true}, {9, 1, false}, {10, 1, false}, {11, 1, true}
+    }};
+    Check(plan.size() == expected.size(), "visibility chunk count mismatch");
+    for (size_t i = 0; i < expected.size(); ++i)
+        Check(plan[i].first_quad == expected[i].first_quad && plan[i].quad_count == expected[i].quad_count &&
+              plan[i].cached == expected[i].cached, "visibility packing/fallback partition mismatch");
+    const std::vector<std::array<uint32_t, 4>> boxes(f.quads.size(), {18, 18, 110, 110});
+    CheckVisibilityCells(f, plan, boxes);
+    for (uint32_t q : {0u, 4u, 7u, 8u, 11u})
+        Check(f.maps[q].atlas_xy == 0, "visibility packing did not reset at a new cached chunk");
+
+    for (auto& quad : f.quads) quad.atlas_scale = 0;
+    const auto fallback = f.Plan(); // Reusing the map vector must clear every previous cached entry.
+    CheckVisibilityPartition(f, fallback);
+    Check(fallback.size() == f.color_pages.size(), "fallback chunks crossed original color pages");
+    for (const auto& page : fallback) Check(!page.cached, "stale cached page survived replanning");
+}
+
+template<class Change> void RejectVisibility(Change change, const char* message) {
+    VisibilityFixture f;
+    change(f);
+    const auto plan = f.Plan();
+    CheckVisibilityPartition(f, plan);
+    Check(plan.size() == 1 && !plan[0].cached && f.maps[0].atlas_xy == kInvalid, message);
+}
+
+void TestVisibilityRejections() {
+    RejectVisibility([](auto& f) { f.quads[0].atlas_scale = 0; }, "unmapped visibility cell admitted");
+    for (float scale : {.25f, std::nextafter(1.f, 2.f), std::numeric_limits<float>::quiet_NaN()})
+        RejectVisibility([scale](auto& f) { f.quads[0].atlas_scale = scale; }, "unsupported visibility scale admitted");
+    RejectVisibility([](auto& f) { f.quads[0].uv_bounds[2] = 0; }, "zero UV extent admitted to visibility cache");
+    RejectVisibility([](auto& f) { f.quads[0].uv_bounds[1] = std::numeric_limits<float>::infinity(); }, "invalid UV admitted to visibility cache");
+    RejectVisibility([](auto& f) { f.quads[0].atlas_size = 4u | (68u << 16); }, "guard-only visibility cell admitted");
+    RejectVisibility([](auto& f) { f.quads[0].atlas_xy = 65535; }, "overflowing color mapping admitted");
+    RejectVisibility([](auto& f) { f.Rect(0, 513, 32, 64, 64); }, "off-target visibility cell admitted");
+    RejectVisibility([](auto& f) { f.Rect(0, 32, 32, 63, 65); }, "subthreshold visibility receiver admitted");
+    RejectVisibility([](auto& f) { f.Rect(0, 450, 320, 128, 128); }, "receiver area counted off-target pixels");
+    RejectVisibility([](auto& f) { f.extent = 128; f.Rect(0, 32, 32, 128, 64); }, "oversized visibility halo admitted");
+    for (float size : {0.f, -1.f, 513.5f, 65536.f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()})
+        RejectVisibility([size](auto& f) { f.globals.target[0] = size; }, "invalid visibility target admitted");
+    RejectVisibility([](auto& f) { f.globals.optics[0] = 0; }, "invalid visibility focus admitted");
+    RejectVisibility([](auto& f) { f.globals.optics[1] = 0; }, "zero visibility radius admitted");
+    RejectVisibility([](auto& f) { f.globals.optics[2] = -1; }, "negative visibility scale admitted");
+    RejectVisibility([](auto& f) { f.globals.optics[2] = f.globals.optics[3] = 0; }, "zero visibility radius bound admitted");
+    RejectVisibility([](auto& f) { f.globals.optics[3] = std::numeric_limits<float>::quiet_NaN(); }, "nonfinite visibility optics admitted");
+    RejectVisibility([](auto& f) { f.globals.optics[1] = std::numeric_limits<float>::max(); f.globals.optics[2] = 2; },
+                     "overflowing visibility radius admitted");
+    RejectVisibility([](auto& f) { f.halo = 13; }, "insufficient visibility halo admitted");
+    RejectVisibility([](auto& f) { f.halo = std::numeric_limits<uint32_t>::max(); }, "visibility halo arithmetic wrapped");
+    for (uint32_t extent : {0u, 65536u})
+        RejectVisibility([extent](auto& f) { f.extent = extent; }, "invalid visibility atlas dimensions admitted");
+
+    Fixture focused(1);
+    focused.Rect(0, 0, 0, 128, 96); focused.Map();
+    const std::array color_pages{focused.page};
+    std::vector<gpu::ParticleDofVisibilityMap> maps;
+    auto plan = gpu::BuildParticleDofVisibilityPages(color_pages, focused.quads, focused.p.globals, 256, 14, maps);
+    Check(plan.size() == 1 && plan[0].cached, "unfocused control missing visibility cache");
+    focused.p.globals.optics[0] = 12; focused.Map();
+    Check(focused.quads[0].atlas_scale == 0, "focused atlas control remained mapped");
+    plan = gpu::BuildParticleDofVisibilityPages(color_pages, focused.quads, focused.p.globals, 256, 14, maps);
+    Check(plan.size() == 1 && !plan[0].cached && maps[0].atlas_xy == kInvalid, "focused quad entered visibility cache");
+}
+
+void TestVisibilityMalformedPages() {
+    VisibilityFixture f(3);
+    f.color_pages = {{1, std::numeric_limits<uint32_t>::max()}};
+    auto plan = f.Plan();
+    Check(plan.size() == 1 && plan[0].first_quad == 1 && plan[0].quad_count == 2 && !plan[0].cached,
+          "malformed visibility page was not clipped to fallback");
+    for (const auto& map : f.maps) Check(map.atlas_xy == kInvalid && map.screen_xy == 0, "malformed page retained a cache map");
+    f.color_pages = {{std::numeric_limits<uint32_t>::max(), 3}};
+    Check(f.Plan().empty(), "out-of-range visibility page retained unavailable quads");
+    f.quads.clear();
+    Check(f.Plan().empty() && f.maps.empty(), "empty visibility input retained stale state");
+}
 } // namespace
 int main() {
     try {
         TestTwoSamples(); TestAdmission(); TestRejections();
-        std::puts("particle coverage CPU PASS: mixed2 equality/invalid; shared admission, depth, mapping, viewport, overlap");
+        TestVisibilityCells(); TestVisibilityPages(); TestVisibilityRejections(); TestVisibilityMalformedPages();
+        std::puts("particle coverage CPU PASS: mixed2 equality/invalid; shared admission; visibility order, halos, packing, fallback");
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "particle coverage CPU FAIL: %s\n", error.what()); return 1; }
 }

@@ -31,6 +31,7 @@
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_small_radius.h"
 #include "d3d/particle_dof_shared_coverage.h"
+#include "d3d/particle_dof_visibility.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "d3d/dof_shader_source.h"
 #include "gpu/shaders.h"
@@ -55,17 +56,25 @@ namespace smoke_c591 {
 namespace smoke_f793 {
 #include "reference/f793e2d/particle_dof_shader.h"
 }
+namespace smoke_bc30216 {
+#include "reference/bc30216/particle_dof_shader.h"
+}
 using Microsoft::WRL::ComPtr;
 
 namespace {
 uint32_t W = 1280, H = 720, AtlasExtent = 2048;
 float TargetRadius = 4.0f;
+float FocusDistance=5.0f,NearScale=1.0f,FarScale=.45f;
+float WallZ=4.0f;
+bool ZeroInputW=false;
 float QuadScale = 1.0f;
 UINT CandidateOptimization=D3DCOMPILE_OPTIMIZATION_LEVEL1;
 uint32_t Samples = 8, Quads = 12, Batches = 4;
 bool CoverageBenchmark=false,F793Benchmark=false,DepthLessEqual=false,SceneVisible=false;
 bool SharedOff=false;
 bool GatherBenchmark=false;
+bool VisibilityBenchmark=false;
+bool MixedSamples=false,AdditiveBenchmark=false,WarpCorrectness=false;
 uint32_t Warmups=8,MeasuredPairs=16;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
 void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix,
@@ -87,6 +96,26 @@ void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix,
         Require(variable && SUCCEEDED(variable->GetDesc(&variable_desc)) &&
                 variable_desc.StartOffset==offsets[i],
                 "atlas-filter shader constants do not match the selected legacy/current prefix");
+    }
+}
+void CheckVisibilityCbufferLayout(ID3DBlob* shader) {
+    ComPtr<ID3D11ShaderReflection> reflection;
+    Require(SUCCEEDED(D3DReflect(shader->GetBufferPointer(),shader->GetBufferSize(),
+        IID_ID3D11ShaderReflection,reinterpret_cast<void**>(reflection.GetAddressOf()))) &&
+        reflection,"Reflect Vq shader");
+    auto* cbuffer=reflection->GetConstantBufferByName("VC");
+    Require(cbuffer!=nullptr,"Vq shader omitted native vertex constants");
+    D3D11_SHADER_BUFFER_DESC buffer{};
+    Require(SUCCEEDED(cbuffer->GetDesc(&buffer)),"Describe Vq vertex constants");
+    Require(buffer.Size==11280,"Vq b0 size differs from native+target+1024 maps ABI");
+    const char* names[]{"particleVisibilityTarget","particleVisibilityMaps"};
+    const UINT offsets[]{3072,3088};
+    for (size_t i=0;i<2;++i) {
+        auto* variable=cbuffer->GetVariableByName(names[i]);
+        D3D11_SHADER_VARIABLE_DESC desc{};
+        Require(variable && SUCCEEDED(variable->GetDesc(&desc)) &&
+                desc.StartOffset==offsets[i],
+                "Vq shader constant-buffer offsets differ from CPU upload layout");
     }
 }
 void ReportParticlePixelBytecode(const char* label,ID3DBlob* shader) {
@@ -199,7 +228,15 @@ public:
     Bench() {
         ComPtr<IDXGIFactory6> factory;
         Hr(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
-        for (UINT i = 0;; ++i) {
+        if (WarpCorrectness) {
+            Hr(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter_)),"EnumWarpAdapter");
+            DXGI_ADAPTER_DESC1 desc{};
+            Hr(adapter_->GetDesc1(&desc),"WARP GetDesc1");
+            Require((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)!=0,
+                    "explicit --warp did not select a software adapter");
+            std::printf("WARP correctness adapter: %ls\n",desc.Description);
+        }
+        for (UINT i = 0;!WarpCorrectness; ++i) {
             ComPtr<IDXGIAdapter1> candidate;
             if (factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
                     IID_PPV_ARGS(&candidate)) == DXGI_ERROR_NOT_FOUND) break;
@@ -215,9 +252,9 @@ public:
                 break;
             }
         }
-        Require(adapter_.Get() != nullptr, "No hardware D3D12 adapter; benchmark not run");
+        Require(adapter_.Get() != nullptr, "No requested D3D12 adapter; benchmark not run");
         Hr(D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0,
-                             IID_PPV_ARGS(&device_)), "D3D12CreateDevice(hardware)");
+                             IID_PPV_ARGS(&device_)), "D3D12CreateDevice(offscreen)");
         if (GatherBenchmark) {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT format{};
             format.Format=DXGI_FORMAT_R32G32_FLOAT;
@@ -252,8 +289,10 @@ public:
         const bool coverage=mode==Mode::CoverageBefore || mode==Mode::CoverageAfter ||
                             mode==Mode::F793Before || mode==Mode::F793After;
         const bool float_range=mode==Mode::V25 || mode==Mode::CoverageBefore ||
+                               VisibilityBenchmark ||
                                (GatherBenchmark && mode==Mode::F793After);
         const bool shared=mode==Mode::F793After && Samples==2 && !SharedOff;
+        const bool visibility=VisibilityBenchmark && mode==Mode::F793After;
         const uint32_t range_levels=1;
         Require(!capture_samples || coverage,"sample capture requires an MSAA coverage mode");
         // Resource creation, uploads and PSO creation are deliberately outside GPU timestamps.
@@ -282,7 +321,7 @@ public:
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,1,sample_width,
                 sample_height*Samples),D3D12_RESOURCE_STATE_RENDER_TARGET);
         ComPtr<ID3D12Resource> source_atlas, filtered_atlas;
-        ComPtr<ID3D12Resource> support,transmission;
+        ComPtr<ID3D12Resource> support,transmission,visibility_atlas;
         if (UsesAtlas(mode)) {
             const auto desc = TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 1, AtlasExtent, AtlasExtent);
@@ -297,10 +336,15 @@ public:
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
                 D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
+        if (visibility)
+            visibility_atlas=MakeTexture(TextureDesc(DXGI_FORMAT_R16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,1,AtlasExtent,AtlasExtent),
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
         auto descriptors = MakeDescriptors(snapshot.Get(), range.Get(), target.Get(),
                                             source_atlas.Get(), filtered_atlas.Get(),
                                             sample_target.Get(),float_range,range_levels,
-                                            support.Get(),transmission.Get());
+                                             support.Get(),transmission.Get(),
+                                             visibility_atlas.Get());
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
         dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
@@ -309,8 +353,9 @@ public:
             dsv_desc.Flags=D3D12_DSV_FLAG_READ_ONLY_DEPTH;
             device_->CreateDepthStencilView(depth.Get(),&dsv_desc,descriptors.dsv_read);
         }
+        const float wall_depth=1.0f-1.0f/WallZ;
         list->ClearDepthStencilView(descriptors.dsv,D3D12_CLEAR_FLAG_DEPTH,
-                                    coverage&&!SceneVisible?(1.0f-1.0f/4.0f):1.0f,
+                                    coverage&&!SceneVisible?wall_depth:1.0f,
                                     0,0,nullptr);
         if (coverage&&!SceneVisible) {
             // Repeating openings keep hidden z12 particle source energy near
@@ -326,10 +371,24 @@ public:
         }
         const float clear[] = {.02f,.03f,.05f,.1f};
         list->ClearRenderTargetView(descriptors.target_rtv, clear, 0, nullptr);
+        if (MixedSamples) {
+            const D3D12_VIEWPORT mixed_viewport{0,0,float(W),float(H),0,1};
+            const D3D12_RECT mixed_scissor{LONG(W/2-32),0,LONG(W/2+32),LONG(H)};
+            list->RSSetViewports(1,&mixed_viewport);
+            list->RSSetScissorRects(1,&mixed_scissor);
+            list->SetGraphicsRootSignature(root_.Get());
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list->OMSetRenderTargets(1,&descriptors.target_rtv,FALSE,&descriptors.dsv);
+            list->SetPipelineState(mixed_sample0_pso_.Get());
+            list->DrawInstanced(3,1,0,0);
+            list->SetPipelineState(mixed_sample1_pso_.Get());
+            list->DrawInstanced(3,1,0,0);
+        }
 
         D3D12_QUERY_HEAP_DESC qh{};
         qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qh.Count = UINT(2 + 2 * (3 + Batches * std::max<size_t>(1, pages_.size()) * 5));
+        qh.Count = UINT(2 + 2 * (3 + Batches *
+                         std::max<size_t>({1,pages_.size(),visibility_pages_.size()}) * 5));
         ComPtr<ID3D12QueryHeap> queries;
         Hr(device_->CreateQueryHeap(&qh, IID_PPV_ARGS(&queries)), "Create timestamp heap");
         const auto timing = MakeBuffer(qh.Count*sizeof(uint64_t), D3D12_HEAP_TYPE_READBACK,
@@ -361,6 +420,10 @@ public:
         const D3D12_VERTEX_BUFFER_VIEW vbv{
             (mode == Mode::Native ? native_vb_ : vb_)->GetGPUVirtualAddress(),
             UINT(sizeof(gpu::NativeParticleVertex)*expanded_.size()), sizeof(gpu::NativeParticleVertex)};
+        const D3D12_VERTEX_BUFFER_VIEW native_vbv{
+            native_vb_->GetGPUVirtualAddress(),
+            UINT(sizeof(gpu::NativeParticleVertex)*expanded_.size()),
+            sizeof(gpu::NativeParticleVertex)};
         const D3D12_INDEX_BUFFER_VIEW ibv{ib_->GetGPUVirtualAddress(),
             UINT(sizeof(uint16_t)*indices_.size()), DXGI_FORMAT_R16_UINT};
         list->IASetVertexBuffers(0, 1, &vbv);
@@ -399,6 +462,7 @@ public:
         D3D12_RESOURCE_STATES filtered_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         D3D12_RESOURCE_STATES support_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         D3D12_RESOURCE_STATES transmission_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        D3D12_RESOURCE_STATES visibility_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES& state,
                               D3D12_RESOURCE_STATES next) {
             if (state == next) return;
@@ -414,13 +478,19 @@ public:
                 });
                 continue;
             }
-            for (size_t page_index = 0; page_index < pages_.size(); ++page_index) {
-                const auto page = pages_[page_index];
-                const auto page_cb=page_dcbs_[page_index]->GetGPUVirtualAddress();
+            const auto& active_rects=visibility?visibility_rects_:page_rects_;
+            const auto& active_cb=visibility?visibility_page_dcbs_:page_dcbs_;
+            const size_t page_count=visibility?visibility_pages_.size():pages_.size();
+            for (size_t page_index = 0; page_index < page_count; ++page_index) {
+                const auto page=visibility?
+                    gpu::ParticleDofAtlasPage{visibility_pages_[page_index].first_quad,
+                                              visibility_pages_[page_index].quad_count}:
+                    pages_[page_index];
+                const auto page_cb=active_cb[page_index]->GetGPUVirtualAddress();
                 timed(prepares, [&] {
                     transition(source_atlas.Get(), source_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
                     // Production clears only allocated cells. The filtered pass writes every cell itself.
-                    const auto& rectangles = page_rects_[page_index];
+                    const auto& rectangles = active_rects[page_index];
                     gpu::ClearParticleDofAtlasCells(list.Get(), descriptors.source_rtv, rectangles);
                     list->RSSetViewports(1, &atlas_viewport);
                     list->RSSetScissorRects(1, &atlas_scissor);
@@ -429,7 +499,7 @@ public:
                     list->SetGraphicsRootConstantBufferView(2, page_cb);
                     list->SetPipelineState(mode==Mode::CoverageBefore?
                         coverage_before_source_pso_.Get():
-                        mode==Mode::F793Before?f793_source_pso_.Get():source_pso_.Get());
+                        mode==Mode::F793Before || visibility?f793_source_pso_.Get():source_pso_.Get());
                     list->OMSetRenderTargets(1, &descriptors.source_rtv, FALSE, nullptr);
                     list->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
                     transition(source_atlas.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -493,18 +563,44 @@ public:
                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     });
                 }
+                if (visibility && visibility_pages_[page_index].cached) {
+                    timed(transmissions,[&] {
+                        transition(visibility_atlas.Get(),visibility_state,
+                                   D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->RSSetViewports(1,&atlas_viewport);
+                        list->RSSetScissorRects(1,&atlas_scissor);
+                        list->SetGraphicsRootDescriptorTable(0,descriptors.native_srv);
+                        list->SetGraphicsRootConstantBufferView(1,
+                            visibility_vcb_->GetGPUVirtualAddress());
+                        list->SetGraphicsRootConstantBufferView(2,page_cb);
+                        list->IASetVertexBuffers(0,1,&native_vbv);
+                        list->SetPipelineState(visibility_source_pso_.Get());
+                        list->OMSetRenderTargets(1,&descriptors.visibility_rtv,FALSE,nullptr);
+                        list->DrawIndexedInstanced(page.quad_count*6,1,page.first_quad*6,0,0);
+                        list->IASetVertexBuffers(0,1,&vbv);
+                        transition(visibility_atlas.Get(),visibility_state,
+                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    });
+                }
                 timed(composites, [&] {
                     list->RSSetViewports(1, &viewport);
                     list->RSSetScissorRects(1, &scissor);
                     list->SetGraphicsRootDescriptorTable(0,
+                        visibility && visibility_pages_[page_index].cached?
+                            descriptors.visibility_composite_srv:
                         shared?descriptors.shared_composite_srv:descriptors.composite_srv);
-                    list->SetGraphicsRootConstantBufferView(1, vcb_->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(1,
+                        visibility?visibility_vcb_->GetGPUVirtualAddress():
+                                   vcb_->GetGPUVirtualAddress());
                     list->SetGraphicsRootConstantBufferView(2, page_cb);
                     list->SetPipelineState(mode==Mode::CoverageBefore?coverage_before_pso_.Get():
                                            mode==Mode::CoverageAfter?coverage_after_pso_.Get():
                                            mode==Mode::F793Before?f793_composite_pso_.Get():
-                                           mode==Mode::F793After?
-                                               (shared?shared_composite_pso_.Get():coverage_after_pso_.Get()):
+                                            mode==Mode::F793After?
+                                                (visibility && visibility_pages_[page_index].cached?
+                                                    visibility_composite_pso_.Get():
+                                                 shared?shared_composite_pso_.Get():
+                                                        coverage_after_pso_.Get()):
                                            composite_pso_.Get());
                     list->OMSetRenderTargets(1,&descriptors.target_rtv,FALSE,
                                               coverage?&descriptors.dsv_read:nullptr);
@@ -630,10 +726,12 @@ private:
     struct Descriptors {
         ComPtr<ID3D12DescriptorHeap> srv_heap,rtv_heap,dsv_heap;
         D3D12_CPU_DESCRIPTOR_HANDLE range_rtv{},target_rtv{},source_rtv{},filtered_rtv{},
-                                    sample_rtv{},support_rtv{},transmission_rtv{},dsv{},dsv_read{};
+                                    sample_rtv{},support_rtv{},transmission_rtv{},
+                                    visibility_rtv{},dsv{},dsv_read{};
         D3D12_GPU_DESCRIPTOR_HANDLE sample_srv{};
         D3D12_GPU_DESCRIPTOR_HANDLE native_srv{},filter_srv{},composite_srv{},
-                                    transmission_srv{},shared_composite_srv{};
+                                    transmission_srv{},shared_composite_srv{},
+                                    visibility_composite_srv{};
     };
     ComPtr<ID3D12Resource> MakeBuffer(UINT64 bytes,D3D12_HEAP_TYPE type,
                                       D3D12_RESOURCE_STATES state) {
@@ -693,7 +791,8 @@ private:
     }
     ComPtr<ID3D12PipelineState> Pipeline(ID3DBlob* vs,ID3DBlob* ps,
                                         DXGI_FORMAT format,bool blend,bool vertices,
-                                        uint32_t samples=1,bool attach_depth=false) {
+                                        uint32_t samples=1,bool attach_depth=false,
+                                        bool additive=false,bool write_depth=false) {
         D3D12_INPUT_ELEMENT_DESC attrs[]{
             {"ATTR",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
             {"ATTR",3,DXGI_FORMAT_B8G8R8A8_UNORM,0,16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
@@ -708,7 +807,10 @@ private:
         p.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
         p.RasterizerState.DepthClipEnable=TRUE;
         p.RasterizerState.MultisampleEnable=samples>1;
-        p.DepthStencilState.DepthEnable=FALSE;
+        p.DepthStencilState.DepthEnable=write_depth?TRUE:FALSE;
+        p.DepthStencilState.DepthWriteMask=write_depth?
+            D3D12_DEPTH_WRITE_MASK_ALL:D3D12_DEPTH_WRITE_MASK_ZERO;
+        p.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_ALWAYS;
         p.DSVFormat=attach_depth?DXGI_FORMAT_D24_UNORM_S8_UINT:DXGI_FORMAT_UNKNOWN;
         p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         p.NumRenderTargets=1;
@@ -719,7 +821,8 @@ private:
             auto& b=p.BlendState.RenderTarget[0];
             b.BlendEnable=TRUE;
             b.SrcBlend=b.SrcBlendAlpha=D3D12_BLEND_SRC_ALPHA;
-            b.DestBlend=b.DestBlendAlpha=D3D12_BLEND_INV_SRC_ALPHA;
+            b.DestBlend=b.DestBlendAlpha=additive?
+                D3D12_BLEND_ONE:D3D12_BLEND_INV_SRC_ALPHA;
             b.BlendOp=b.BlendOpAlpha=D3D12_BLEND_OP_ADD;
         }
         ComPtr<ID3D12PipelineState> out;
@@ -735,23 +838,38 @@ private:
         const auto legacy_native_ps=LegacyDrawConstantsShader(native_ps);
         const auto native_vertex=Compile(native_vs,"main","vs_5_0");
         const auto native_pixel=Compile(native_ps,"main","ps_5_0");
-        const auto source_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs,1),"main","vs_5_0");
-        const auto source_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1),
+        const auto source_vs=Compile(VisibilityBenchmark?
+            gpu::DofParticleVertexSource(1):gpu::MakeParticleDofVertexShader(native_vs,1),
+            "main","vs_5_0");
+        const uint32_t blend=AdditiveBenchmark?1u:0u;
+        const auto source_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,blend,7,1),
                                      "main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,
                                      CoverageBenchmark);
         ComPtr<ID3D12PipelineState> feature_source_pso;
-        const auto composite_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs,2),"main","vs_5_0");
-        const auto composite_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,2),"main","ps_5_0");
+        const auto composite_vs=Compile(VisibilityBenchmark?
+            gpu::DofParticleVertexSource(2):gpu::MakeParticleDofVertexShader(native_vs,2),
+            "main","vs_5_0");
+        const auto composite_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,blend,7,2),"main","ps_5_0");
         if (CoverageBenchmark) {
-            const char* frozen_quad=F793Benchmark?smoke_f793::gpu::kParticleDofQuadHlsl:
+            const char* frozen_quad=VisibilityBenchmark?
+                                    smoke_bc30216::gpu::kParticleDofQuadHlsl:
+                                    F793Benchmark?smoke_f793::gpu::kParticleDofQuadHlsl:
                                                     smoke_c591::gpu::kParticleDofQuadHlsl;
-            const char* frozen_disk=F793Benchmark?smoke_f793::gpu::kParticleDofDiskHlsl:
+            const char* frozen_disk=VisibilityBenchmark?
+                                    smoke_bc30216::gpu::kParticleDofDiskHlsl:
+                                    F793Benchmark?smoke_f793::gpu::kParticleDofDiskHlsl:
                                                     smoke_c591::gpu::kParticleDofDiskHlsl;
-            const char* frozen_aperture=F793Benchmark?smoke_f793::gpu::kParticleDofHlsl:
+            const char* frozen_aperture=VisibilityBenchmark?
+                                        smoke_bc30216::gpu::kParticleDofHlsl:
+                                        F793Benchmark?smoke_f793::gpu::kParticleDofHlsl:
                                                         smoke_c591::gpu::kParticleDofHlsl;
             Require(GatherBenchmark || (std::strcmp(gpu::kParticleDofQuadHlsl,frozen_quad)==0 &&
                     std::strcmp(gpu::kParticleDofDiskHlsl,frozen_disk)==0),
                     "frozen coverage comparison changed quad ABI or aperture taps");
+            if (VisibilityBenchmark)
+                Require(gpu::ParticleDofAtlasFilterSource(true,true)==
+                            smoke_bc30216::gpu::ParticleDofAtlasFilterSource(true,true),
+                        "visibility candidate changed the matched atlas filter");
             const auto frozen_core=[&](std::string source) {
                 const std::string current_core=gpu::kParticleDofHlsl;
                 const size_t at=source.rfind(current_core);
@@ -761,18 +879,24 @@ private:
                 return source;
             };
             const std::string current_composite=
-                gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,2);
-            const std::string before=GatherBenchmark?
-                gpu::DofParticlePixelSource(Samples,0,7,false,2,false):
+                gpu::MakeParticleDofPixelShader(native_ps,Samples,blend,7,2);
+            const std::string float_prefix="#define PARTICLE_DOF_FLOAT_BOUNDS 1\n";
+            const std::string before=VisibilityBenchmark?
+                float_prefix+frozen_core(current_composite):GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,blend,7,false,2,false):
                 frozen_core(current_composite);
-            const std::string after=GatherBenchmark?
-                gpu::DofParticlePixelSource(Samples,0,7,false,2,true):current_composite;
-            const std::string before_source=GatherBenchmark?
-                gpu::DofParticlePixelSource(Samples,0,7,false,1,false):
-                frozen_core(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1));
-            const std::string after_source=GatherBenchmark?
-                gpu::DofParticlePixelSource(Samples,0,7,false,1,true):
-                gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1);
+            const std::string after=VisibilityBenchmark?
+                float_prefix+current_composite:GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,blend,7,false,2,true):current_composite;
+            const std::string before_source=VisibilityBenchmark?
+                float_prefix+frozen_core(
+                    gpu::MakeParticleDofPixelShader(native_ps,Samples,blend,7,1)):GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,blend,7,false,1,false):
+                frozen_core(gpu::MakeParticleDofPixelShader(native_ps,Samples,blend,7,1));
+            const std::string after_source=VisibilityBenchmark?
+                before_source:GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,blend,7,false,1,true):
+                gpu::MakeParticleDofPixelShader(native_ps,Samples,blend,7,1);
             if (GatherBenchmark) {
                 const std::string switch_prefix="#define PARTICLE_DOF_FLOAT_BOUNDS 1\n";
                 Require(after==switch_prefix+before &&
@@ -781,10 +905,18 @@ private:
             }
             const auto before_ps=Compile(before,"main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
             const auto after_ps=Compile(after,"main","ps_5_0",CandidateOptimization,true);
+            if (VisibilityBenchmark) {
+                Require(before.starts_with(float_prefix) && after.starts_with(float_prefix) &&
+                        before_source.starts_with(float_prefix) &&
+                        after_source==before_source,
+                        "visibility comparison did not keep a matched FLOAT source pass");
+            }
             if (F793Benchmark) {
-                ReportParticlePixelBytecode(GatherBenchmark?"production-uint-pass2":
+                ReportParticlePixelBytecode(VisibilityBenchmark?"bc30216-direct-pass2":
+                                           GatherBenchmark?"production-uint-pass2":
                                            "f793-baseline",before_ps.Get());
-                ReportParticlePixelBytecode(GatherBenchmark?"production-float-gather-pass2":
+                ReportParticlePixelBytecode(VisibilityBenchmark?"visibility-direct-fallback-pass2":
+                                           GatherBenchmark?"production-float-gather-pass2":
                                            "candidate-direct-fallback-pass2",after_ps.Get());
             }
             const auto before_source_ps=Compile(before_source,"main","ps_5_0",
@@ -794,9 +926,9 @@ private:
             coverage_before_source_pso_=Pipeline(source_vs.Get(),before_source_ps.Get(),
                 DXGI_FORMAT_R16G16B16A16_FLOAT,false,true);
             coverage_before_pso_=Pipeline(composite_vs.Get(),before_ps.Get(),
-                DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,Samples,true);
+                DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,Samples,true,AdditiveBenchmark);
             coverage_after_pso_=Pipeline(composite_vs.Get(),after_ps.Get(),
-                DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,Samples,true);
+                DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,Samples,true,AdditiveBenchmark);
             if (F793Benchmark) {
                 f793_source_pso_=coverage_before_source_pso_;
                 f793_composite_pso_=coverage_before_pso_;
@@ -836,13 +968,18 @@ private:
         const auto range_vs=Compile(range_source,"vs","vs_5_0");
         const auto range_ps=Compile(range_source,"range_ps","ps_5_0",
                                     D3DCOMPILE_OPTIMIZATION_LEVEL1,CoverageBenchmark);
-        const auto float_range_source=GatherBenchmark?gpu::DofParticleRangeSource(Samples,true):
+        const auto float_range_source=(GatherBenchmark || VisibilityBenchmark)?
+            gpu::DofParticleRangeSource(Samples,true):
             std::string("#define PARTICLE_DOF_SAMPLES ")+
                                       std::to_string(Samples)+"\n"+
                                       smoke_c591::gpu::kParticleDofDepthRangeHlsl;
         if (GatherBenchmark)
             Require(float_range_source=="#define PARTICLE_DOF_FLOAT_BOUNDS 1\n"+range_source,
                     "production range factory changed code beyond the bounds switch");
+        if (VisibilityBenchmark)
+            Require(std::strcmp(gpu::kParticleDofDepthRangeHlsl,
+                                smoke_bc30216::gpu::kParticleDofDepthRangeHlsl)==0,
+                    "visibility comparison changed frozen base range shader");
         const auto float_range_vs=Compile(float_range_source,"vs","vs_5_0");
         const auto float_range_ps=Compile(float_range_source,"range_ps","ps_5_0",
                                           D3DCOMPILE_OPTIMIZATION_LEVEL1,CoverageBenchmark);
@@ -862,7 +999,27 @@ private:
         candidate_pso_=Pipeline(candidate_vs.Get(),candidate_ps.Get(),
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,false,false);
         composite_pso_=Pipeline(composite_vs.Get(),composite_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
-        if (F793Benchmark && Samples==2 && !GatherBenchmark) {
+        if (MixedSamples) {
+            const std::string vs_text=
+                "float4 mixed_vs(uint id:SV_VertexID):SV_Position { "
+                "return float4((id==2?3:-1),(id==1?-3:1),0,1); }";
+            const auto mixed_vs=Compile(vs_text,"mixed_vs","vs_5_0");
+            const auto make_mixed=[&](uint32_t mask,const char* color,const char* depth) {
+                const std::string ps_text=
+                    "struct O { float4 color:SV_Target; float depth:SV_Depth; "
+                    "uint coverage:SV_Coverage; }; O mixed_ps() { O o; o.color="+
+                    std::string(color)+"; o.depth="+depth+"; o.coverage="+
+                    std::to_string(mask)+"; return o; }";
+                const auto ps=Compile(ps_text,"mixed_ps","ps_5_0");
+                return Pipeline(mixed_vs.Get(),ps.Get(),
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,false,false,2,true,false,true);
+            };
+            char wall_literal[32]{};
+            std::snprintf(wall_literal,sizeof(wall_literal),"%.9g",1.0f-1.0f/WallZ);
+            mixed_sample0_pso_=make_mixed(1,"float4(.72,.08,.04,.2)",wall_literal);
+            mixed_sample1_pso_=make_mixed(2,"float4(.02,.14,.8,.8)","1.0");
+        }
+        if (F793Benchmark && Samples==2 && !GatherBenchmark && !VisibilityBenchmark) {
             auto make=[&](uint32_t pass,uint32_t blend) {
                 const auto vertex=Compile(gpu::MakeParticleDofVertexShader(native_vs,pass),
                                           "main","vs_5_0",CandidateOptimization,true);
@@ -886,14 +1043,36 @@ private:
         range_pso_=Pipeline(range_vs.Get(),range_ps.Get(),DXGI_FORMAT_R32G32_UINT,false,false);
         float_range_pso_=Pipeline(float_range_vs.Get(),float_range_ps.Get(),
                                   DXGI_FORMAT_R32G32_FLOAT,false,false);
+        if (VisibilityBenchmark) {
+            const auto producer_vs=Compile(gpu::DofParticleVertexSource(6),"main","vs_5_0",
+                                           D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            const auto producer_ps=Compile(gpu::DofParticlePixelSource(2,0,0,false,6,true),
+                                           "main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            const auto consumer_vs=Compile(gpu::DofParticleVertexSource(7),"main","vs_5_0",
+                                           D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            const auto consumer_ps=Compile(gpu::DofParticlePixelSource(2,blend,0,false,7,true),
+                                           "main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            CheckVisibilityCbufferLayout(producer_vs.Get());
+            CheckVisibilityCbufferLayout(consumer_ps.Get());
+            visibility_source_pso_=Pipeline(producer_vs.Get(),producer_ps.Get(),
+                                            DXGI_FORMAT_R16_FLOAT,false,true);
+            visibility_composite_pso_=Pipeline(consumer_vs.Get(),consumer_ps.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,2,true,AdditiveBenchmark);
+            ReportParticlePixelBytecode("visibility-producer-pass6",producer_ps.Get());
+            ReportParticlePixelBytecode("visibility-consumer-pass7",consumer_ps.Get());
+        }
     }
     void MakeFixture() {
         gpu::ParticleDofGeometryParams p{};
-        p.globals.optics[0]=5;
-        // Matched visible CoC: z3 near uses 5/12 of base; z12 far uses
-        // ((12-5)-.15*5)/12 * .45 = .234375 of base.
-        p.globals.optics[1]=CoverageBenchmark?TargetRadius/.234375f:TargetRadius*2.4f;
-        p.globals.optics[2]=1;p.globals.optics[3]=.45f;
+        p.globals.optics[0]=FocusDistance;
+        p.globals.optics[2]=NearScale;p.globals.optics[3]=FarScale;
+        // Match the requested visible radius at the z12 reference particle.
+        const float reference_coc=std::min(std::max(std::abs(12.0f-FocusDistance)-
+            FocusDistance*.15f,0.0f)/12.0f,1.0f)*
+            (12.0f<FocusDistance?NearScale:FarScale);
+        Require(!CoverageBenchmark || reference_coc>0,
+                "selected optics leave the z12 benchmark particle focused");
+        p.globals.optics[1]=CoverageBenchmark?TargetRadius/reference_coc:TargetRadius*2.4f;
         p.globals.viewport[2]=p.globals.target[0]=p.guest_size[0]=float(W);
         p.globals.viewport[3]=p.globals.target[1]=p.guest_size[1]=float(H);
         p.globals.target[2]=float(Quads);
@@ -903,7 +1082,8 @@ private:
             p.globals.projection[1]=1;
             p.globals.projection[2]=1;
         }
-        p.c97[2]=1;p.c98[0]=p.c98[1]=p.c98[3]=1;p.c98[2]=-1;
+        p.c97[2]=1;p.c97[3]=ZeroInputW?1.0f:0.0f;
+        p.c98[0]=p.c98[1]=p.c98[3]=1;p.c98[2]=-1;
         std::vector<gpu::NativeParticleVertex> native;
         constexpr std::array<float,4> gather_depths{8.0f,10.0f,12.0f,16.0f};
         for (uint32_t q=0;q<Quads;++q) {
@@ -911,13 +1091,15 @@ private:
             const float y=(120+float(q/4)*5)*float(H)/720.0f;
             const float quad_width=QuadScale*760.0f*float(W)/1280.0f;
             const float quad_height=QuadScale*480.0f*float(H)/720.0f;
-            const float z=GatherBenchmark?1.0f/gather_depths[q%gather_depths.size()]:
+            const float z=(GatherBenchmark || VisibilityBenchmark)?
+                           1.0f/gather_depths[q%gather_depths.size()]:
                           CoverageBenchmark?1.0f/12.0f:1.0f/3.0f;
             const uint32_t color=0x38FFE0C0;
-            native.push_back({{x,y,z,2.25f},color,{0,0},0});
-            native.push_back({{x,y+quad_height,z,2.25f},color,{0,1},0});
-            native.push_back({{x+quad_width,y+quad_height,z,2.25f},color,{1,1},0});
-            native.push_back({{x+quad_width,y,z,2.25f},color,{1,0},0});
+            const float input_w=ZeroInputW?0.0f:2.25f;
+            native.push_back({{x,y,z,input_w},color,{0,0},0});
+            native.push_back({{x,y+quad_height,z,input_w},color,{0,1},0});
+            native.push_back({{x+quad_width,y+quad_height,z,input_w},color,{1,1},0});
+            native.push_back({{x+quad_width,y,z,input_w},color,{1,0},0});
             const uint16_t k=uint16_t(q*4);
             indices_.insert(indices_.end(),{k,uint16_t(k+1),uint16_t(k+2),
                                               k,uint16_t(k+2),uint16_t(k+3)});
@@ -930,6 +1112,27 @@ private:
         ib_=Upload(indices_.data(),indices_.size()*sizeof(indices_[0]));
         pages_=gpu::BuildParticleDofAtlasPages(expanded_,p,metadata_,AtlasExtent,AtlasExtent);
         Require(!pages_.empty(),"production atlas packer returned no pages");
+        if (VisibilityBenchmark) {
+            const float largest=p.globals.optics[1]*
+                std::max(p.globals.optics[2],p.globals.optics[3]);
+            visibility_halo_=uint32_t(std::ceil(largest))+2;
+            visibility_pages_=gpu::BuildParticleDofVisibilityPages(
+                pages_,metadata_,p.globals,AtlasExtent,visibility_halo_,visibility_maps_);
+            Require(!visibility_pages_.empty() &&
+                    std::any_of(visibility_pages_.begin(),visibility_pages_.end(),
+                        [](const auto& page) { return page.cached; }),
+                    "benchmark fixture did not enter the production visibility cache path");
+            uint32_t next=0,cached=0;
+            for (const auto& page:visibility_pages_) {
+                Require(page.first_quad==next && page.quad_count>0,
+                        "visibility planner changed native quad order");
+                next+=page.quad_count;
+                cached+=page.cached?1u:0u;
+            }
+            Require(next==Quads,"visibility planner lost native quads");
+            std::printf("Visibility planner: %zu ordered chunks, %u cached, halo %u px\n",
+                        visibility_pages_.size(),cached,visibility_halo_);
+        }
         std::array<float,gpu::kParticleDofMaxQuads> radii{};
         size_t mapped=0; uint64_t atlas_pixels=0;
         for (size_t q=0;q<metadata_.size();++q) {
@@ -944,6 +1147,20 @@ private:
         std::array<std::array<float,4>,192> vc{};
         for (int j=0;j<4;++j) {vc[97][j]=p.c97[j];vc[98][j]=p.c98[j];}
         vcb_=Upload(vc.data(),sizeof(vc));
+        if (VisibilityBenchmark) {
+            constexpr size_t maps_bytes=gpu::kParticleDofMaxQuads*
+                sizeof(gpu::ParticleDofVisibilityMap);
+            std::vector<uint8_t> constants(sizeof(vc)+16+maps_bytes,0xff);
+            std::memcpy(constants.data(),vc.data(),sizeof(vc));
+            const float cache_target[4]{float(AtlasExtent),float(AtlasExtent),
+                                        float(visibility_halo_),0};
+            std::memcpy(constants.data()+sizeof(vc),cache_target,sizeof(cache_target));
+            std::memcpy(constants.data()+sizeof(vc)+sizeof(cache_target),
+                        visibility_maps_.data(),visibility_maps_.size()*
+                        sizeof(gpu::ParticleDofVisibilityMap));
+            static_assert(sizeof(vc)==3072 && sizeof(gpu::ParticleDofVisibilityMap)==8);
+            visibility_vcb_=Upload(constants.data(),constants.size());
+        }
         gpu::DrawConstants dc{};
         dc.surf[0]=float(W);dc.surf[1]=float(H);dc.surf[2]=1;
         dc.misc[1]=7;dc.texsize[0][0]=dc.texsize[0][1]=32;
@@ -962,7 +1179,7 @@ private:
             std::memcpy(old_cb.data()+legacy_prefix+old_globals+i*old_quad,&metadata_[i],old_quad);
         old_dcb_=Upload(old_cb.data(),old_cb.size());
         for (const auto page:pages_) {
-            if (F793Benchmark && Samples==2 && !GatherBenchmark) {
+            if (F793Benchmark && Samples==2 && !GatherBenchmark && !VisibilityBenchmark) {
                 auto admission=gpu::BuildParticleSharedCoverage(expanded_,metadata_,p,
                                                                  page,Samples,true);
                 std::printf("shared page %u..%u: rejection %u, sum/union %.1f/%.1f, "
@@ -987,7 +1204,7 @@ private:
             std::memcpy(cb.data()+sizeof(dc)+sizeof(globals),metadata_.data(),
                         metadata_.size()*sizeof(metadata_[0]));
             page_dcbs_.push_back(Upload(cb.data(),cb.size()));
-            if (F793Benchmark && Samples==2 && !GatherBenchmark) {
+            if (F793Benchmark && Samples==2 && !GatherBenchmark && !VisibilityBenchmark) {
                 auto field_cb=cb;
                 const size_t first_slot=sizeof(dc)+sizeof(globals);
                 auto field_globals=globals;
@@ -1022,6 +1239,31 @@ private:
             }
             Require(!rectangles.empty(),"benchmark page contains no source cells");
             page_rects_.push_back(std::move(rectangles));
+        }
+        if (VisibilityBenchmark) {
+            for (const auto& page:visibility_pages_) {
+                auto globals=p.globals;
+                globals.atlas_target[0]=globals.atlas_target[1]=float(AtlasExtent);
+                globals.atlas_target[2]=float(page.first_quad);
+                globals.atlas_target[3]=float(page.quad_count);
+                std::vector<uint8_t> cb(sizeof(dc)+sizeof(globals)+
+                    gpu::kParticleDofMaxQuads*sizeof(gpu::ParticleDofQuad));
+                std::memcpy(cb.data(),&dc,sizeof(dc));
+                std::memcpy(cb.data()+sizeof(dc),&globals,sizeof(globals));
+                std::memcpy(cb.data()+sizeof(dc)+sizeof(globals),metadata_.data(),
+                            metadata_.size()*sizeof(metadata_[0]));
+                visibility_page_dcbs_.push_back(Upload(cb.data(),cb.size()));
+                std::vector<D3D12_RECT> rectangles;
+                for (uint32_t q=page.first_quad;q<page.first_quad+page.quad_count;++q) {
+                    const auto& m=metadata_[q];
+                    if (m.atlas_scale<=0) continue;
+                    const LONG x=LONG(m.atlas_xy&65535u),y=LONG(m.atlas_xy>>16);
+                    rectangles.push_back({x,y,x+LONG(m.atlas_size&65535u),
+                                               y+LONG(m.atlas_size>>16)});
+                }
+                Require(!rectangles.empty(),"visibility chunk has no color source cells");
+                visibility_rects_.push_back(std::move(rectangles));
+            }
         }
         std::printf("Fixture: %ux%u, actual radius %.3f px, %u quads, %u batches, "
                     "%zu production atlas pages at %ux%u; "
@@ -1065,11 +1307,12 @@ private:
                                 ID3D12Resource* target,ID3D12Resource* source,
                                 ID3D12Resource* filtered,ID3D12Resource* sample_target,
                                 bool float_range,uint32_t range_levels,
-                                ID3D12Resource* support,ID3D12Resource* transmission) {
+                                 ID3D12Resource* support,ID3D12Resource* transmission,
+                                 ID3D12Resource* visibility) {
         Descriptors d;
         D3D12_DESCRIPTOR_HEAP_DESC h{};
         h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        h.NumDescriptors=28+4*(range_levels-1);
+        h.NumDescriptors=32+4*(range_levels-1);
         h.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.srv_heap)),"SRV heap");
         const auto cpu=d.srv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -1131,8 +1374,20 @@ private:
                 device_->CreateShaderResourceView(nullptr,&sample_view,at(slot));
             d.sample_srv=d.native_srv;d.sample_srv.ptr+=24*UINT64(step);
         }
+        if (visibility) {
+            view2d(28,range,DXGI_FORMAT_R32G32_FLOAT);
+            view2d(29,filtered,DXGI_FORMAT_R16G16B16A16_FLOAT);
+            view2d(30,visibility,DXGI_FORMAT_R16_FLOAT);
+            D3D12_SHADER_RESOURCE_VIEW_DESC depth{};
+            depth.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            depth.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            depth.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            device_->CreateShaderResourceView(snapshot,&depth,at(31));
+            d.visibility_composite_srv=d.native_srv;
+            d.visibility_composite_srv.ptr+=28*UINT64(step);
+        }
         h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        h.NumDescriptors=7+(range_levels-1);
+        h.NumDescriptors=8+(range_levels-1);
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.rtv_heap)),"RTV heap");
         const UINT rtv_step=device_->GetDescriptorHandleIncrementSize(h.Type);
         d.range_rtv=d.rtv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -1142,6 +1397,7 @@ private:
         d.sample_rtv=d.filtered_rtv;d.sample_rtv.ptr+=rtv_step;
         d.support_rtv=d.sample_rtv;d.support_rtv.ptr+=rtv_step;
         d.transmission_rtv=d.support_rtv;d.transmission_rtv.ptr+=rtv_step;
+        d.visibility_rtv=d.transmission_rtv;d.visibility_rtv.ptr+=rtv_step;
         D3D12_RENDER_TARGET_VIEW_DESC range_rtv_desc{};
         range_rtv_desc.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
         range_rtv_desc.Format=float_range?DXGI_FORMAT_R32G32_FLOAT:DXGI_FORMAT_R32G32_UINT;
@@ -1153,6 +1409,7 @@ private:
         if (support) device_->CreateRenderTargetView(support,nullptr,d.support_rtv);
         if (transmission) device_->CreateRenderTargetView(transmission,nullptr,
                                                           d.transmission_rtv);
+        if (visibility) device_->CreateRenderTargetView(visibility,nullptr,d.visibility_rtv);
         h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;h.NumDescriptors=2;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.dsv_heap)),"DSV heap");
         d.dsv=d.dsv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -1170,13 +1427,20 @@ private:
                                  coverage_before_source_pso_,float_range_pso_,sample_pso_,
                                  f793_source_pso_,f793_composite_pso_,
                                  support_pso_,transmission_pso_,shared_composite_pso_;
-    ComPtr<ID3D12Resource> native_vb_,vb_,ib_,vcb_,old_dcb_,radii_cb_,texture_;
+    ComPtr<ID3D12PipelineState> visibility_source_pso_,visibility_composite_pso_;
+    ComPtr<ID3D12PipelineState> mixed_sample0_pso_,mixed_sample1_pso_;
+    ComPtr<ID3D12Resource> native_vb_,vb_,ib_,vcb_,visibility_vcb_,old_dcb_,radii_cb_,texture_;
     std::vector<ComPtr<ID3D12Resource>> page_dcbs_;
+    std::vector<ComPtr<ID3D12Resource>> visibility_page_dcbs_;
     std::vector<ComPtr<ID3D12Resource>> legacy_page_dcbs_;
     std::vector<ComPtr<ID3D12Resource>> field_page_dcbs_,shared_vbs_;
     std::vector<gpu::ParticleSharedCoverage> shared_infos_;
     std::vector<gpu::ParticleDofAtlasPage> pages_;
+    std::vector<gpu::ParticleDofVisibilityPage> visibility_pages_;
+    std::vector<gpu::ParticleDofVisibilityMap> visibility_maps_;
+    uint32_t visibility_halo_=0;
     std::vector<std::vector<D3D12_RECT>> page_rects_;
+    std::vector<std::vector<D3D12_RECT>> visibility_rects_;
     std::vector<gpu::NativeParticleVertex> expanded_;
     std::vector<gpu::ParticleDofQuad> metadata_;
     std::vector<uint16_t> indices_;
@@ -1314,6 +1578,16 @@ int main(int argc,char** argv) {
                 CoverageBenchmark=F793Benchmark=true;
             } else if (std::strcmp(argv[arg],"--gather")==0) {
                 GatherBenchmark=CoverageBenchmark=F793Benchmark=SharedOff=true;
+            } else if (std::strcmp(argv[arg],"--visibility-cache")==0) {
+                VisibilityBenchmark=CoverageBenchmark=F793Benchmark=SharedOff=true;
+            } else if (std::strcmp(argv[arg],"--mixed-samples")==0) {
+                MixedSamples=true;
+            } else if (std::strcmp(argv[arg],"--additive")==0) {
+                AdditiveBenchmark=true;
+            } else if (std::strcmp(argv[arg],"--warp")==0) {
+                WarpCorrectness=true;
+            } else if (std::strcmp(argv[arg],"--zero-w")==0) {
+                ZeroInputW=true;
             } else if (std::strcmp(argv[arg],"--scene")==0 && arg+1<argc) {
                 const char* scene=argv[++arg];
                 Require(std::strcmp(scene,"occluded")==0 ||
@@ -1351,22 +1625,40 @@ int main(int argc,char** argv) {
                 MeasuredPairs=uint32_t(count);
             } else if (std::strcmp(argv[arg],"--width")==0 && arg+1<argc) {
                 const int width=std::atoi(argv[++arg]);
-                Require(width>=320 && width<=4096,
-                        "--width must be in 320..4096 pixels");
+                Require(width>=64 && width<=4096,
+                        "--width must be in 64..4096 pixels");
                 requested_width=uint32_t(width);
             } else if (std::strcmp(argv[arg],"--lequal")==0) {
                 DepthLessEqual=true;
             } else
             if (std::strcmp(argv[arg],"--height")==0 && arg+1<argc) {
                 const int height=std::atoi(argv[++arg]);
-                Require(height==720 || height==2160,"--height must be 720 or 2160");
-                H=uint32_t(height);W=H==720?1280:3840;
-                AtlasExtent=H==720?2048:4096;
+                Require(height>=64 && height<=2160,"--height must be in 64..2160");
+                H=uint32_t(height);W=H==720?1280:H==2160?3840:128;
+                AtlasExtent=H==2160?4096:2048;
             } else if (std::strcmp(argv[arg],"--radius")==0 && arg+1<argc) {
                 char* end=nullptr;
                 TargetRadius=std::strtof(argv[++arg],&end);
                 Require(end!=argv[arg] && *end=='\0' && std::isfinite(TargetRadius) &&
                         TargetRadius>0 && TargetRadius<=24,"--radius must be in (0,24]");
+            } else if (std::strcmp(argv[arg],"--wall-z")==0 && arg+1<argc) {
+                char* end=nullptr;
+                WallZ=std::strtof(argv[++arg],&end);
+                Require(end!=argv[arg] && *end=='\0' && std::isfinite(WallZ) &&
+                        WallZ>1 && WallZ<=100,
+                        "--wall-z must be finite in (1,100]");
+            } else if ((std::strcmp(argv[arg],"--focus")==0 ||
+                        std::strcmp(argv[arg],"--near")==0 ||
+                        std::strcmp(argv[arg],"--far")==0) && arg+1<argc) {
+                const char* option=argv[arg];
+                char* end=nullptr;
+                const float value=std::strtof(argv[++arg],&end);
+                Require(end!=argv[arg] && *end=='\0' && std::isfinite(value) &&
+                        value>0 && value<=100,
+                        "--focus/--near/--far must be finite in (0,100]");
+                if (std::strcmp(option,"--focus")==0) FocusDistance=value;
+                else if (std::strcmp(option,"--near")==0) NearScale=value;
+                else FarScale=value;
             } else if (std::strcmp(argv[arg],"--opt")==0 && arg+1<argc) {
                 const char* level=argv[++arg];
                 Require(std::strcmp(level,"O1")==0 || std::strcmp(level,"O3")==0,
@@ -1375,22 +1667,39 @@ int main(int argc,char** argv) {
                     D3DCOMPILE_OPTIMIZATION_LEVEL3:D3DCOMPILE_OPTIMIZATION_LEVEL1;
             } else {
                 throw std::runtime_error("usage: new_smoke_dof_gpu_bench "
-                    "[--coverage|--coverage-baseline|--gather] "
-                    "[--height 720|2160] [--width 320..4096] [--radius px] "
+                    "[--coverage|--coverage-baseline|--gather|--visibility-cache] "
+                    "[--height 720|2160; --warp also 64..2160] "
+                    "[--width 64..4096] [--radius px] "
+                    "[--focus worldZ] [--near scale] [--far scale] "
+                    "[--wall-z worldZ] [--zero-w] "
                     "[--samples 2|8] [--quads 1..64] "
                     "[--quad-scale .25..1] "
                     "[--layers 1..16] [--warmup 1..16] [--repeat even 8..64] "
                     "[--scene occluded|visible] [--lequal] "
+                    "[--mixed-samples] [--additive] [--warp] "
                     "[--shared-off for f793 fallback control] "
                     "[--opt O1|O3 candidate]");
             }
         }
         if (requested_width) W=requested_width;
+        Require(WarpCorrectness || (H==720 || H==2160) && W>=320,
+                "non-WARP benchmark requires 720p/2160p and width >=320");
+        Require(!WarpCorrectness || VisibilityBenchmark,
+                "--warp is correctness-only for --visibility-cache");
+        Require(!MixedSamples || VisibilityBenchmark,
+                "--mixed-samples requires --visibility-cache");
+        Require(!AdditiveBenchmark || VisibilityBenchmark,
+                "--additive requires --visibility-cache");
+        if (WarpCorrectness) AtlasExtent=256;
         if (CoverageBenchmark && !samples_set) Samples=2;
         Require(!GatherBenchmark || Samples==2,
                 "--gather requires the production 2x MSAA float-bounds variant");
         Require(!GatherBenchmark || CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
                 "--gather compares both production shaders at O1");
+        Require(!VisibilityBenchmark || Samples==2,
+                "--visibility-cache requires the production 2x MSAA FLOAT bounds variant");
+        Require(!VisibilityBenchmark || CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
+                "--visibility-cache compares both particle shaders at O1");
         Require(!CoverageBenchmark || F793Benchmark ||
                     CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
                 "non-f793 coverage comparison requires both production variants at O1");
@@ -1401,10 +1710,11 @@ int main(int argc,char** argv) {
                         "radius %.3f px, %u quads x %u layers, quad scale %.2f, %s scene, native %s, "
                         "candidate %s/%s; "
                         "%u warmups and %u measured runs/variant in ABBA order\n",
-                        GatherBenchmark?"production UINT versus FLOAT gather":
+                         VisibilityBenchmark?"bc30216 versus Vq visibility cache":
+                         GatherBenchmark?"production UINT versus FLOAT gather":
                         F793Benchmark?"f793 shared coverage":"c591 quantized",W,H,Samples,
                         TargetRadius,Quads,Batches,QuadScale,
-                        SceneVisible?"all-visible":"z4 wall with openings",
+                         SceneVisible?"all-visible":"wall with openings",
                         DepthLessEqual?"LEQUAL":"LESS",
                         SharedOff?"direct fallback":"shared field",
                         CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL3?"O3":"O1",
@@ -1412,6 +1722,20 @@ int main(int argc,char** argv) {
             if (GatherBenchmark)
                 std::puts("Gather workload: ordered per-quad view Z 8/10/12/16, identical geometry, "
                           "textures, range/mask and O1 flags; only UINT versus FLOAT bounds switch.");
+            if (VisibilityBenchmark)
+                std::printf("Vq workload: ordered per-quad view Z 8/10/12/16, "
+                            "focus %.3f near %.3f far %.3f, wall Z %.3f, input W %.2f; "
+                            "same FLOAT D24 base range "
+                            "and atlas material/filter; candidate times production cache "
+                            "page splits, Vq generation and cached composition.\n",
+                            FocusDistance,NearScale,FarScale,WallZ,ZeroInputW?0.0f:2.25f);
+            if (MixedSamples)
+                std::puts("Mixed 2x control: sample0 z4 wall/red, sample1 far/blue in a center stripe; "
+                          "preparation is outside GPU timestamps for both variants.");
+            if (AdditiveBenchmark)
+                std::puts("Additive control: source P/Q and native SRC_ALPHA/ONE RGB+alpha blending.");
+            if (WarpCorrectness)
+                std::puts("WARP correctness run: software adapter timings are not GPU performance evidence.");
             const auto cold_start=std::chrono::steady_clock::now();
             Bench bench;
             const double cold_seconds=std::chrono::duration<double>(
@@ -1439,11 +1763,14 @@ int main(int argc,char** argv) {
                 }
             Require(before.size()==MeasuredPairs && after.size()==MeasuredPairs,
                     "coverage ABBA pairing lost a measurement");
-            Print(GatherBenchmark?"production UINT bounds/direct pass2":
+            Print(VisibilityBenchmark?"bc30216 FLOAT direct pass2":
+                  GatherBenchmark?"production UINT bounds/direct pass2":
                   F793Benchmark?"f793e2d baseline":"c591162 blur-aware pass2",before);
-            Print(GatherBenchmark?"production FLOAT gather/direct pass2":
+            Print(VisibilityBenchmark?"Vq cache generation plus pass7":
+                  GatherBenchmark?"production FLOAT gather/direct pass2":
                   F793Benchmark?"shared coverage candidate":"quantized blur-aware pass2",after);
             const auto difference=Compare(before.front(),after.front(),
+                VisibilityBenchmark?"bc30216/Vq resolved":
                 GatherBenchmark?"production UINT/FLOAT gather resolved":
                 F793Benchmark?"f793/shared resolved":"c591/quantized resolved");
             if (!SceneVisible) CountBlurredWallPixels(before.front());
@@ -1451,15 +1778,21 @@ int main(int argc,char** argv) {
             before_samples.rgba=before.front().sample_rgba;
             after_samples.rgba=after.front().sample_rgba;
             const auto sample_difference=Compare(before_samples,after_samples,
+                VisibilityBenchmark?"bc30216/Vq physical MS samples (64x16 ROI)":
                 GatherBenchmark?"production UINT/FLOAT gather physical MS samples (64x16 ROI)":
                 F793Benchmark?"f793/shared physical MS samples (64x16 ROI)":
                               "c591/quantized physical MS samples (64x16 ROI)");
             const std::string suffix=std::to_string(H)+"p-r"+std::to_string(int(TargetRadius))+
                 "-ms"+std::to_string(Samples)+(DepthLessEqual?"-lequal":"-less")+
                 (SceneVisible?"-visible":"-occluded")+
-                (GatherBenchmark?"-production-float-gather":
+                (VisibilityBenchmark?"-bc30216-vq-cache":
+                 GatherBenchmark?"-production-float-gather":
                  F793Benchmark?"-f793-shared":
-                               "-c591-quantized");
+                                "-c591-quantized")+
+                (VisibilityBenchmark?"-wallz"+std::to_string(int(WallZ)):
+                                     std::string{})+
+                (ZeroInputW?"-zero-w":"")+(MixedSamples?"-mixed":"")+
+                (AdditiveBenchmark?"-additive":"");
             WriteBmp(("coverage-before-"+suffix+".bmp").c_str(),before.front());
             WriteBmp(("coverage-after-"+suffix+".bmp").c_str(),after.front());
             const double old_ms=MedianTotal(before),new_ms=MedianTotal(after);
@@ -1475,6 +1808,10 @@ int main(int argc,char** argv) {
             if (GatherBenchmark) {
                 Require(difference.maximum<=1e-5f && sample_difference.maximum<=1e-5f,
                         "production FLOAT gather changed resolved or physical-MS output");
+            }
+            if (VisibilityBenchmark) {
+                Require(difference.maximum<=1e-5f && sample_difference.maximum<=1e-5f,
+                        "Vq cache changed resolved or physical-MS output");
             }
             Require(difference.maximum<=.003f && difference.rms<=.0003 &&
                     difference.active_rms<=.0006 &&

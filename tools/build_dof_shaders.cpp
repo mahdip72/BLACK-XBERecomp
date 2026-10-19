@@ -21,7 +21,7 @@
 namespace {
 
 constexpr uint32_t kSamples[] = {1, 2, 4, 8};
-constexpr size_t kExpectedUniqueKeys = 536;
+constexpr size_t kExpectedUniqueKeys = 541;
 const gpu::ShaderCache* g_bytecode_cache = nullptr;
 
 struct Key {
@@ -156,6 +156,9 @@ bool Build(std::map<Key, Record>& records) {
     for (uint32_t pass = 0; pass <= 5; ++pass) {
         if (!Add(records, gpu::DofParticleVertexSource(pass), "main", "vs_5_0")) return false;
     }
+    for (uint32_t pass = 6; pass <= 7; ++pass) {
+        if (!Add(records, gpu::DofParticleVertexSource(pass), "main", "vs_5_0")) return false;
+    }
     constexpr int alpha_functions[] = {0, 1, 2, 3, 4, 5, 6, 7};
     for (uint32_t samples : kSamples) {
         for (bool float_bounds : {false, true}) {
@@ -178,6 +181,10 @@ bool Build(std::map<Key, Record>& records) {
             for (bool float_bounds : {false, true})
                 if (!Add(records, gpu::DofParticlePixelSource(2, blend, 0, false, pass, float_bounds), "main", "ps_5_0")) return false;
         }
+    }
+    if (!Add(records, gpu::DofParticlePixelSource(2, 0, 0, false, 6, true), "main", "ps_5_0")) return false;
+    for (uint32_t blend = 0; blend <= 1; ++blend) {
+        if (!Add(records, gpu::DofParticlePixelSource(2, blend, 0, false, 7, true), "main", "ps_5_0")) return false;
     }
     return true;
 }

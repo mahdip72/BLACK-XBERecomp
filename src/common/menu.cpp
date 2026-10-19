@@ -1025,7 +1025,7 @@ void DrawDofPanel() {
             if (ImGui::Checkbox(Ui("Particle coverage reuse", false).c_str(), &coverage_reuse))
                 gpu::SetDofParticleCoverageReuseEnabled(coverage_reuse);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Reuses shared particle coverage only for qualifying batches with identical depth.\nOther batches fall back automatically.\nVisual quality is unchanged; no restart is needed.");
+                ImGui::SetTooltip("Reuses particle visibility at full resolution.\nTurn off for an A/B GPU timing comparison.\nVisual quality is unchanged; no restart is needed.");
             bool profiling = gpu::DofGpuProfilingEnabled();
             if (ImGui::Checkbox("Measure GPU stages", &profiling)) gpu::SetDofGpuProfilingEnabled(profiling);
             ImGui::TextDisabled("Capture adds timing markers; off for normal play.");

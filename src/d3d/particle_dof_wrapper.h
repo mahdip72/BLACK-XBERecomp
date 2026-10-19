@@ -63,13 +63,17 @@ inline bool ReplaceOne(std::string& s, std::string_view from, std::string_view t
     s.replace(at, from.size(), to);
     return true;
 }
-inline bool Common(std::string& s) {
+inline bool Common(std::string& s, bool visibility = false) {
     if (!ReplaceOne(s, "    float fogamt : TEXCOORD4;", "    float fogamt : TEXCOORD4;\n"
         "    nointerpolation uint particleQuad : TEXCOORD5;\n"
         "    nointerpolation float particleViewZ : TEXCOORD6;")) return false;
     if (!ReplaceOne(s, "    float4 lt[56];\n    float4 rtshift;\n};",
         std::string("    float4 lt[56];\n    float4 rtshift;\n") +
         kParticleDofCbufferFields + "};")) return false;
+    if (visibility && !ReplaceOne(s, "cbuffer VC : register(b0) { float4 c[192]; };",
+        "cbuffer VC : register(b0) { float4 c[192];\n"
+        "    float4 particleVisibilityTarget;\n"
+        "    uint4 particleVisibilityMaps[512];\n};")) return false;
     s.insert(0, kParticleDofQuadHlsl);
     return true;
 }
@@ -78,7 +82,7 @@ inline bool Common(std::string& s) {
 // Empty means that the translator changed its contract; the renderer must use native geometry/shaders.
 inline std::string MakeParticleDofVertexShader(std::string s, uint32_t pass = 0) {
     using namespace particle_dof_detail;
-    if (pass > 5 || !Common(s)) return {};
+    if (pass > 7 || !Common(s, pass >= 6)) return {};
     if (!ReplaceOne(s, "VOut main(VIn i)", "VOut main(VIn i, uint vertexId : SV_VertexID)") &&
         !ReplaceOne(s, "VOut main(VRaw ri)", "VOut main(VRaw ri, uint vertexId : SV_VertexID)")) return {};
     std::string finish = "    o.particleQuad = vertexId / 4;\n"
@@ -94,6 +98,31 @@ inline std::string MakeParticleDofVertexShader(std::string s, uint32_t pass = 0)
         o.pos.xy = (atlas / particleAtlasTarget.xy * float2(2, -2) + float2(-1, 1)) * o.pos.w;
     }
 )";
+    if (pass == 6) finish += R"(
+    // The original program already computed native Z/W. Change only XY so each
+    // particle writes its own complete native-resolution visibility rectangle.
+    if (o.particleQuad >= 1024 || o.particleQuad >= (uint)particleTarget.z) {
+        o.pos.xy = float2(2, 2) * o.pos.w;
+    } else {
+        ParticleDofQuad quad = particleQuads[o.particleQuad];
+        uint4 packedMaps = particleVisibilityMaps[o.particleQuad >> 1];
+        uint2 map = (o.particleQuad & 1u) ? packedMaps.zw : packedMaps.xy;
+        if (map.x == 0xffffffffu || (quad.atlas_scale != 1 && quad.atlas_scale != .5)) {
+            o.pos.xy = float2(2, 2) * o.pos.w;
+        } else {
+            float2 origin = float2(map.x & 65535u, map.x >> 16);
+            float2 first = float2(map.y & 65535u, map.y >> 16);
+            float2 sourceFirst = float2(quad.screen_xy & 65535u, quad.screen_xy >> 16);
+            float2 sourceSize = float2(quad.atlas_size & 65535u, quad.atlas_size >> 16);
+            float2 last = min(sourceFirst + (sourceSize - 4) / quad.atlas_scale +
+                particleVisibilityTarget.z, particleTarget.xy);
+            uint cornerId = vertexId & 3u;
+            float2 corner = float2(cornerId >= 2u, cornerId == 1u || cornerId == 2u);
+            float2 atlas = origin + corner * (last - first);
+            o.pos.xy = (atlas / particleVisibilityTarget.xy * float2(2, -2) + float2(-1, 1)) * o.pos.w;
+        }
+    }
+)";
     finish += "    return o;";
     if (!ReplaceOne(s, "    return o;", finish)) return {};
     return s;
@@ -103,14 +132,14 @@ inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples, u
                                              int alphaFunction = -1, uint32_t pass = 0) {
     using namespace particle_dof_detail;
     if ((samples != 1 && samples != 2 && samples != 4 && samples != 8) || blend > 1 ||
-        alphaFunction < -1 || alphaFunction > 7 || pass > 5) return {};
+        alphaFunction < -1 || alphaFunction > 7 || pass > 7) return {};
     // Shared fields are an explicitly eligible2x path. These passes consume
     // filtered source energy, so native source alpha variants are unnecessary.
-    if (pass >= 3 && (samples != 2 || alphaFunction != 0 || (pass != 4 && blend != 0))) return {};
-    if (!Common(s)) return {};
+    if (pass >= 3 && (samples != 2 || alphaFunction != 0 || (pass != 4 && pass != 7 && blend != 0))) return {};
+    if (!Common(s, pass >= 6)) return {};
     // Unused native stages can retain stale 2D/cube/shadow bindings. Remove their declarations
     // to make room for the exact MSAA bounds at t2 and original-sample depth copy at t3.
-    for (int stage = pass >= 2 ? 1 : 2; stage < 4; ++stage) {
+    for (int stage = pass >= 6 ? 0 : pass >= 2 ? 1 : 2; stage < 4; ++stage) {
         const auto declaration = " tex" + std::to_string(stage) + " : register(t" + std::to_string(stage) + ");";
         auto at = s.find(declaration);
         if (at == std::string::npos) return {};
@@ -123,6 +152,18 @@ inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples, u
     const std::string entry = "float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target";
     auto at = s.find(entry);
     if (at == std::string::npos || s.find(entry, at + entry.size()) != std::string::npos) return {};
+    if (pass >= 6) {
+        // Cached passes never evaluate a material. In particular, pass7 binds
+        // original depth bounds at t0, so no dormant native texture callback may
+        // retain a conflicting declaration or become an unsupported fallback.
+        s.resize(at);
+        s += "\n#define PARTICLE_DOF_SAMPLES " + std::to_string(samples) + "\n";
+        s += "#define PARTICLE_DOF_BLEND " + std::to_string(blend) + "\n";
+        s += "#define PARTICLE_DOF_PASS " + std::to_string(pass) + "\n";
+        s += kParticleDofDiskHlsl;
+        s += kParticleDofHlsl;
+        return s;
+    }
     std::string body = s.substr(at + entry.size());
     if (pass >= 3 && body.find("if (t0.a == 0) discard;") != std::string::npos) return {};
     // The translated native main is last. Reject added functions or unexpected texture accesses.

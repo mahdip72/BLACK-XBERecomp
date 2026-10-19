@@ -50,6 +50,7 @@
 #include "d3d/particle_dof_clear.h"
 #include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_shared_coverage.h"
+#include "d3d/particle_dof_visibility.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "d3d/dof_shader_source.h"
 #include "d3d/dof_shader_library.h"
@@ -980,6 +981,10 @@ private:
     bool PrepareParticleDof(const State& s, Assembled& a, const PixelKey& pk, DrawShaders& sh, DrawTextures& stages);
     void ParticleDofSkipped(uint32_t reason, const char* message);
     bool EnsureParticleDofAtlas(uint32_t extent);
+    bool EnsureParticleDofVisibility(uint32_t extent);
+    D3D12_CPU_DESCRIPTOR_HANDLE ParticleVisibilityView() {
+        return ParticleDofRangeView(kParticleDofSnapshots + 5);
+    }
     bool PrepareParticleSharedCoverage(uint32_t width, uint32_t height);
     D3D12_CPU_DESCRIPTOR_HANDLE ParticleSharedView(uint32_t index) {
         return ParticleDofRangeView(kParticleDofSnapshots + 3 + index);
@@ -1285,6 +1290,7 @@ private:
     uint32_t dof_skip_reported_ = 0;
     bool dof_reported_ = false;
     bool particle_float_bounds_ = false;  // immutable device capability; only the 2x path uses FLOAT bounds
+    bool particle_visibility_cache_ = false;
     uint64_t particle_depth_serial_ = 1;  // actual depth mutations, never mere binding/state changes
     struct ParticleDof {
         bool marker = false;
@@ -1304,6 +1310,13 @@ private:
         ComPtr<ID3D12Resource> atlas[2];
         D3D12_RESOURCE_STATES atlas_states[2] = {};
         uint32_t atlas_extent = 0, atlas_failed = 0;
+        ComPtr<ID3D12Resource> visibility;
+        D3D12_RESOURCE_STATES visibility_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        uint32_t visibility_extent = 0, visibility_failed = 0;
+        bool visibility_active = false;
+        float visibility_target[4] = {};
+        std::vector<ParticleDofVisibilityMap> visibility_maps;
+        uint64_t visibility_pages = 0, visibility_quads = 0;
         uint64_t atlas_batches = 0, atlas_pages = 0, atlas_quads = 0, atlas_fallback = 0;
         ComPtr<ID3D12Resource> shared[2]; // R8 2MSAA support, RG32F single-sample transmission
         D3D12_RESOURCE_STATES shared_states[2] = {};
@@ -1432,6 +1445,10 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
         D3D12_FEATURE_FORMAT_SUPPORT, &particle_bounds, sizeof(particle_bounds))) &&
         (particle_bounds.Support1 & particle_bounds_required) == particle_bounds_required;
     LOGR("Particle DOF 2x depth bounds: %s", particle_float_bounds_ ? "FLOAT Gather" : "UINT Load fallback");
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT particle_visibility{DXGI_FORMAT_R16_FLOAT};
+    particle_visibility_cache_ = particle_float_bounds_ && SUCCEEDED(dev_->CheckFeatureSupport(
+        D3D12_FEATURE_FORMAT_SUPPORT, &particle_visibility, sizeof(particle_visibility))) &&
+        (particle_visibility.Support1 & particle_bounds_required) == particle_bounds_required;
     BeginDofTiming();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
@@ -1504,7 +1521,7 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
 // RTVs: the targets' pool, then the back buffers, occlusion, output, SMAA and the DOF filter mips
 void D3D12Backend::CreateHeaps() {
     constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
-        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots + 5;
+        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots + 6;
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvTotal, false, rtv_heap_);
@@ -2657,6 +2674,7 @@ bool D3D12Backend::ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* 
 bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelKey& pk,
                                      DrawShaders& sh, DrawTextures& stages) {
     auto& p = particle_dof_;
+    p.visibility_active = false;
     if (!p.marker) return false;
     p.marker = false;  // a marker authorizes exactly one draw
     ++p.batches;
@@ -3576,14 +3594,15 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
         }
         // Native 15BB00 uses GREATER; disabled alpha testing maps to ALWAYS. Other alpha/raster/mask
         // states remain supported by the same embedded library and a single asynchronous PSO worker.
-        for (uint32_t pass = 0; pass < 6; ++pass) {
+        for (uint32_t pass = 0; pass < 8; ++pass) {
             const bool shared = pass >= 3;
             if (shared && samples != 2) continue;
+            if (pass >= 6 && !particle_visibility_cache_) continue;
             uint64_t vertex_hash;
             auto* vs = CompileDof(DofParticleVertexSource(pass), "main", "vs_5_0", vertex_hash);
             if (!vs) { ready = false; continue; }
             for (int alpha : {4, 7}) for (bool kill : {false, true}) for (uint32_t blend = 0; blend < 2; ++blend) {
-                if (shared && (alpha != 4 || kill || (pass != 4 && blend))) continue;
+                if (shared && (alpha != 4 || kill || (pass != 4 && pass != 7 && blend))) continue;
                 uint64_t pixel_hash;
                 auto* ps = CompileDof(DofParticlePixelSource(samples, blend, shared ? 0 : alpha, kill, pass, particle_float_bounds_),
                                       "main", "ps_5_0", pixel_hash);
@@ -3601,7 +3620,7 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
                         state.zfunc = depth; state.src = 0x302; state.dst = blend ? 1 : 0x303; state.op = 0x8006;
                         state.wmask = mask; state.cull = state.ccw = cull;
                         state.msaa = samples > 1 ? samples : 0;
-                        if (pass == 1 || pass == 3 || pass == 5) {
+                        if (pass == 1 || pass == 3 || pass == 5 || pass == 6) {
                             state.has_ds = state.zen = state.blend = state.msaa = 0;
                             state.rtfmt = kDofFormats[0]; state.wmask = D3D12_COLOR_WRITE_ENABLE_ALL;
                             if (pass == 3) {
@@ -3609,10 +3628,13 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
                                 state.cull = state.ccw = 0;
                             } else if (pass == 5) {
                                 state.rtfmt = DXGI_FORMAT_R8_UNORM; state.msaa = 2;
+                            } else if (pass == 6) {
+                                state.rtfmt = DXGI_FORMAT_R16_FLOAT;
+                                state.cull = state.ccw = 0;
                             }
                         }
                         EnsureParticlePipeline(state, vs, ps);
-                        if (pass != 1 && pass != 3 && pass != 5) {
+                        if (pass != 1 && pass != 3 && pass != 5 && pass != 6) {
                             if (blend) {
                                 state.op = 0x800B;  // native SRC_ALPHA/ONE reverse-subtract uses the same P/Q shader
                                 EnsureParticlePipeline(state, vs, ps);
@@ -3654,6 +3676,8 @@ bool D3D12Backend::PrepareDofResources(uint32_t width, uint32_t height, bool bal
     // At high native resolutions a small-CoC full-size quad may need a 4096 cell. Reserve that page
     // before gameplay instead of allocating it and flushing the current frame during the first reload.
     ready &= EnsureParticleDofAtlas(std::max(width, height) > 2044 ? 4096 : 2048);
+    if (msaa_ == 2 && particle_visibility_cache_)
+        EnsureParticleDofVisibility(std::max(width, height) > 2044 ? 4096 : 2048);
     // Optional optimization: allocation failure must not disable the established DOF path.
     if (msaa_ == 2) PrepareParticleSharedCoverage(width, height);
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -4606,7 +4630,10 @@ float D3D12Backend::RenderTargetShift(const State& s, const DrawShaders& sh) con
 
 std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh,
     const PsoKey& k, const DrawTextures& stages, GuestExtent size, DrawConstants& c) {
-    Alloc vc = Upload(sizeof(s.vsc), 256);
+    const bool visibility = sh.particle_samples && particle_dof_.visibility_active;
+    static_assert(sizeof(s.vsc) == 192 * 16);
+    const size_t visibility_bytes = visibility ? 16 + kParticleDofMaxQuads * sizeof(ParticleDofVisibilityMap) : 0;
+    Alloc vc = Upload(sizeof(s.vsc) + visibility_bytes, 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
     static_assert(sizeof(DrawConstants) == 2096);
     static_assert(sizeof(DrawConstants) + sizeof(ParticleDofGlobals) +
@@ -4621,6 +4648,13 @@ std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> D3D12Backend::UploadConstants(const Sta
         for (int i = 0; i < 3; i++) c.pc[0][i] *= 0.65f;
     }
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
+    if (visibility) {
+        auto* tail_ptr = static_cast<uint8_t*>(vc.cpu) + sizeof(s.vsc);
+        std::memcpy(tail_ptr, particle_dof_.visibility_target, 16);
+        std::memset(tail_ptr + 16, 0xff, visibility_bytes - 16);
+        std::memcpy(tail_ptr + 16, particle_dof_.visibility_maps.data(),
+            particle_dof_.visibility_maps.size() * sizeof(ParticleDofVisibilityMap));
+    }
     FillTextureConstants(s, sh, stages, c);
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
@@ -4882,6 +4916,31 @@ bool D3D12Backend::PrepareParticleSharedCoverage(uint32_t width, uint32_t height
     return true;
 }
 
+bool D3D12Backend::EnsureParticleDofVisibility(uint32_t extent) {
+    auto& p = particle_dof_;
+    if (p.visibility && p.visibility_extent >= extent) return true;
+    const uint32_t failure = extent > 2048 ? 2u : 1u;
+    if (!particle_visibility_cache_ || (p.visibility_failed & failure)) return false;
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    auto desc = Texture2DDesc(DXGI_FORMAT_R16_FLOAT, extent, extent);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ComPtr<ID3D12Resource> next;
+    if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&next)))) {
+        p.visibility_failed |= failure;
+        return false;
+    }
+    if (p.visibility && !dof_resources_quiescent_) Flush();
+    if (p.visibility) Release(std::move(p.visibility));
+    p.visibility = std::move(next);
+    p.visibility_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    p.visibility_extent = extent;
+    dev_->CreateRenderTargetView(p.visibility.Get(), nullptr, ParticleVisibilityView());
+    const float zero[4] = {};
+    cl_->ClearRenderTargetView(ParticleVisibilityView(), zero, 0, nullptr);
+    return true;
+}
+
 bool D3D12Backend::EnsureParticleDofAtlas(uint32_t extent) {
     auto& p = particle_dof_;
     if (p.atlas[0] && p.atlas_extent == extent) return true;
@@ -4916,6 +4975,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     const DrawShaders& sh, DrawTextures& stages, const PsoKey& native_key, bool clamp) {
     auto& p = particle_dof_;
     const bool reuse_coverage = DofParticleCoverageReuseEnabled();
+    p.visibility_active = false;
     Target* rt = bound_rt_;
     Target* ds = bound_ds_;
     uint32_t extent = p.atlas_extent ? p.atlas_extent : 2048;
@@ -4966,7 +5026,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         if (variant.particle_pass >= 3) {
             pixel.alphakill = 0;
             variant.particle_alpha_function = 0;
-            if (variant.particle_pass != 4) variant.particle_blend = 0;
+            if (variant.particle_pass != 4 && variant.particle_pass != 7) variant.particle_blend = 0;
         }
         DrawShaderKeys(s, a, pixel, variant);
         EnsureVertexShader(s, a, variant);
@@ -4974,7 +5034,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         if (!variant.vs_code || !variant.ps_code) return nullptr;
         PsoKey key = native_key;
         key.vs = variant.vh; key.ps = variant.ph;
-        if (prepare || variant.particle_pass == 3 || variant.particle_pass == 5) {
+        if (prepare || variant.particle_pass == 3 || variant.particle_pass == 5 || variant.particle_pass == 6) {
             key.has_ds = key.zen = key.zwrite = key.sten = key.blend = key.msaa = 0;
             key.has_rt = 1;
             key.rtfmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -4984,6 +5044,8 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
                 key.cull = key.ccw = 0;
             } else if (variant.particle_pass == 5) {
                 key.rtfmt = DXGI_FORMAT_R8_UNORM; key.msaa = 2;
+            } else if (variant.particle_pass == 6) {
+                key.rtfmt = DXGI_FORMAT_R16_FLOAT; key.cull = key.ccw = 0;
             }
         } else if (variant.particle_coverage) {
             key.zen = 0;  // the shader preserves native/focused sample rejection and softens defocused coverage
@@ -5004,6 +5066,38 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         return false;
     }
     if (!EnsureParticleDofAtlas(extent)) return false;
+    DrawShaders visibility_source = sh, visibility_composite = sh;
+    visibility_source.particle_pass = 6; visibility_composite.particle_pass = 7;
+    ID3D12PipelineState* visibility_source_pso = nullptr;
+    ID3D12PipelineState* visibility_composite_pso = nullptr;
+    std::vector<ParticleDofVisibilityPage> visibility_pages;
+    const float largest_radius = p.globals.optics[1] * std::max(p.globals.optics[2], p.globals.optics[3]);
+    if (reuse_coverage && particle_visibility_cache_ && sh.particle_samples == 2 && sh.particle_coverage &&
+        native_key.fill != kFillWireframe && !native_key.zbias && !native_key.zslope &&
+        std::isfinite(largest_radius) && largest_radius > 0 && largest_radius < 4096) {
+        const uint32_t halo = uint32_t(std::ceil(largest_radius)) + 2;
+        try {
+            visibility_pages = BuildParticleDofVisibilityPages(pages, p.quads, p.globals, extent, halo, p.visibility_maps);
+        } catch (const std::bad_alloc&) { visibility_pages.clear(); }
+        if (std::any_of(visibility_pages.begin(), visibility_pages.end(),
+            [](const auto& page) { return page.cached; }) && EnsureParticleDofVisibility(extent)) {
+            visibility_source_pso = pipeline(visibility_source, true);
+            visibility_composite_pso = pipeline(visibility_composite, false);
+            if (visibility_source_pso && visibility_composite_pso) {
+                try {
+                    std::vector<ParticleDofAtlasPage> split_pages;
+                    split_pages.reserve(visibility_pages.size());
+                    std::vector<ParticleSharedCoverage> no_shared(visibility_pages.size());
+                    for (const auto& page : visibility_pages)
+                        split_pages.push_back({page.first_quad, page.quad_count});
+                    pages = std::move(split_pages); shared_pages = std::move(no_shared);
+                    p.visibility_active = true;
+                    p.visibility_target[0] = p.visibility_target[1] = float(p.visibility_extent);
+                    p.visibility_target[2] = float(halo); p.visibility_target[3] = 0;
+                } catch (const std::bad_alloc&) { /* Keep the original ordered pages. */ }
+            }
+        }
+    }
     DrawShaders support = sh, field = sh, shared_composite = sh;
     support.particle_pass = 5; field.particle_pass = 3; shared_composite.particle_pass = 4;
     ID3D12PipelineState* support_pso = nullptr;
@@ -5069,6 +5163,17 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     shared_filtered.sv[2] = filtered.sv[1];
     shared_filtered.sv[2].Format = DXGI_FORMAT_R32G32_FLOAT;
     shared_filtered.rt[2] = false; shared_filtered.wide[2] = 0; shared_filtered.blur[2] = false; shared_filtered.k[2] = 1;
+    DrawTextures visibility_filtered = filtered;
+    visibility_filtered.res[0] = stages.res[2];
+    visibility_filtered.info[0] = TexInfo{kTex2D};
+    visibility_filtered.sv[0] = stages.sv[2];
+    visibility_filtered.rt[0] = false; visibility_filtered.wide[0] = 0;
+    visibility_filtered.blur[0] = false; visibility_filtered.k[0] = 1;
+    visibility_filtered.res[2] = p.visibility.Get();
+    visibility_filtered.sv[2] = filtered.sv[1];
+    visibility_filtered.sv[2].Format = DXGI_FORMAT_R16_FLOAT;
+    visibility_filtered.rt[2] = false; visibility_filtered.wide[2] = 0;
+    visibility_filtered.blur[2] = false; visibility_filtered.k[2] = 1;
     DrawTextures unfiltered = stages;
     unfiltered.res[0] = p.atlas[0].Get();
     unfiltered.info[0] = TexInfo{kTex2D};
@@ -5080,6 +5185,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         const auto& page = pages[page_index];
         const auto& shared = shared_pages[page_index];
         const bool use_shared = shared_ready && bool(shared);
+        const bool use_visibility = p.visibility_active && visibility_pages[page_index].cached;
         p.globals.atlas_target[2] = float(page.first_quad);
         p.globals.atlas_target[3] = float(page.quad_count);
         DrawConstants constants{};
@@ -5118,6 +5224,24 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             // The procedural pass writes every texel of each allocated cell, including its zero guard.
             cl_->DrawInstanced(6, page.quad_count, 0, 0);
             Transition(p.atlas[1].Get(), p.atlas_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        if (use_visibility) {
+            auto visibility_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleTransmission, cl_.Get());
+            Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            SetBlitTarget(ParticleVisibilityView(), p.visibility_extent, p.visibility_extent);
+            cl_->SetPipelineState(visibility_source_pso);
+            cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
+            cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
+            cl_->IASetVertexBuffers(0, 1, &native_view);
+            cl_->IASetIndexBuffer(&index_view);
+            cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            SetTextureViewsAndSamplers(s, stages, clamp);
+            cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
+            Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            ++p.visibility_pages; p.visibility_quads += page.quad_count;
+            if (p.visibility_pages == 1)
+                LOGR("Particle DOF native visibility cache active: %ux%u R16F, unchanged aperture samples",
+                     p.visibility_extent, p.visibility_extent);
         }
         if (use_shared) {
             const D3D12_RECT box{shared.bounds[0], shared.bounds[1], shared.bounds[2], shared.bounds[3]};
@@ -5170,10 +5294,10 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         }
         auto composite_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleComposite, cl_.Get());
         restore_target();
-        cl_->SetPipelineState(use_shared ? shared_pso : composite_pso);
+        cl_->SetPipelineState(use_visibility ? visibility_composite_pso : use_shared ? shared_pso : composite_pso);
         cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
         cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
-        SetTextureViewsAndSamplers(s, use_shared ? shared_filtered : filtered, clamp);
+        SetTextureViewsAndSamplers(s, use_visibility ? visibility_filtered : use_shared ? shared_filtered : filtered, clamp);
         SetViewportScissor(s, size.w);
         SetBlendFactorStencilRef(s, native_key);
         cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -6058,6 +6182,8 @@ void D3D12Backend::Present(const Surface& front) {
              (unsigned long long)shared[size_t(ParticleSharedReject::Depth)],
              (unsigned long long)shared[size_t(ParticleSharedReject::Bounds)],
              (unsigned long long)shared[size_t(ParticleSharedReject::Overlap)]);
+        LOGR("Particle DOF native visibility cache: %llu pages, %llu quads",
+             (unsigned long long)particle.visibility_pages, (unsigned long long)particle.visibility_quads);
     }
     particle.previous_world = particle.world_valid;
     particle.marker = particle.world_valid = false;

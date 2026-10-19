@@ -157,7 +157,12 @@ Texture2DMS<float> particleSceneDepth : register(t3);
 #if PARTICLE_DOF_PASS != 4
 // Exact D24 min/max codes of every sample in the current snapshot, prequantized once per depth copy.
 #if PARTICLE_DOF_FLOAT_BOUNDS
+#if PARTICLE_DOF_PASS == 7
+Texture2D<float2> particleDepthBounds : register(t0);
+Texture2D<float> particleVisibilityCache : register(t2);
+#else
 Texture2D<float2> particleDepthBounds : register(t2);
+#endif
 uint2 ParticleLoadDepthBounds(int2 pixel) {
     float2 b = particleDepthBounds.Load(int3(pixel, 0));
     // Reject invalid sentinels/NaNs before converting to the original integer code.
@@ -175,6 +180,28 @@ Texture2D<float> particleSceneDepth : register(t3);
 #endif
 
 bool ParticleFinite(float x) { return (asuint(x) & 0x7f800000u) != 0x7f800000u; }
+#if PARTICLE_DOF_PASS == 6 || PARTICLE_DOF_PASS == 7
+bool ParticleVisibilityCell(uint quadIndex, out int2 atlas, out int2 first, out int2 last) {
+    atlas = 0; first = 0; last = 0;
+    if (quadIndex >= 1024 || quadIndex >= (uint)particleTarget.z) return false;
+    ParticleDofQuad quad = particleQuads[quadIndex];
+    uint4 packedMaps = particleVisibilityMaps[quadIndex >> 1];
+    uint2 map = (quadIndex & 1u) ? packedMaps.zw : packedMaps.xy;
+    if (map.x == 0xffffffffu || (quad.atlas_scale != 1 && quad.atlas_scale != .5)) return false;
+    atlas = int2(map.x & 65535u, map.x >> 16);
+    first = int2(map.y & 65535u, map.y >> 16);
+    int2 sourceFirst = int2(quad.screen_xy & 65535u, quad.screen_xy >> 16);
+    int2 sourceSize = int2(quad.atlas_size & 65535u, quad.atlas_size >> 16);
+    if (any(sourceSize <= 4)) return false;
+    last = min(sourceFirst + int2((sourceSize - 4) / quad.atlas_scale) +
+        (int)particleVisibilityTarget.z, int2(particleTarget.xy));
+    return all(last > first) && all(atlas + last - first <= int2(particleVisibilityTarget.xy));
+}
+#endif
+#if PARTICLE_DOF_PASS == 7
+// One mapping lookup per receiving fragment, reused by both unchanged 32-tap sums.
+static int2 particleCacheAtlas, particleCacheFirst, particleCacheLast;
+#endif
 float ParticleRadius(float z) {
     float d = z - particleOptics.x;
     float c = min(max(abs(d) - particleOptics.x * .15, 0) / z, 1);
@@ -231,10 +258,10 @@ float ParticleVisibleCode(float2 sourcePixel, uint incomingCode, float2 low, flo
     if (bounds.x <= bounds.y && bounds.y <= 0xffffffu) {
         if (lessEqual ? incomingCode <= bounds.x : incomingCode < bounds.x) return 1;
         if (lessEqual ? incomingCode > bounds.y : incomingCode >= bounds.y) return 0;
-#if PARTICLE_DOF_SAMPLES == 2 && PARTICLE_DOF_PASS == 3
+#if PARTICLE_DOF_SAMPLES == 2 && (PARTICLE_DOF_PASS == 3 || PARTICLE_DOF_PASS == 6)
         // With two valid samples, an unresolved min/max interval contains exactly
         // one passing sample, including LESS/LEQUAL equality at either endpoint.
-        // Keep this specialization in the shared field: common fallback register
+        // Use this only in the visibility producers: common fallback register
         // allocation regressed in matched GPU tests with the extra branch.
         return .5;
 #endif
@@ -289,6 +316,19 @@ float ParticleBilinearVisibility(int2 center, float2 offset, uint incomingCode,
     // cannot round an absolute sum in only one half of the bilinear footprint.
     int2 p = center + int2(floor(offset));
     float2 f = frac(offset);
+#if PARTICLE_DOF_PASS == 7
+    // Vq contains every native pixel in the cell, including transparent source
+    // regions and logical-viewport exterior. R16 stores 0/.5/1 without loss.
+    // Gather only unfiltered corners; retain the original three lerps and order.
+    if (all(p >= particleCacheFirst) && all(p + 1 < particleCacheLast)) {
+        int2 cached = particleCacheAtlas + p - particleCacheFirst;
+        float2 uv = (float2(cached) + 1) / particleVisibilityTarget.xy;
+        float4 visible = particleVisibilityCache.GatherRed(smp0, uv);
+        return lerp(lerp(visible.w, visible.z, f.x), lerp(visible.x, visible.y, f.x), f.y);
+    }
+    // A cache miss inside the viewport must evaluate the original depth, never
+    // substitute zero or clamp to a neighboring cell. t0 retains original bounds.
+#endif
 #if PARTICLE_DOF_SAMPLES == 2 && PARTICLE_DOF_PASS == 2 && PARTICLE_DOF_FLOAT_BOUNDS
     // Gather the same four corners together. With exactly two valid depth samples,
     // comparing both extrema reproduces the original 0/.5/1 source visibility.
@@ -544,6 +584,17 @@ float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
     // keep their area, including odd-width/height cells and viewport edges.
     return sum * .25;
 }
+#elif PARTICLE_DOF_PASS == 6
+float main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
+    int2 atlas, first, last;
+    if (!ParticleVisibilityCell(i.particleQuad, atlas, first, last)) discard;
+    int2 pixel = int2(i.pos.xy) - atlas + first;
+    if (any(pixel < first) || any(pixel >= last)) discard;
+    // Native incoming Z/W is unchanged by the rectangular producer VS. Average
+    // all scene samples, independently of particle alpha and raster coverage.
+    return ParticleVisible(float2(pixel) + .5, i.pos.z, max(particleViewport.xy, 0),
+        min(particleViewport.xy + particleViewport.zw, particleTarget.xy), particleTarget.w > .5);
+}
 #elif PARTICLE_DOF_PASS == 3
 // A page with one proven native depth/radius shares the expensive visibility
 // integrals. Store individual sample transmissions, never an aggregate mask.
@@ -574,7 +625,7 @@ float2 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
     float2 second = ParticleOccluderTransmission(pixel, depth1, incomingCode, radius, low, high, lessEqual, first.y);
     return float2(first.x, second.x);
 }
-#elif PARTICLE_DOF_PASS == 2 || PARTICLE_DOF_PASS == 4 || PARTICLE_DOF_PASS == 5
+#elif PARTICLE_DOF_PASS == 2 || PARTICLE_DOF_PASS == 4 || PARTICLE_DOF_PASS == 5 || PARTICLE_DOF_PASS == 7
 Texture2D<float4> particleFilteredAtlas : register(t1);
 float4 ParticleAtlasLoad(int2 p, int2 low, int2 high) {
     return all(p >= low) && all(p < high) ? particleFilteredAtlas.Load(int3(p, 0)) : 0;
@@ -639,7 +690,14 @@ ParticleFinal main(VOut i, bool front : SV_IsFrontFace, uint rasterCoverage : SV
 }
 #else
 ParticleFinal main(VOut i, bool front : SV_IsFrontFace, uint rasterCoverage : SV_Coverage) {
+#if PARTICLE_DOF_PASS == 7
+    if (!ParticleVisibilityCell(i.particleQuad, particleCacheAtlas, particleCacheFirst, particleCacheLast))
+        return (ParticleFinal)0;
+#endif
     float4 color = ParticleAtlasComposite(i, front);
+#if PARTICLE_DOF_PASS == 7
+    if (color.a == 0) return (ParticleFinal)0;
+#endif
     float2 coverage = ParticleCoverage(i, color.a, rasterCoverage);
     ParticleFinal output = (ParticleFinal)0;
     output.color = ParticleTransmit(color, coverage);

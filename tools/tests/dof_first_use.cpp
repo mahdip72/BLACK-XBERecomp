@@ -27,6 +27,7 @@ namespace {
 struct Counters { unsigned static_pairs=0,range_pairs=0,atlas_pairs=0,particle_vs=0,
                            particle_ps=0,shared_vs=0,shared_ps=0,
                            float_range_pairs=0,float_particle_ps=0,float_shared_ps=0,
+                           late_particle_vs=0,late_particle_ps=0,
                            coverage_ps=0,tile_vs=0,lookups=0; };
 void Check(bool value,const char* message) {
     if (!value) throw std::runtime_error(message);
@@ -219,6 +220,47 @@ void CheckFloatBoundsMatrix(Counters& count) {
           count.float_shared_ps==2,
           "float-bounds particle consumer matrix changed without updating test");
 }
+void CheckLateParticleMatrix(Counters& count) {
+    const auto vertex6=gpu::DofParticleVertexSource(6);
+    const auto vertex7=gpu::DofParticleVertexSource(7);
+    Check(!vertex6.empty() && !vertex7.empty() && vertex6!=vertex7 &&
+          vertex6!=gpu::DofParticleVertexSource(0) &&
+          vertex7!=gpu::DofParticleVertexSource(0),
+          "late particle vertex stages did not produce two distinct canonical sources");
+    RequireEmbedded(vertex6,"main","vs_5_0",count);
+    RequireEmbedded(vertex7,"main","vs_5_0",count);
+    count.late_particle_vs=2;
+
+    for (uint32_t pass:{6u,7u}) {
+        const uint32_t blend_count=pass==7 ? 2u : 1u;
+        for (uint32_t blend=0;blend<blend_count;++blend) {
+            const auto canonical=gpu::DofParticlePixelSource(2,blend,0,false,pass,true);
+            Check(!canonical.empty() &&
+                  gpu::DofParticlePixelSource(2,blend,0,false,pass,false).empty(),
+                  "late particle PS must require its native-2x float-bounds variant");
+            RequireEmbedded(canonical,"main","ps_5_0",count);
+            ++count.late_particle_ps;
+            for (int alpha=0;alpha<8;++alpha)
+                for (bool kill:{false,true})
+                    Check(gpu::DofParticlePixelSource(2,blend,alpha,kill,pass,true)==canonical,
+                          "late particle PS did not canonicalize dead alpha state");
+        }
+        if (pass==6)
+            Check(gpu::DofParticlePixelSource(2,1,7,true,pass,true)==
+                      gpu::DofParticlePixelSource(2,0,0,false,pass,true),
+                  "pass-6 particle PS did not canonicalize blend state");
+        for (uint32_t samples:{1u,4u,8u})
+            Check(gpu::DofParticlePixelSource(samples,0,0,false,pass,true).empty(),
+                  "late particle PS unexpectedly enabled outside native 2x MSAA");
+    }
+    const auto pixel6=gpu::DofParticlePixelSource(2,0,0,false,6,true);
+    const auto pixel7_blend0=gpu::DofParticlePixelSource(2,0,0,false,7,true);
+    const auto pixel7_blend1=gpu::DofParticlePixelSource(2,1,0,false,7,true);
+    Check(pixel6!=pixel7_blend0 && pixel7_blend0!=pixel7_blend1,
+          "late particle PS pass/blend variants were not retained separately");
+    Check(count.late_particle_vs==2 && count.late_particle_ps==3,
+          "late particle consumer matrix changed without updating test");
+}
 void CheckSelectedBytecode(std::string_view source,const char* entry,const char* profile,
                            const char* label) {
     const auto flags=gpu::DofShaderCompilerFlags(entry,profile);
@@ -273,6 +315,7 @@ int main(int argc,char** argv) {
         CheckStaticManifest(count);
         CheckParticleMatrix(count);
         CheckFloatBoundsMatrix(count);
+        CheckLateParticleMatrix(count);
         CheckMissingVariants();
         if (!no_fxc) {
             CheckSelectedBytecode(gpu::DofStaticPassSource("depth_of_field_pack",8),
@@ -285,6 +328,8 @@ int main(int argc,char** argv) {
                                   "float-bounds particle composite pass 2 MS2");
             CheckSelectedBytecode(gpu::kParticleDofAtlasFilterHlsl,"filter_ps","ps_5_0",
                                   "particle atlas filter");
+            CheckSelectedBytecode(gpu::DofParticlePixelSource(2,1,0,false,7,true),"main","ps_5_0",
+                                  "pass-7 particle float-bounds consumer");
         }
         if (initially_empty) {
             cache_error.clear();
@@ -295,13 +340,13 @@ int main(int argc,char** argv) {
                     "%u viewmodel tile VS, %u range pairs, %u atlas pair, "
                     "%u particle VS, %u particle PS, %u shared-field VS, %u shared-field PS; "
                     "%u float-bounds range pair, %u float-bounds native PS, "
-                    "%u float-bounds shared PS; "
+                    "%u float-bounds shared PS, %u late particle VS, %u late particle PS; "
                     "%u successful lookups; cache initially %s; FXC references %s\n",
                     count.static_pairs,count.coverage_ps,count.tile_vs,count.range_pairs,
                     count.atlas_pairs,count.particle_vs,count.particle_ps,count.shared_vs,
                     count.shared_ps,count.float_range_pairs,count.float_particle_ps,
-                    count.float_shared_ps,count.lookups,
-                    initially_empty?"absent":"already present",no_fxc?"disabled":"five byte-exact");
+                    count.float_shared_ps,count.late_particle_vs,count.late_particle_ps,count.lookups,
+                    initially_empty?"absent":"already present",no_fxc?"disabled":"six byte-exact");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr,"embedded DOF first use FAILED: %s\n",error.what());

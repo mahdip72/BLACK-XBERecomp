@@ -376,7 +376,7 @@ public:
             "particle depth copy", "particle range", "particle source", "particle filter",
             "particle composite", "particle direct", "particle hierarchy",
             "SDK depth downsample", "SDK color downsample", "SDK dilate", "SDK blur", "SDK composite",
-            "particle support", "particle transmission"};
+            "particle support", "particle visibility"};
         static_assert(sizeof(names) / sizeof(names[0]) == kStageCount);
         const uint32_t index = uint32_t(stage);
         return index < kStageCount ? names[index] : "unknown";
