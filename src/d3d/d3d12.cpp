@@ -989,7 +989,10 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE ParticleDofAtlasView(uint32_t index) {
         return ParticleDofRangeView(kParticleDofSnapshots + index);
     }
-    bool EnsureParticleDofDepthRange(uint32_t snapshot_index, uint32_t w, uint32_t h);
+    DXGI_FORMAT ParticleDofRangeFormat(uint32_t samples) const {
+        return samples == 2 && particle_float_bounds_ ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R32G32_UINT;
+    }
+    bool EnsureParticleDofDepthRange(uint32_t snapshot_index, uint32_t w, uint32_t h, uint32_t samples);
     bool ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* range,
         D3D12_RESOURCE_STATES& range_state,
         uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h);
@@ -1281,6 +1284,7 @@ private:
     D3D12_RESOURCE_STATES dof_layer_states_[kDofTargets] = {};
     uint32_t dof_skip_reported_ = 0;
     bool dof_reported_ = false;
+    bool particle_float_bounds_ = false;  // immutable device capability; only the 2x path uses FLOAT bounds
     uint64_t particle_depth_serial_ = 1;  // actual depth mutations, never mere binding/state changes
     struct ParticleDof {
         bool marker = false;
@@ -1421,6 +1425,13 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     weapon_dof_.conservative_supported = SUCCEEDED(dev_->CheckFeatureSupport(
         D3D12_FEATURE_D3D12_OPTIONS, &conservative, sizeof(conservative))) &&
         conservative.ConservativeRasterizationTier >= D3D12_CONSERVATIVE_RASTERIZATION_TIER_2;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT particle_bounds{DXGI_FORMAT_R32G32_FLOAT};
+    const auto particle_bounds_required = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+        D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
+    particle_float_bounds_ = SUCCEEDED(dev_->CheckFeatureSupport(
+        D3D12_FEATURE_FORMAT_SUPPORT, &particle_bounds, sizeof(particle_bounds))) &&
+        (particle_bounds.Support1 & particle_bounds_required) == particle_bounds_required;
+    LOGR("Particle DOF 2x depth bounds: %s", particle_float_bounds_ ? "FLOAT Gather" : "UINT Load fallback");
     BeginDofTiming();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
@@ -2590,15 +2601,16 @@ void D3D12Backend::ParticleDofSkipped(uint32_t reason, const char* message) {
     LOGR("Particle DOF native fallback: %s", message);
 }
 
-bool D3D12Backend::EnsureParticleDofDepthRange(uint32_t index, uint32_t w, uint32_t h) {
+bool D3D12Backend::EnsureParticleDofDepthRange(uint32_t index, uint32_t w, uint32_t h, uint32_t samples) {
     auto& snapshot = particle_dof_.snapshots[index];
     if (!w || !h) return false;
+    const DXGI_FORMAT format = ParticleDofRangeFormat(samples);
     if (snapshot.range) {
         const auto desc = snapshot.range->GetDesc();
-        if (desc.Width == w && desc.Height == h && desc.MipLevels == 1) return true;
+        if (desc.Width == w && desc.Height == h && desc.MipLevels == 1 && desc.Format == format) return true;
     }
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    auto desc = Texture2DDesc(DXGI_FORMAT_R32G32_UINT, w, h);
+    auto desc = Texture2DDesc(format, w, h);
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> range;
     if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
@@ -2617,8 +2629,8 @@ bool D3D12Backend::EnsureParticleDofDepthRange(uint32_t index, uint32_t w, uint3
 
 bool D3D12Backend::ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* range,
     D3D12_RESOURCE_STATES& range_state, uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h) {
-    const auto source = DofParticleRangeSource(samples);
-    auto* pipeline = EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_UINT, -1, true);
+    const auto source = DofParticleRangeSource(samples, particle_float_bounds_);
+    auto* pipeline = EnsurePassPipeline(source.c_str(), "vs", "range_ps", ParticleDofRangeFormat(samples), -1, true);
     if (!pipeline) return false;
     auto range_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleRange, cl_.Get());
     const uint32_t slot = AllocSrvSlots(4);
@@ -2804,7 +2816,7 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
         snapshot->source = nullptr;
     }
     const uint32_t snapshot_index = uint32_t(snapshot - p.snapshots);
-    if (samples > 1 && !EnsureParticleDofDepthRange(snapshot_index, rt->w, rt->h)) {
+    if (samples > 1 && !EnsureParticleDofDepthRange(snapshot_index, rt->w, rt->h, samples)) {
         ParticleDofSkipped(7, "MSAA depth range allocation failed"); return false;
     }
     snapshot->used = ++p.uses;
@@ -2837,7 +2849,7 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
     if (samples > 1) {
         stages.res[2] = snapshot->range.Get();
         stages.sv[2] = {};
-        stages.sv[2].Format = DXGI_FORMAT_R32G32_UINT;
+        stages.sv[2].Format = ParticleDofRangeFormat(samples);
         stages.sv[2].Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         stages.sv[2].ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         stages.sv[2].Texture2D.MipLevels = snapshot->range->GetDesc().MipLevels;
@@ -3559,8 +3571,8 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
         ready &= EnsureDepthOfFieldPipeline("ffx_dof_prepare", kDofFormats[0], 1, samples) != nullptr;
         ready &= EnsureDepthOfFieldPipeline("ffx_dof_present", kBgra, samples) != nullptr;
         if (samples > 1) {
-            const auto source = DofParticleRangeSource(samples);
-            ready &= EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_UINT, -1, true) != nullptr;
+            const auto source = DofParticleRangeSource(samples, particle_float_bounds_);
+            ready &= EnsurePassPipeline(source.c_str(), "vs", "range_ps", ParticleDofRangeFormat(samples), -1, true) != nullptr;
         }
         // Native 15BB00 uses GREATER; disabled alpha testing maps to ALWAYS. Other alpha/raster/mask
         // states remain supported by the same embedded library and a single asynchronous PSO worker.
@@ -3573,7 +3585,7 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
             for (int alpha : {4, 7}) for (bool kill : {false, true}) for (uint32_t blend = 0; blend < 2; ++blend) {
                 if (shared && (alpha != 4 || kill || (pass != 4 && blend))) continue;
                 uint64_t pixel_hash;
-                auto* ps = CompileDof(DofParticlePixelSource(samples, blend, shared ? 0 : alpha, kill, pass),
+                auto* ps = CompileDof(DofParticlePixelSource(samples, blend, shared ? 0 : alpha, kill, pass, particle_float_bounds_),
                                       "main", "ps_5_0", pixel_hash);
                 if (!ps) { ready = false; continue; }
                 for (uint32_t cull = 0; cull < 2; ++cull)
@@ -3669,7 +3681,7 @@ bool D3D12Backend::PrepareDofResources(uint32_t width, uint32_t height, bool bal
         const uint32_t samples = i ? 1 : msaa_;
         ready &= prepare_depth(snapshot.depth, snapshot.state, w, h, samples);
         snapshot.source = nullptr;
-        if (samples > 1) ready &= EnsureParticleDofDepthRange(i, w, h);
+        if (samples > 1) ready &= EnsureParticleDofDepthRange(i, w, h, samples);
     }
     return ready;
 }
@@ -4290,7 +4302,7 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
         return;
     }
     const auto source = sh.particle_samples ? DofParticlePixelSource(sh.particle_samples, sh.particle_blend,
-        sh.particle_alpha_function, pk.alphakill != 0, sh.particle_pass) : DrawPixelHlsl(pk, sh.near_depth);
+        sh.particle_alpha_function, pk.alphakill != 0, sh.particle_pass, particle_float_bounds_) : DrawPixelHlsl(pk, sh.near_depth);
     sh.ps_code = sh.particle_samples ? CompileDof(source, "main", "ps_5_0", sh.ph) :
                                       Compile(source, "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
@@ -4697,7 +4709,7 @@ void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::stri
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
     CaptureShader("vs", sh.vkey, VertexHlsl(s, a, sh));
     const auto source = sh.particle_samples ? DofParticlePixelSource(sh.particle_samples, sh.particle_blend,
-        sh.particle_alpha_function, pk.alphakill != 0, sh.particle_pass) : DrawPixelHlsl(pk, sh.near_depth);
+        sh.particle_alpha_function, pk.alphakill != 0, sh.particle_pass, particle_float_bounds_) : DrawPixelHlsl(pk, sh.near_depth);
     CaptureShader("ps", sh.pkey, source);
 }
 

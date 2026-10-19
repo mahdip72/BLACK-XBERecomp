@@ -4,8 +4,8 @@
 
 namespace gpu {
 
-// Render once per current MS depth snapshot into R32G32_UINT. Exact D24 codes let every visibility probe
-// compare these bounds directly; mixed samples still use the original raw depth snapshot.
+// Render exact D24 codes once per MS depth snapshot. The gather-capable 2x path uses
+// R32G32_FLOAT: binary32 represents every D24 integer exactly. Other paths use UINT.
 inline constexpr char kParticleDofDepthRangeHlsl[] = R"(
 Texture2DMS<float> particleRangeDepth : register(t3);
 uint ParticleRangeD24Code(float depth) {
@@ -24,7 +24,11 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
+#if PARTICLE_DOF_FLOAT_BOUNDS
+float2 range_ps(float4 pos : SV_Position) : SV_Target {
+#else
 uint2 range_ps(float4 pos : SV_Position) : SV_Target {
+#endif
     uint minimum = 0xffffffu, maximum = 0;
     bool valid = true;
     [unroll] for (uint sampleIndex = 0; sampleIndex < PARTICLE_DOF_SAMPLES; ++sampleIndex) {
@@ -38,7 +42,11 @@ uint2 range_ps(float4 pos : SV_Position) : SV_Target {
         }
     }
     // R24_UNORM is always valid. The sentinel also keeps generic test inputs and future formats safe.
+#if PARTICLE_DOF_FLOAT_BOUNDS
+    return valid ? float2(minimum, maximum) : float2(-1, 0);
+#else
     return valid ? uint2(minimum, maximum) : uint2(0xffffffffu, 0);
+#endif
 }
 )";
 
@@ -148,7 +156,17 @@ inline constexpr char kParticleDofHlsl[] = R"(
 Texture2DMS<float> particleSceneDepth : register(t3);
 #if PARTICLE_DOF_PASS != 4
 // Exact D24 min/max codes of every sample in the current snapshot, prequantized once per depth copy.
+#if PARTICLE_DOF_FLOAT_BOUNDS
+Texture2D<float2> particleDepthBounds : register(t2);
+uint2 ParticleLoadDepthBounds(int2 pixel) {
+    float2 b = particleDepthBounds.Load(int3(pixel, 0));
+    // Reject invalid sentinels/NaNs before converting to the original integer code.
+    if (b.x >= 0 && b.x <= b.y && b.y <= 16777215.0) return uint2(b);
+    return uint2(0xffffffffu, 0);
+}
+#else
 Texture2D<uint2> particleDepthBounds : register(t2);
+#endif
 #else
 Texture2D<float2> particleTransmissionField : register(t2);
 #endif
@@ -205,7 +223,11 @@ float ParticleVisibleCode(float2 sourcePixel, uint incomingCode, float2 low, flo
     if (any(sourcePixel < low) || any(sourcePixel >= high)) return 0;
     int2 p = int2(sourcePixel);
 #if PARTICLE_DOF_SAMPLES > 1 && PARTICLE_DOF_PASS != 4
+#if PARTICLE_DOF_FLOAT_BOUNDS
+    uint2 bounds = ParticleLoadDepthBounds(p);
+#else
     uint2 bounds = particleDepthBounds.Load(int3(p, 0));
+#endif
     if (bounds.x <= bounds.y && bounds.y <= 0xffffffu) {
         if (lessEqual ? incomingCode <= bounds.x : incomingCode < bounds.x) return 1;
         if (lessEqual ? incomingCode > bounds.y : incomingCode >= bounds.y) return 0;
@@ -267,6 +289,23 @@ float ParticleBilinearVisibility(int2 center, float2 offset, uint incomingCode,
     // cannot round an absolute sum in only one half of the bilinear footprint.
     int2 p = center + int2(floor(offset));
     float2 f = frac(offset);
+#if PARTICLE_DOF_SAMPLES == 2 && PARTICLE_DOF_PASS == 2 && PARTICLE_DOF_FLOAT_BOUNDS
+    // Gather the same four corners together. With exactly two valid depth samples,
+    // comparing both extrema reproduces the original 0/.5/1 source visibility.
+    // Interior-only sampling avoids every native sampler addressing/border rule.
+    if (all(float2(p) + .5 >= low) && all(float2(p + 1) + .5 < high)) {
+        float2 uv = (float2(p) + 1) / particleTarget.xy;
+        float4 minimum = particleDepthBounds.GatherRed(smp0, uv);
+        float4 maximum = particleDepthBounds.GatherGreen(smp0, uv);
+        if (all(minimum >= 0) && all(minimum <= maximum) && all(maximum <= 16777215.0)) {
+            float4 visible = lessEqual ?
+                (float4(float(incomingCode) <= minimum) + float4(float(incomingCode) <= maximum)) * .5 :
+                (float4(float(incomingCode) < minimum) + float4(float(incomingCode) < maximum)) * .5;
+            // Gather order: bottom-left, bottom-right, top-right, top-left.
+            return lerp(lerp(visible.w, visible.z, f.x), lerp(visible.x, visible.y, f.x), f.y);
+        }
+    }
+#endif
     return lerp(lerp(ParticleVisibleCode(float2(p) + .5, incomingCode, low, high, lessEqual),
                      ParticleVisibleCode(float2(p + int2(1, 0)) + .5, incomingCode, low, high, lessEqual), f.x),
                 lerp(ParticleVisibleCode(float2(p + int2(0, 1)) + .5, incomingCode, low, high, lessEqual),
@@ -341,7 +380,11 @@ float2 ParticleCoverage(VOut i, float alpha, uint rasterCoverage) {
 #if PARTICLE_DOF_SAMPLES > 1
     // The existing exact depth bounds can prove every covered sample visible,
     // avoiding raw loads and the per-sample deduplication path without changing bits.
+#if PARTICLE_DOF_FLOAT_BOUNDS
+    uint2 bounds = ParticleLoadDepthBounds(pixel);
+#else
     uint2 bounds = particleDepthBounds.Load(int3(pixel, 0));
+#endif
     if (bounds.x <= bounds.y && bounds.y <= 0xffffffu) {
         if (lessEqual ? incomingCode <= bounds.x : incomingCode < bounds.x)
             return float2(rasterCoverage, rasterCoverage ? 1 : 0);
@@ -518,7 +561,11 @@ float2 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {
     if (radius <= 0)
         return float2(ParticleDepthPassCode(incomingCode, ParticleRawDepth(pixel, 0), lessEqual),
                       ParticleDepthPassCode(incomingCode, ParticleRawDepth(pixel, 1), lessEqual));
+#if PARTICLE_DOF_FLOAT_BOUNDS
+    uint2 bounds = ParticleLoadDepthBounds(pixel);
+#else
     uint2 bounds = particleDepthBounds.Load(int3(pixel, 0));
+#endif
     if (bounds.x <= bounds.y && bounds.y <= 0xffffffu &&
         (lessEqual ? incomingCode <= bounds.x : incomingCode < bounds.x)) return 1;
     float depth0 = ParticleRawDepth(pixel, 0), depth1 = ParticleRawDepth(pixel, 1);

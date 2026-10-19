@@ -26,6 +26,7 @@ namespace {
 
 struct Counters { unsigned static_pairs=0,range_pairs=0,atlas_pairs=0,particle_vs=0,
                            particle_ps=0,shared_vs=0,shared_ps=0,
+                           float_range_pairs=0,float_particle_ps=0,float_shared_ps=0,
                            coverage_ps=0,tile_vs=0,lookups=0; };
 void Check(bool value,const char* message) {
     if (!value) throw std::runtime_error(message);
@@ -91,6 +92,14 @@ void CheckStaticManifest(Counters& count) {
         RequirePair(source,"range_ps",count);
         ++count.range_pairs;
     }
+    const auto float_range=gpu::DofParticleRangeSource(2,true);
+    Check(!float_range.empty() && float_range!=gpu::DofParticleRangeSource(2,false),
+          "2x float-bounds range source did not form a distinct canonical key");
+    RequirePair(float_range,"range_ps",count);
+    ++count.float_range_pairs;
+    for (uint32_t samples:{1u,4u,8u})
+        Check(gpu::DofParticleRangeSource(samples,true)==gpu::DofParticleRangeSource(samples,false),
+              "non-2x float-bounds range source did not canonicalize to integer bounds");
     RequirePair(gpu::kParticleDofAtlasFilterHlsl,"filter_ps",count);
     ++count.atlas_pairs;
 }
@@ -153,6 +162,63 @@ void CheckParticleMatrix(Counters& count) {
           count.shared_vs==3 && count.shared_ps==4,
           "particle DOF consumer matrix changed without updating test");
 }
+void CheckFloatBoundsMatrix(Counters& count) {
+    // The native-sample float family is limited to 2x and covers every live
+    // native alpha/blend state in passes 0-2.
+    for (uint32_t pass:{0u,1u,2u})
+        for (uint32_t blend:{0u,1u})
+            for (int alpha=0;alpha<8;++alpha)
+                for (bool kill:{false,true}) {
+                    const auto source=gpu::DofParticlePixelSource(
+                        2,blend,alpha,kill,pass,true);
+                    Check(!source.empty() && source!=gpu::DofParticlePixelSource(
+                              2,blend,alpha,kill,pass,false),
+                          "2x float-bounds particle PS did not form a distinct canonical key");
+                    RequireEmbedded(source,"main","ps_5_0",count);
+                    ++count.float_particle_ps;
+                }
+
+    // Shared passes 3 and 5 consume float bounds; their source alpha and blend
+    // arguments are dead. Pass 4 has no bounds read and must reuse the integer key.
+    for (uint32_t pass:{3u,5u}) {
+        const auto canonical=gpu::DofParticlePixelSource(2,0,0,false,pass,true);
+        Check(!canonical.empty() && canonical!=gpu::DofParticlePixelSource(
+                  2,0,0,false,pass,false),
+              "shared 2x float-bounds particle PS did not form a distinct canonical key");
+        RequireEmbedded(canonical,"main","ps_5_0",count);
+        ++count.float_shared_ps;
+        for (uint32_t blend:{0u,1u})
+            for (int alpha=0;alpha<8;++alpha)
+                for (bool kill:{false,true})
+                    Check(gpu::DofParticlePixelSource(2,blend,alpha,kill,pass,true)==canonical,
+                          "shared float-bounds particle PS did not canonicalize dead alpha/blend state");
+    }
+    for (uint32_t blend:{0u,1u})
+        for (int alpha=0;alpha<8;++alpha)
+            for (bool kill:{false,true}) {
+                const auto integer=gpu::DofParticlePixelSource(2,blend,alpha,kill,4,false);
+                Check(!integer.empty() &&
+                      gpu::DofParticlePixelSource(2,blend,alpha,kill,4,true)==integer,
+                      "pass-4 float-bounds request did not canonicalize to its integer-bounds key");
+            }
+
+    // Float bounds are not compiled for other sample counts; requests must map
+    // exactly to the existing integer source over every native pass variant.
+    for (uint32_t samples:{1u,4u,8u})
+        for (uint32_t pass:{0u,1u,2u})
+            for (uint32_t blend:{0u,1u})
+                for (int alpha=0;alpha<8;++alpha)
+                    for (bool kill:{false,true})
+                        Check(gpu::DofParticlePixelSource(
+                                  samples,blend,alpha,kill,pass,true)==
+                              gpu::DofParticlePixelSource(
+                                  samples,blend,alpha,kill,pass,false),
+                              "non-2x float-bounds particle PS did not canonicalize to integer bounds");
+
+    Check(count.float_range_pairs==1 && count.float_particle_ps==96 &&
+          count.float_shared_ps==2,
+          "float-bounds particle consumer matrix changed without updating test");
+}
 void CheckSelectedBytecode(std::string_view source,const char* entry,const char* profile,
                            const char* label) {
     const auto flags=gpu::DofShaderCompilerFlags(entry,profile);
@@ -206,6 +272,7 @@ int main(int argc,char** argv) {
         Counters count;
         CheckStaticManifest(count);
         CheckParticleMatrix(count);
+        CheckFloatBoundsMatrix(count);
         CheckMissingVariants();
         if (!no_fxc) {
             CheckSelectedBytecode(gpu::DofStaticPassSource("depth_of_field_pack",8),
@@ -214,6 +281,8 @@ int main(int argc,char** argv) {
                                   "particle atlas source VS");
             CheckSelectedBytecode(gpu::DofParticlePixelSource(8,1,4,true,2),"main","ps_5_0",
                                   "particle additive alpha-test MS8 composite");
+            CheckSelectedBytecode(gpu::DofParticlePixelSource(2,1,4,true,2,true),"main","ps_5_0",
+                                  "float-bounds particle composite pass 2 MS2");
             CheckSelectedBytecode(gpu::kParticleDofAtlasFilterHlsl,"filter_ps","ps_5_0",
                                   "particle atlas filter");
         }
@@ -225,11 +294,14 @@ int main(int argc,char** argv) {
         std::printf("embedded DOF first use PASS: %u static pairs, %u viewmodel coverage PS, "
                     "%u viewmodel tile VS, %u range pairs, %u atlas pair, "
                     "%u particle VS, %u particle PS, %u shared-field VS, %u shared-field PS; "
+                    "%u float-bounds range pair, %u float-bounds native PS, "
+                    "%u float-bounds shared PS; "
                     "%u successful lookups; cache initially %s; FXC references %s\n",
                     count.static_pairs,count.coverage_ps,count.tile_vs,count.range_pairs,
                     count.atlas_pairs,count.particle_vs,count.particle_ps,count.shared_vs,
-                    count.shared_ps,count.lookups,
-                    initially_empty?"absent":"already present",no_fxc?"disabled":"four byte-exact");
+                    count.shared_ps,count.float_range_pairs,count.float_particle_ps,
+                    count.float_shared_ps,count.lookups,
+                    initially_empty?"absent":"already present",no_fxc?"disabled":"five byte-exact");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr,"embedded DOF first use FAILED: %s\n",error.what());

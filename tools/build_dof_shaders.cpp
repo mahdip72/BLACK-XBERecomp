@@ -21,7 +21,7 @@
 namespace {
 
 constexpr uint32_t kSamples[] = {1, 2, 4, 8};
-constexpr size_t kExpectedUniqueKeys = 436;
+constexpr size_t kExpectedUniqueKeys = 536;
 const gpu::ShaderCache* g_bytecode_cache = nullptr;
 
 struct Key {
@@ -145,8 +145,11 @@ bool Build(std::map<Key, Record>& records) {
              "viewmodel_dof_tiles_vs", "vs_5_0")) return false;
 
     for (uint32_t samples : kSamples) {
-        auto source = gpu::DofParticleRangeSource(samples);
-        if (!AddPair(records, std::move(source), "vs", "range_ps")) return false;
+        for (bool float_bounds : {false, true}) {
+            if (float_bounds && samples != 2) continue;
+            auto source = gpu::DofParticleRangeSource(samples, float_bounds);
+            if (!AddPair(records, std::move(source), "vs", "range_ps")) return false;
+        }
     }
     if (!AddPair(records, gpu::kParticleDofAtlasFilterHlsl, "vs", "filter_ps")) return false;
 
@@ -155,13 +158,16 @@ bool Build(std::map<Key, Record>& records) {
     }
     constexpr int alpha_functions[] = {0, 1, 2, 3, 4, 5, 6, 7};
     for (uint32_t samples : kSamples) {
-        for (uint32_t blend = 0; blend <= 1; ++blend) {
-            for (int alpha_function : alpha_functions) {
-                for (bool alpha_kill : {false, true}) {
-                    for (uint32_t pass = 0; pass <= 2; ++pass) {
-                        auto source = gpu::DofParticlePixelSource(
-                            samples, blend, alpha_function, alpha_kill, pass);
-                        if (!Add(records, std::move(source), "main", "ps_5_0")) return false;
+        for (bool float_bounds : {false, true}) {
+            if (float_bounds && samples != 2) continue;
+            for (uint32_t blend = 0; blend <= 1; ++blend) {
+                for (int alpha_function : alpha_functions) {
+                    for (bool alpha_kill : {false, true}) {
+                        for (uint32_t pass = 0; pass <= 2; ++pass) {
+                            auto source = gpu::DofParticlePixelSource(
+                                samples, blend, alpha_function, alpha_kill, pass, float_bounds);
+                            if (!Add(records, std::move(source), "main", "ps_5_0")) return false;
+                        }
                     }
                 }
             }
@@ -169,7 +175,8 @@ bool Build(std::map<Key, Record>& records) {
     }
     for (uint32_t pass = 3; pass <= 5; ++pass) {
         for (uint32_t blend = 0; blend < (pass == 4 ? 2u : 1u); ++blend) {
-            if (!Add(records, gpu::DofParticlePixelSource(2, blend, 0, false, pass), "main", "ps_5_0")) return false;
+            for (bool float_bounds : {false, true})
+                if (!Add(records, gpu::DofParticlePixelSource(2, blend, 0, false, pass, float_bounds), "main", "ps_5_0")) return false;
         }
     }
     return true;

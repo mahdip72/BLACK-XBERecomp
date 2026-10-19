@@ -32,6 +32,7 @@
 #include "d3d/particle_dof_small_radius.h"
 #include "d3d/particle_dof_shared_coverage.h"
 #include "d3d/particle_dof_wrapper.h"
+#include "d3d/dof_shader_source.h"
 #include "gpu/shaders.h"
 namespace smoke_v25 {
 namespace gpu {
@@ -64,6 +65,7 @@ UINT CandidateOptimization=D3DCOMPILE_OPTIMIZATION_LEVEL1;
 uint32_t Samples = 8, Quads = 12, Batches = 4;
 bool CoverageBenchmark=false,F793Benchmark=false,DepthLessEqual=false,SceneVisible=false;
 bool SharedOff=false;
+bool GatherBenchmark=false;
 uint32_t Warmups=8,MeasuredPairs=16;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
 void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix,
@@ -216,6 +218,16 @@ public:
         Require(adapter_.Get() != nullptr, "No hardware D3D12 adapter; benchmark not run");
         Hr(D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0,
                              IID_PPV_ARGS(&device_)), "D3D12CreateDevice(hardware)");
+        if (GatherBenchmark) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT format{};
+            format.Format=DXGI_FORMAT_R32G32_FLOAT;
+            Hr(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&format,sizeof(format)),
+               "Check R32G32_FLOAT gather support");
+            Require((format.Support1&D3D12_FORMAT_SUPPORT1_SHADER_GATHER)!=0 &&
+                    (format.Support1&D3D12_FORMAT_SUPPORT1_RENDER_TARGET)!=0 &&
+                    (format.Support1&D3D12_FORMAT_SUPPORT1_SHADER_LOAD)!=0,
+                    "hardware adapter lacks RG32_FLOAT gather/render/load support");
+        }
         D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{};
         q.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; q.SampleCount = Samples;
         Hr(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
@@ -239,7 +251,8 @@ public:
     Result Run(Mode mode,bool capture_samples=false) {
         const bool coverage=mode==Mode::CoverageBefore || mode==Mode::CoverageAfter ||
                             mode==Mode::F793Before || mode==Mode::F793After;
-        const bool float_range=mode==Mode::V25 || mode==Mode::CoverageBefore;
+        const bool float_range=mode==Mode::V25 || mode==Mode::CoverageBefore ||
+                               (GatherBenchmark && mode==Mode::F793After);
         const bool shared=mode==Mode::F793After && Samples==2 && !SharedOff;
         const uint32_t range_levels=1;
         Require(!capture_samples || coverage,"sample capture requires an MSAA coverage mode");
@@ -736,8 +749,8 @@ private:
                                                     smoke_c591::gpu::kParticleDofDiskHlsl;
             const char* frozen_aperture=F793Benchmark?smoke_f793::gpu::kParticleDofHlsl:
                                                         smoke_c591::gpu::kParticleDofHlsl;
-            Require(std::strcmp(gpu::kParticleDofQuadHlsl,frozen_quad)==0 &&
-                    std::strcmp(gpu::kParticleDofDiskHlsl,frozen_disk)==0,
+            Require(GatherBenchmark || (std::strcmp(gpu::kParticleDofQuadHlsl,frozen_quad)==0 &&
+                    std::strcmp(gpu::kParticleDofDiskHlsl,frozen_disk)==0),
                     "frozen coverage comparison changed quad ABI or aperture taps");
             const auto frozen_core=[&](std::string source) {
                 const std::string current_core=gpu::kParticleDofHlsl;
@@ -749,17 +762,30 @@ private:
             };
             const std::string current_composite=
                 gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,2);
-            const std::string after=current_composite;
-            const std::string before=frozen_core(current_composite);
-            const std::string before_source=frozen_core(
-                gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1));
-            const std::string after_source=
+            const std::string before=GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,0,7,false,2,false):
+                frozen_core(current_composite);
+            const std::string after=GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,0,7,false,2,true):current_composite;
+            const std::string before_source=GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,0,7,false,1,false):
+                frozen_core(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1));
+            const std::string after_source=GatherBenchmark?
+                gpu::DofParticlePixelSource(Samples,0,7,false,1,true):
                 gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1);
+            if (GatherBenchmark) {
+                const std::string switch_prefix="#define PARTICLE_DOF_FLOAT_BOUNDS 1\n";
+                Require(after==switch_prefix+before &&
+                        after_source==switch_prefix+before_source,
+                        "production gather factories changed code beyond the bounds switch");
+            }
             const auto before_ps=Compile(before,"main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
             const auto after_ps=Compile(after,"main","ps_5_0",CandidateOptimization,true);
             if (F793Benchmark) {
-                ReportParticlePixelBytecode("f793-baseline",before_ps.Get());
-                ReportParticlePixelBytecode("candidate-direct-fallback-pass2",after_ps.Get());
+                ReportParticlePixelBytecode(GatherBenchmark?"production-uint-pass2":
+                                           "f793-baseline",before_ps.Get());
+                ReportParticlePixelBytecode(GatherBenchmark?"production-float-gather-pass2":
+                                           "candidate-direct-fallback-pass2",after_ps.Get());
             }
             const auto before_source_ps=Compile(before_source,"main","ps_5_0",
                                                 D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
@@ -803,15 +829,20 @@ private:
                                   "main","vs_5_0");
         const auto old_ps=Compile(smoke_v25::gpu::MakeParticleDofPixelShader(legacy_native_ps,Samples,0,7),
                                   "main","ps_5_0");
-        const auto range_source=std::string("#define PARTICLE_DOF_SAMPLES ")+
+        const auto range_source=GatherBenchmark?gpu::DofParticleRangeSource(Samples,false):
+            std::string("#define PARTICLE_DOF_SAMPLES ")+
                                 std::to_string(Samples)+"\n"+
                                 gpu::kParticleDofDepthRangeHlsl;
         const auto range_vs=Compile(range_source,"vs","vs_5_0");
         const auto range_ps=Compile(range_source,"range_ps","ps_5_0",
                                     D3DCOMPILE_OPTIMIZATION_LEVEL1,CoverageBenchmark);
-        const auto float_range_source=std::string("#define PARTICLE_DOF_SAMPLES ")+
+        const auto float_range_source=GatherBenchmark?gpu::DofParticleRangeSource(Samples,true):
+            std::string("#define PARTICLE_DOF_SAMPLES ")+
                                       std::to_string(Samples)+"\n"+
                                       smoke_c591::gpu::kParticleDofDepthRangeHlsl;
+        if (GatherBenchmark)
+            Require(float_range_source=="#define PARTICLE_DOF_FLOAT_BOUNDS 1\n"+range_source,
+                    "production range factory changed code beyond the bounds switch");
         const auto float_range_vs=Compile(float_range_source,"vs","vs_5_0");
         const auto float_range_ps=Compile(float_range_source,"range_ps","ps_5_0",
                                           D3DCOMPILE_OPTIMIZATION_LEVEL1,CoverageBenchmark);
@@ -831,7 +862,7 @@ private:
         candidate_pso_=Pipeline(candidate_vs.Get(),candidate_ps.Get(),
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,false,false);
         composite_pso_=Pipeline(composite_vs.Get(),composite_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
-        if (F793Benchmark && Samples==2) {
+        if (F793Benchmark && Samples==2 && !GatherBenchmark) {
             auto make=[&](uint32_t pass,uint32_t blend) {
                 const auto vertex=Compile(gpu::MakeParticleDofVertexShader(native_vs,pass),
                                           "main","vs_5_0",CandidateOptimization,true);
@@ -874,12 +905,14 @@ private:
         }
         p.c97[2]=1;p.c98[0]=p.c98[1]=p.c98[3]=1;p.c98[2]=-1;
         std::vector<gpu::NativeParticleVertex> native;
+        constexpr std::array<float,4> gather_depths{8.0f,10.0f,12.0f,16.0f};
         for (uint32_t q=0;q<Quads;++q) {
             const float x=(260+float(q%4)*5)*float(W)/1280.0f;
             const float y=(120+float(q/4)*5)*float(H)/720.0f;
             const float quad_width=QuadScale*760.0f*float(W)/1280.0f;
             const float quad_height=QuadScale*480.0f*float(H)/720.0f;
-            const float z=CoverageBenchmark?1.0f/12.0f:1.0f/3.0f;
+            const float z=GatherBenchmark?1.0f/gather_depths[q%gather_depths.size()]:
+                          CoverageBenchmark?1.0f/12.0f:1.0f/3.0f;
             const uint32_t color=0x38FFE0C0;
             native.push_back({{x,y,z,2.25f},color,{0,0},0});
             native.push_back({{x,y+quad_height,z,2.25f},color,{0,1},0});
@@ -929,7 +962,7 @@ private:
             std::memcpy(old_cb.data()+legacy_prefix+old_globals+i*old_quad,&metadata_[i],old_quad);
         old_dcb_=Upload(old_cb.data(),old_cb.size());
         for (const auto page:pages_) {
-            if (F793Benchmark && Samples==2) {
+            if (F793Benchmark && Samples==2 && !GatherBenchmark) {
                 auto admission=gpu::BuildParticleSharedCoverage(expanded_,metadata_,p,
                                                                  page,Samples,true);
                 std::printf("shared page %u..%u: rejection %u, sum/union %.1f/%.1f, "
@@ -954,7 +987,7 @@ private:
             std::memcpy(cb.data()+sizeof(dc)+sizeof(globals),metadata_.data(),
                         metadata_.size()*sizeof(metadata_[0]));
             page_dcbs_.push_back(Upload(cb.data(),cb.size()));
-            if (F793Benchmark && Samples==2) {
+            if (F793Benchmark && Samples==2 && !GatherBenchmark) {
                 auto field_cb=cb;
                 const size_t first_slot=sizeof(dc)+sizeof(globals);
                 auto field_globals=globals;
@@ -1279,6 +1312,8 @@ int main(int argc,char** argv) {
                 CoverageBenchmark=true;
             } else if (std::strcmp(argv[arg],"--coverage-baseline")==0) {
                 CoverageBenchmark=F793Benchmark=true;
+            } else if (std::strcmp(argv[arg],"--gather")==0) {
+                GatherBenchmark=CoverageBenchmark=F793Benchmark=SharedOff=true;
             } else if (std::strcmp(argv[arg],"--scene")==0 && arg+1<argc) {
                 const char* scene=argv[++arg];
                 Require(std::strcmp(scene,"occluded")==0 ||
@@ -1340,7 +1375,7 @@ int main(int argc,char** argv) {
                     D3DCOMPILE_OPTIMIZATION_LEVEL3:D3DCOMPILE_OPTIMIZATION_LEVEL1;
             } else {
                 throw std::runtime_error("usage: new_smoke_dof_gpu_bench "
-                    "[--coverage|--coverage-baseline] "
+                    "[--coverage|--coverage-baseline|--gather] "
                     "[--height 720|2160] [--width 320..4096] [--radius px] "
                     "[--samples 2|8] [--quads 1..64] "
                     "[--quad-scale .25..1] "
@@ -1352,6 +1387,10 @@ int main(int argc,char** argv) {
         }
         if (requested_width) W=requested_width;
         if (CoverageBenchmark && !samples_set) Samples=2;
+        Require(!GatherBenchmark || Samples==2,
+                "--gather requires the production 2x MSAA float-bounds variant");
+        Require(!GatherBenchmark || CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
+                "--gather compares both production shaders at O1");
         Require(!CoverageBenchmark || F793Benchmark ||
                     CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
                 "non-f793 coverage comparison requires both production variants at O1");
@@ -1362,6 +1401,7 @@ int main(int argc,char** argv) {
                         "radius %.3f px, %u quads x %u layers, quad scale %.2f, %s scene, native %s, "
                         "candidate %s/%s; "
                         "%u warmups and %u measured runs/variant in ABBA order\n",
+                        GatherBenchmark?"production UINT versus FLOAT gather":
                         F793Benchmark?"f793 shared coverage":"c591 quantized",W,H,Samples,
                         TargetRadius,Quads,Batches,QuadScale,
                         SceneVisible?"all-visible":"z4 wall with openings",
@@ -1369,6 +1409,9 @@ int main(int argc,char** argv) {
                         SharedOff?"direct fallback":"shared field",
                         CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL3?"O3":"O1",
                         Warmups,MeasuredPairs);
+            if (GatherBenchmark)
+                std::puts("Gather workload: ordered per-quad view Z 8/10/12/16, identical geometry, "
+                          "textures, range/mask and O1 flags; only UINT versus FLOAT bounds switch.");
             const auto cold_start=std::chrono::steady_clock::now();
             Bench bench;
             const double cold_seconds=std::chrono::duration<double>(
@@ -1396,21 +1439,26 @@ int main(int argc,char** argv) {
                 }
             Require(before.size()==MeasuredPairs && after.size()==MeasuredPairs,
                     "coverage ABBA pairing lost a measurement");
-            Print(F793Benchmark?"f793e2d baseline":"c591162 blur-aware pass2",before);
-            Print(F793Benchmark?"shared coverage candidate":"quantized blur-aware pass2",after);
+            Print(GatherBenchmark?"production UINT bounds/direct pass2":
+                  F793Benchmark?"f793e2d baseline":"c591162 blur-aware pass2",before);
+            Print(GatherBenchmark?"production FLOAT gather/direct pass2":
+                  F793Benchmark?"shared coverage candidate":"quantized blur-aware pass2",after);
             const auto difference=Compare(before.front(),after.front(),
+                GatherBenchmark?"production UINT/FLOAT gather resolved":
                 F793Benchmark?"f793/shared resolved":"c591/quantized resolved");
             if (!SceneVisible) CountBlurredWallPixels(before.front());
             Result before_samples,after_samples;
             before_samples.rgba=before.front().sample_rgba;
             after_samples.rgba=after.front().sample_rgba;
             const auto sample_difference=Compare(before_samples,after_samples,
+                GatherBenchmark?"production UINT/FLOAT gather physical MS samples (64x16 ROI)":
                 F793Benchmark?"f793/shared physical MS samples (64x16 ROI)":
                               "c591/quantized physical MS samples (64x16 ROI)");
             const std::string suffix=std::to_string(H)+"p-r"+std::to_string(int(TargetRadius))+
                 "-ms"+std::to_string(Samples)+(DepthLessEqual?"-lequal":"-less")+
                 (SceneVisible?"-visible":"-occluded")+
-                (F793Benchmark?"-f793-shared":
+                (GatherBenchmark?"-production-float-gather":
+                 F793Benchmark?"-f793-shared":
                                "-c591-quantized");
             WriteBmp(("coverage-before-"+suffix+".bmp").c_str(),before.front());
             WriteBmp(("coverage-after-"+suffix+".bmp").c_str(),after.front());
@@ -1424,6 +1472,10 @@ int main(int argc,char** argv) {
                 100*(old_ms-new_ms)/std::max(old_ms,1e-9),
                 100*(Percentile(old_composite,.5)-Percentile(new_composite,.5))/
                     std::max(Percentile(old_composite,.5),1e-9));
+            if (GatherBenchmark) {
+                Require(difference.maximum<=1e-5f && sample_difference.maximum<=1e-5f,
+                        "production FLOAT gather changed resolved or physical-MS output");
+            }
             Require(difference.maximum<=.003f && difference.rms<=.0003 &&
                     difference.active_rms<=.0006 &&
                     difference.rgb_energy_percent<=.15 && difference.alpha_energy_percent<=.15,

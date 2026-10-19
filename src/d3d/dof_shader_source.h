@@ -26,8 +26,9 @@ inline std::string DofStaticPassSource(std::string_view entry, uint32_t input_sa
     return source;
 }
 
-inline std::string DofParticleRangeSource(uint32_t samples) {
-    return "#define PARTICLE_DOF_SAMPLES " + std::to_string(samples) + "\n" + kParticleDofDepthRangeHlsl;
+inline std::string DofParticleRangeSource(uint32_t samples, bool float_bounds = false) {
+    const std::string mode = samples == 2 && float_bounds ? "#define PARTICLE_DOF_FLOAT_BOUNDS 1\n" : "";
+    return mode + "#define PARTICLE_DOF_SAMPLES " + std::to_string(samples) + "\n" + kParticleDofDepthRangeHlsl;
 }
 
 // Native screen-space programs leave position.w at zero. This is the renderer's existing
@@ -46,7 +47,7 @@ inline std::string DofParticleVertexSource(uint32_t pass) {
 }
 
 inline std::string DofParticlePixelSource(uint32_t samples, uint32_t blend, int alpha_function, bool alpha_kill,
-                                         uint32_t pass = 0) {
+                                         uint32_t pass = 0, bool float_bounds = false) {
     // Field/support/consumer never reevaluate a native material. Canonicalize
     // their dead source-alpha callbacks to keep the embedded family bounded.
     if (pass >= 3) {
@@ -56,7 +57,10 @@ inline std::string DofParticlePixelSource(uint32_t samples, uint32_t blend, int 
     }
     auto key = ParticleDofNativePixelKey(TexInfo{kTex2D});
     key.alphakill = alpha_kill ? 1 : 0;
-    return MakeParticleDofPixelShader(PixelHlsl(key), samples, blend, alpha_function, pass);
+    auto source = MakeParticleDofPixelShader(PixelHlsl(key), samples, blend, alpha_function, pass);
+    if (samples == 2 && pass != 4 && float_bounds && !source.empty())
+        source.insert(0, "#define PARTICLE_DOF_FLOAT_BOUNDS 1\n");
+    return source;
 }
 
 } // namespace gpu
