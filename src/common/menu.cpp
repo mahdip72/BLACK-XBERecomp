@@ -1021,6 +1021,11 @@ void DrawDofPanel() {
         DofViewUnitsSlider("Weapon focus transition", o.dof_weapon_transition, o.dof_weapon_sharp_depth);
         ImGui::Separator();
         if (ImGui::CollapsingHeader("GPU frame timings")) {
+            bool coverage_reuse = gpu::DofParticleCoverageReuseEnabled();
+            if (ImGui::Checkbox(Ui("Particle coverage reuse", false).c_str(), &coverage_reuse))
+                gpu::SetDofParticleCoverageReuseEnabled(coverage_reuse);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Reuses shared particle coverage only for qualifying batches with identical depth.\nOther batches fall back automatically.\nVisual quality is unchanged; no restart is needed.");
             bool profiling = gpu::DofGpuProfilingEnabled();
             if (ImGui::Checkbox("Measure GPU stages", &profiling)) gpu::SetDofGpuProfilingEnabled(profiling);
             ImGui::TextDisabled("Capture adds timing markers; off for normal play.");

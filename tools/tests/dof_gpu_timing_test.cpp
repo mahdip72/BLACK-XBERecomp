@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <stdexcept>
 #include <vector>
 
@@ -140,6 +141,19 @@ struct Gpu {
 void Run(bool hardware) {
     Gpu gpu(hardware);
     gpu::DofGpuTiming timer;
+    using Stage = gpu::DofGpuTiming::Stage;
+    static_assert(uint32_t(Stage::ParticleDirect) == 14 &&
+                  uint32_t(Stage::ParticleHierarchy) == 15 &&
+                  uint32_t(Stage::SdkDownsampleDepth) == 16 &&
+                  uint32_t(Stage::SdkComposite) == 20 &&
+                  uint32_t(Stage::ParticleSupport) == 21 &&
+                  uint32_t(Stage::ParticleTransmission) == 22);
+    Check(gpu::DofGpuTiming::CountsTowardDofTotal(Stage::ParticleHierarchy) &&
+          gpu::DofGpuTiming::CountsTowardDofTotal(Stage::ParticleSupport) &&
+          gpu::DofGpuTiming::CountsTowardDofTotal(Stage::ParticleTransmission) &&
+          !gpu::DofGpuTiming::CountsTowardDofTotal(Stage::SdkBlur) &&
+          gpu::DofGpuTiming::IsSdkSubpass(Stage::SdkBlur),
+          "top-level and nested stage classification invalid");
     Check(timer.Init(gpu.device.Get(), gpu.queue.Get()), "timestamp timer unavailable");
     Check(!gpu::DofGpuProfilingEnabled(), "profiling must default off");
     gpu::SetDofGpuProfilingEnabled(true);
@@ -147,34 +161,78 @@ void Run(bool hardware) {
 
     timer.BeginFrame(1, true, 0);
     gpu.Submit(timer, 1, false, [&](ID3D12GraphicsCommandList* list) {
-        auto scope = timer.Measure(gpu::DofGpuTiming::Stage::ScenePrepare, list);
-        gpu.Copy(list, 32);
+        {
+            auto scope = timer.Measure(Stage::ScenePrepare, list);
+            gpu.Copy(list, 32);
+        }
+        {
+            auto scope = timer.Measure(Stage::ParticleHierarchy, list);
+            gpu.Copy(list, 4);
+        }
+        {
+            auto scope = timer.Measure(Stage::ParticleSupport, list);
+            gpu.Copy(list, 4);
+        }
+        {
+            auto scope = timer.Measure(Stage::ParticleTransmission, list);
+            gpu.Copy(list, 4);
+        }
     });
     gpu.Submit(timer, 1, true, [&](ID3D12GraphicsCommandList* list) {
-        auto scope = timer.Measure(gpu::DofGpuTiming::Stage::Sdk, list);
-        gpu.Copy(list, 32);
+        auto sdk_whole = timer.Measure(Stage::Sdk, list);
+        for (Stage child : {Stage::SdkDownsampleDepth, Stage::SdkDownsampleColor,
+                            Stage::SdkDilate, Stage::SdkBlur, Stage::SdkComposite}) {
+            auto scope = timer.Measure(child, list);
+            gpu.Copy(list, 8);
+        }
     });
     // A stale completed-fence value must not expose an in-flight readback.
     timer.Collect(0);
     auto before = timer.TakeReport();
-    Check(before.complete_frames == 0 && before.pending_frames == 1,
+    Check(before.complete_frames == 0 && before.pending_frames == 1 &&
+          before.frame_sample_count == 0,
           "in-flight frame was published");
     gpu.Wait(gpu.signaled);
     timer.Collect(gpu.fence->GetCompletedValue());
     auto report = timer.TakeReport();
-    using Stage = gpu::DofGpuTiming::Stage;
     const auto& prepare = report.stage[uint32_t(Stage::ScenePrepare)];
     const auto& sdk = report.stage[uint32_t(Stage::Sdk)];
+    const auto& hierarchy = report.stage[uint32_t(Stage::ParticleHierarchy)];
+    const auto& support = report.stage[uint32_t(Stage::ParticleSupport)];
+    const auto& transmission = report.stage[uint32_t(Stage::ParticleTransmission)];
     const auto& total = report.stage[uint32_t(Stage::DofTotal)];
     const auto& zero = report.stage[uint32_t(Stage::WeaponPack)];
     Check(report.complete_frames == 1 && report.invalid_frames == 0, "two-submit frame invalid");
-    Check(prepare.intervals == 1 && sdk.intervals == 1 && total.intervals == 2,
+    Check(prepare.intervals == 1 && sdk.intervals == 1 && hierarchy.intervals == 1 &&
+          support.intervals == 1 && transmission.intervals == 1 && total.intervals == 5,
           "stage intervals across submissions lost");
-    Check(prepare.total_ms > 0 && sdk.total_ms > 0 &&
-          std::fabs(total.total_ms - prepare.total_ms - sdk.total_ms) < 1e-5,
+    Check(prepare.total_ms > 0 && sdk.total_ms > 0 && hierarchy.total_ms > 0 &&
+          std::fabs(total.total_ms - prepare.total_ms - sdk.total_ms - hierarchy.total_ms -
+                    support.total_ms - transmission.total_ms) < 1e-5,
           "timestamp conversion or derived total invalid");
+    for (Stage child : {Stage::SdkDownsampleDepth, Stage::SdkDownsampleColor,
+                        Stage::SdkDilate, Stage::SdkBlur, Stage::SdkComposite})
+        Check(report.stage[uint32_t(child)].intervals == 1,
+              "SDK subpass marker missing");
     Check(zero.total_ms == 0 && zero.median_frame_ms == 0 && zero.percentile_frames == 1,
           "inactive stage was not a zero frame sample");
+    Check(report.frame_sample_count == 1 && report.frame_sample_evicted == 0 &&
+          report.frequency != 0, "completed frame sample missing");
+    const auto& sample = report.frame_samples[0];
+    Check(sample.frame_id == 1 && sample.fence == gpu.signaled &&
+          sample.intervals[uint32_t(Stage::DofTotal)] == 5 &&
+          sample.intervals[uint32_t(Stage::Sdk)] == 1 &&
+          sample.intervals[uint32_t(Stage::SdkComposite)] == 1 &&
+          sample.ticks[uint32_t(Stage::WeaponPack)] == 0 &&
+          sample.intervals[uint32_t(Stage::WeaponPack)] == 0,
+          "frame sample identity, intervals, or zero stage invalid");
+    Check(sample.ticks[uint32_t(Stage::DofTotal)] ==
+          sample.ticks[uint32_t(Stage::ScenePrepare)] +
+          sample.ticks[uint32_t(Stage::Sdk)] +
+          sample.ticks[uint32_t(Stage::ParticleHierarchy)] +
+          sample.ticks[uint32_t(Stage::ParticleSupport)] +
+          sample.ticks[uint32_t(Stage::ParticleTransmission)],
+          "nested SDK children were double-counted in frame total");
     gpu::PublishDofGpuReport(report);
     Check(gpu::GetDofGpuReport().complete_frames == 1, "published report mismatch");
 
@@ -188,7 +246,8 @@ void Run(bool hardware) {
     timer.Collect(gpu.fence->GetCompletedValue());
     report = timer.TakeReport();
     Check(report.complete_frames == 0 && report.invalid_frames == 1 &&
-          report.overflow_frames == 1 && report.dropped_intervals == 1,
+          report.overflow_frames == 1 && report.dropped_intervals == 1 &&
+          report.frame_sample_count == 0,
           "overflow frame was treated as a complete sample");
 
     // Hold completed-fence observation at zero to deterministically occupy
@@ -211,6 +270,11 @@ void Run(bool hardware) {
     report = timer.TakeReport();
     Check(report.complete_frames == gpu::DofGpuTiming::kSlots && report.invalid_frames == 0,
           "completed ring slots were not collected");
+    Check(report.frame_sample_count == gpu::DofGpuTiming::kSlots &&
+          report.frame_sample_evicted == 0, "completed ring frame samples missing");
+    for (uint32_t i = 0; i < gpu::DofGpuTiming::kSlots; ++i)
+        Check(report.frame_samples[i].frame_id == uint64_t(3 + i),
+              "completed frame samples are not ordered by frame ID");
 
     gpu::SetDofGpuProfilingEnabled(false);
     timer.BeginFrame(busy_frame + 1, gpu::DofGpuProfilingEnabled(), gpu.fence->GetCompletedValue());
@@ -221,10 +285,12 @@ void Run(bool hardware) {
     gpu.Wait(gpu.signaled);
     timer.Collect(gpu.fence->GetCompletedValue());
     report = timer.TakeReport();
-    Check(report.complete_frames == 0 && report.invalid_frames == 0,
+    Check(report.complete_frames == 0 && report.invalid_frames == 0 &&
+          report.frame_sample_count == 0,
           "disabled profiler emitted a frame");
-    std::printf("DOF GPU timing %s PASS: two submits, fence gating, derived total, zero stage, "
-                "overflow, busy ring, opt-out\n", hardware ? "hardware" : "WARP");
+    std::printf("DOF GPU timing %s PASS: two submits, fence gating, SDK children, "
+                "frame samples, derived total, zero stage, overflow, busy ring, opt-out\n",
+                hardware ? "hardware" : "WARP");
 }
 } // namespace
 

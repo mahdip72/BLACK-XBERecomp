@@ -150,7 +150,7 @@ bool Build(std::map<Key, Record>& records) {
     }
     if (!AddPair(records, gpu::kParticleDofAtlasFilterHlsl, "vs", "filter_ps")) return false;
 
-    for (uint32_t pass = 0; pass <= 2; ++pass) {
+    for (uint32_t pass = 0; pass <= 5; ++pass) {
         if (!Add(records, gpu::DofParticleVertexSource(pass), "main", "vs_5_0")) return false;
     }
     constexpr int alpha_functions[] = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -165,6 +165,11 @@ bool Build(std::map<Key, Record>& records) {
                     }
                 }
             }
+        }
+    }
+    for (uint32_t pass = 3; pass <= 5; ++pass) {
+        for (uint32_t blend = 0; blend < (pass == 4 ? 2u : 1u); ++blend) {
+            if (!Add(records, gpu::DofParticlePixelSource(2, blend, 0, false, pass), "main", "ps_5_0")) return false;
         }
     }
     return true;

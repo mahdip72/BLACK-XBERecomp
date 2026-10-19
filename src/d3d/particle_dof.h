@@ -31,7 +31,7 @@ struct ParticleDofGlobals {
     float viewport[4];  // x, y, width, height in this target's pixels
     float target[4];    // width, height, quad count, 0=LESS / 1=LEQUAL
     float atlas_target[4]; // atlas width/height, first quad and count for the filter draw
-    // ViewZ = x / (raw depth - y). z enables shader destination coverage only for verified depth.
+    // ViewZ = x / (raw depth - y). z enables verified destination coverage; w is reserved.
     float projection[4];
 };
 

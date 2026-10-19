@@ -130,6 +130,9 @@ target_link_libraries(viewmodel_dof_test PRIVATE d3d11 d3dcompiler dxgi dxguid)
 add_executable(particle_small_radius_cpu tools/tests/particle_small_radius_cpu.cpp)
 target_include_directories(particle_small_radius_cpu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+add_executable(particle_coverage_cpu tools/tests/particle_coverage_cpu.cpp)
+target_include_directories(particle_coverage_cpu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
 # Official AMD FidelityFX DoF component and DX12 backend. The SDK itself is
 # prepared as a sparse, pinned checkout by tools/cmake/prepare_fidelityfx_sdk.ps1.
 option(BLACK_FIDELITYFX_DOF "Build BLACK's DoF adapter against the official FidelityFX SDK" ON)

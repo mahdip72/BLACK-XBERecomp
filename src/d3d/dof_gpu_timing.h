@@ -31,6 +31,14 @@ public:
         ParticleFilter,
         ParticleComposite,
         ParticleDirect,
+        ParticleHierarchy,
+        SdkDownsampleDepth,
+        SdkDownsampleColor,
+        SdkDilate,
+        SdkBlur,
+        SdkComposite,
+        ParticleSupport,
+        ParticleTransmission,
         Count
     };
 
@@ -38,6 +46,30 @@ public:
     static constexpr uint32_t kSlots = 8;
     static constexpr uint32_t kIntervalsPerFrame = 512;
     static constexpr uint32_t kSamplesPerReport = 240;
+    static constexpr uint32_t kFrameSamplesPerReport = 240;
+    static_assert(kIntervalsPerFrame <= 0xffff);
+
+    // SDK children are nested inside Sdk. Only top-level stages contribute to
+    // DofTotal; adding both the parent and its children would double-count.
+    static constexpr bool CountsTowardDofTotal(Stage stage) {
+        return (stage > Stage::DofTotal && stage < Stage::SdkDownsampleDepth) ||
+               stage == Stage::ParticleSupport || stage == Stage::ParticleTransmission;
+    }
+
+    static constexpr bool IsSdkSubpass(Stage stage) {
+        return stage >= Stage::SdkDownsampleDepth && stage <= Stage::SdkComposite;
+    }
+
+    // Valid, final-fence-completed native frame. Ticks retain queue-frequency
+    // precision; inactive stages have zero ticks and intervals. Frame IDs permit
+    // alignment across live benchmark streams. Missing IDs must be treated as
+    // losses, not as zero-cost frames.
+    struct FrameSample {
+        uint64_t frame_id = 0;
+        uint64_t fence = 0;
+        std::array<uint64_t, kStageCount> ticks{};
+        std::array<uint16_t, kStageCount> intervals{};
+    };
 
     struct StageReport {
         uint64_t intervals = 0;
@@ -60,8 +92,11 @@ public:
         uint64_t auto_closed_scopes = 0;
         uint64_t unresolved_frames = 0;
         uint64_t readback_errors = 0;
+        uint64_t frame_sample_evicted = 0;
         uint32_t pending_frames = 0;
+        uint32_t frame_sample_count = 0;
         std::array<StageReport, kStageCount> stage{};
+        std::array<FrameSample, kFrameSamplesPerReport> frame_samples{};
     };
 
     class Scope {
@@ -123,6 +158,7 @@ public:
     }
 
     bool Available() const { return available_; }
+    bool Recording() const { return active_slot_ >= 0; }
 
     // Call once per native present before any timed draw. A frame with no
     // markers is still a valid zero-duration sample when timing is enabled.
@@ -224,9 +260,19 @@ public:
     // Map is read-only and never waits for GPU progress.
     void Collect(uint64_t completed_fence) {
         if (!available_) return;
+        std::array<uint32_t, kSlots> ready{};
+        uint32_t ready_count = 0;
         for (uint32_t i = 0; i < kSlots; ++i) {
+            const Slot& slot = slots_[i];
+            if (slot.state == SlotState::Pending && slot.fence && slot.fence <= completed_fence)
+                ready[ready_count++] = i;
+        }
+        std::sort(ready.begin(), ready.begin() + ready_count, [&](uint32_t a, uint32_t b) {
+            return slots_[a].frame_id < slots_[b].frame_id;
+        });
+        for (uint32_t r = 0; r < ready_count; ++r) {
+            const uint32_t i = ready[r];
             Slot& slot = slots_[i];
-            if (slot.state != SlotState::Pending || !slot.fence || slot.fence > completed_fence) continue;
             if (slot.used != slot.resolved) slot.invalid = true;
             std::array<uint64_t, kStageCount> ticks{};
             std::array<uint32_t, kStageCount> counts{};
@@ -246,10 +292,11 @@ public:
                         ticks[stage] += end - start;
                         ++counts[stage];
                     }
-                    for (uint32_t j = 1; j < kStageCount; ++j) {
-                        ticks[0] += ticks[j];
-                        counts[0] += counts[j];
-                    }
+                    for (uint32_t j = 1; j < kStageCount; ++j)
+                        if (CountsTowardDofTotal(Stage(j))) {
+                            ticks[0] += ticks[j];
+                            counts[0] += counts[j];
+                        }
                     D3D12_RANGE written{0, 0};
                     readback_->Unmap(0, &written);
                 }
@@ -259,6 +306,16 @@ public:
                 period_.overflow_frames += slot.overflow;
             } else {
                 ++period_.complete_frames;
+                FrameSample& sample = period_.frame_samples[period_.frame_sample_next];
+                sample.frame_id = slot.frame_id;
+                sample.fence = slot.fence;
+                sample.ticks = ticks;
+                for (uint32_t j = 0; j < kStageCount; ++j)
+                    sample.intervals[j] = uint16_t(counts[j]);
+                period_.frame_sample_next = (period_.frame_sample_next + 1) % kFrameSamplesPerReport;
+                period_.frame_sample_evicted += period_.frame_sample_count == kFrameSamplesPerReport;
+                period_.frame_sample_count = std::min(period_.frame_sample_count + 1,
+                                                      kFrameSamplesPerReport);
                 for (uint32_t j = 0; j < kStageCount; ++j) {
                     auto& stat = period_.stage[j];
                     const double ms = double(ticks[j]) * 1000.0 / double(frequency_);
@@ -287,6 +344,12 @@ public:
         out.auto_closed_scopes = period_.auto_closed_scopes;
         out.unresolved_frames = period_.unresolved_frames;
         out.readback_errors = period_.readback_errors;
+        out.frame_sample_evicted = period_.frame_sample_evicted;
+        out.frame_sample_count = period_.frame_sample_count;
+        const uint32_t first = period_.frame_sample_count == kFrameSamplesPerReport
+            ? period_.frame_sample_next : 0;
+        for (uint32_t i = 0; i < out.frame_sample_count; ++i)
+            out.frame_samples[i] = period_.frame_samples[(first + i) % kFrameSamplesPerReport];
         for (const Slot& slot : slots_) out.pending_frames += slot.state == SlotState::Pending;
         for (uint32_t i = 0; i < kStageCount; ++i) {
             const auto& src = period_.stage[i];
@@ -311,7 +374,10 @@ public:
         constexpr const char* names[] = {"DOF total", "scene prepare", "SDK whole", "scene compose",
             "weapon scene copy", "weapon depth copy", "weapon coverage", "weapon pack", "weapon compose",
             "particle depth copy", "particle range", "particle source", "particle filter",
-            "particle composite", "particle direct"};
+            "particle composite", "particle direct", "particle hierarchy",
+            "SDK depth downsample", "SDK color downsample", "SDK dilate", "SDK blur", "SDK composite",
+            "particle support", "particle transmission"};
+        static_assert(sizeof(names) / sizeof(names[0]) == kStageCount);
         const uint32_t index = uint32_t(stage);
         return index < kStageCount ? names[index] : "unknown";
     }
@@ -336,7 +402,10 @@ private:
         uint64_t complete_frames = 0, invalid_frames = 0, busy_frames = 0;
         uint64_t overflow_frames = 0, dropped_intervals = 0, auto_closed_scopes = 0;
         uint64_t unresolved_frames = 0, readback_errors = 0;
+        uint64_t frame_sample_evicted = 0;
+        uint32_t frame_sample_next = 0, frame_sample_count = 0;
         std::array<PeriodStage, kStageCount> stage{};
+        std::array<FrameSample, kFrameSamplesPerReport> frame_samples{};
     };
 
     uint32_t QueryIndex(uint32_t slot, uint32_t interval) const {

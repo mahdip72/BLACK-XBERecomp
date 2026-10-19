@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <mutex>
@@ -48,6 +49,7 @@
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_clear.h"
 #include "d3d/particle_dof_atlas.h"
+#include "d3d/particle_dof_shared_coverage.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "d3d/dof_shader_source.h"
 #include "d3d/dof_shader_library.h"
@@ -812,7 +814,7 @@ struct DrawShaders {
     uint32_t particle_samples = 0;  // only the verified, late native smoke variant
     uint32_t particle_blend = 0;    // 0 alpha-over, 1 native SRC_ALPHA/ONE additive or reverse-subtractive
     int particle_alpha_function = -1;
-    uint32_t particle_pass = 0;  // 0 direct aperture, 1 atlas source, 2 atlas composite
+    uint32_t particle_pass = 0;  // 0 direct, 1 source, 2 composite, 3 field, 4 shared composite, 5 support
     bool particle_coverage = false;  // verified depth; final shader replaces hardware depth coverage
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
@@ -896,6 +898,7 @@ private:
     void Begin();
     void Submit(bool wait, bool final_native_present = false);
     void BeginDofTiming();
+    void ExportDofTiming(const DofGpuTiming::Report& report);
     void WaitFence(uint64_t value);
     void SetFullViewport(uint32_t w, uint32_t h);
     void SetBlitTarget(D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t w, uint32_t h);
@@ -977,13 +980,19 @@ private:
     bool PrepareParticleDof(const State& s, Assembled& a, const PixelKey& pk, DrawShaders& sh, DrawTextures& stages);
     void ParticleDofSkipped(uint32_t reason, const char* message);
     bool EnsureParticleDofAtlas(uint32_t extent);
+    bool PrepareParticleSharedCoverage(uint32_t width, uint32_t height);
+    D3D12_CPU_DESCRIPTOR_HANDLE ParticleSharedView(uint32_t index) {
+        return ParticleDofRangeView(kParticleDofSnapshots + 3 + index);
+    }
     bool DrawParticleDofAtlas(const State& s, const Assembled& a, const PixelKey& pk,
         const DrawShaders& sh, DrawTextures& stages, const PsoKey& native_key, bool clamp);
     D3D12_CPU_DESCRIPTOR_HANDLE ParticleDofAtlasView(uint32_t index) {
         return ParticleDofRangeView(kParticleDofSnapshots + index);
     }
+    bool EnsureParticleDofDepthRange(uint32_t snapshot_index, uint32_t w, uint32_t h);
     bool ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* range,
-        D3D12_RESOURCE_STATES& range_state, uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h);
+        D3D12_RESOURCE_STATES& range_state,
+        uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h);
     D3D12_CPU_DESCRIPTOR_HANDLE ParticleDofRangeView(uint32_t index) {
         return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
             kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + index, rtv_inc_);
@@ -1019,7 +1028,9 @@ private:
     bool EnsureWeaponDofTiles(uint32_t w, uint32_t h);
     void RecordWeaponDofCoverage(const State& s, const Assembled& a, const DrawShaders& sh,
                                  const PsoKey& k, ID3D12PipelineState* native, uint32_t guest_width);
-    D3D12_CPU_DESCRIPTOR_HANDLE WeaponDofTileView() { return ParticleDofRangeView(kParticleDofSnapshots + 2); }
+    D3D12_CPU_DESCRIPTOR_HANDLE WeaponDofTileView() {
+        return ParticleDofRangeView(kParticleDofSnapshots + 2);
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE WeaponDofView(uint32_t target) {
         return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
             kDofLevels * kDofTargets + kDofLayerViews + target, rtv_inc_);
@@ -1204,6 +1215,12 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
     std::unique_ptr<DofPipelineCache> dof_pipelines_;
     DofGpuTiming dof_timing_;
+    // At most one bounded report can be in flight. Disk work never blocks the render
+    // thread; overloaded export batches are counted rather than queued indefinitely.
+    std::future<bool> dof_csv_write_;
+    uint64_t dof_csv_dropped_ = 0;
+    uint32_t dof_csv_pending_frames_ = 0;
+    bool dof_csv_started_ = false, dof_csv_failed_ = false;
     uint64_t dof_prime_signature_ = 0, dof_embedded_loads_ = 0, dof_embedded_missing_ = 0;
     enum class DofPreparation { Dormant, Drain, Queue, Cpu, Resources, Warm, Gpu, Complete };
     DofPreparation dof_preparation_ = DofPreparation::Dormant;
@@ -1284,6 +1301,12 @@ private:
         D3D12_RESOURCE_STATES atlas_states[2] = {};
         uint32_t atlas_extent = 0, atlas_failed = 0;
         uint64_t atlas_batches = 0, atlas_pages = 0, atlas_quads = 0, atlas_fallback = 0;
+        ComPtr<ID3D12Resource> shared[2]; // R8 2MSAA support, RG32F single-sample transmission
+        D3D12_RESOURCE_STATES shared_states[2] = {};
+        uint32_t shared_width = 0, shared_height = 0;
+        std::array<uint64_t, size_t(ParticleSharedReject::Total)> shared_admission{};
+        uint64_t shared_pages = 0, shared_unavailable = 0;
+        double shared_sum_area = 0, shared_union_area = 0;
         std::vector<D3D12_RECT> atlas_rects;
         struct Snapshot {
             ComPtr<ID3D12Resource> depth;
@@ -1470,7 +1493,7 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
 // RTVs: the targets' pool, then the back buffers, occlusion, output, SMAA and the DOF filter mips
 void D3D12Backend::CreateHeaps() {
     constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets +
-        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots + 3;
+        kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + kParticleDofSnapshots + 5;
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvTotal, false, rtv_heap_);
@@ -1585,9 +1608,14 @@ void D3D12Backend::BeginDofTiming() {
     if (enabled && presents_ && presents_ % 120 == 0) {
         const auto report = dof_timing_.TakeReport();
         PublishDofGpuReport(report);
+        ExportDofTiming(report);
         LOGR("DOF GPU timing: %llu complete frames, %llu invalid, %llu overflow, %llu busy; no GPU waits",
              (unsigned long long)report.complete_frames, (unsigned long long)report.invalid_frames,
              (unsigned long long)report.overflow_frames, (unsigned long long)report.busy_frames);
+        LOGR("DOF GPU settings at report: particle coverage reuse %s",
+             DofParticleCoverageReuseEnabled() ? "on" : "off");
+        // Keep the existing bounded summary format consumed by capture.ps1; raw rows
+        // belong only in the asynchronous CSV, never one log line per GPU interval.
         for (uint32_t i = 0; i < DofGpuTiming::kStageCount; ++i) {
             const auto& stat = report.stage[i];
             if (!stat.intervals) continue;
@@ -1596,6 +1624,63 @@ void D3D12Backend::BeginDofTiming() {
                  stat.percentile_frames, (unsigned long long)stat.intervals);
         }
     }
+}
+
+void D3D12Backend::ExportDofTiming(const DofGpuTiming::Report& report) {
+    if (!report.frame_sample_count || !report.frequency) return;
+    if (dof_csv_write_.valid()) {
+        if (dof_csv_write_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            dof_csv_dropped_ += report.frame_sample_count;
+            return;
+        }
+        bool written = false;
+        try { written = dof_csv_write_.get(); } catch (...) {}
+        if (!written) dof_csv_dropped_ += dof_csv_pending_frames_;
+        if (!written && !dof_csv_failed_) {
+            dof_csv_failed_ = true;
+            LOGR("DOF GPU frame export failed; profiling remains available in the settings report");
+        }
+    }
+    const auto path = app::ExeDir() / "logs" / "dof-gpu-frames.csv";
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const bool first = !dof_csv_started_;
+    const uint64_t dropped = dof_csv_dropped_;
+    try {
+        dof_csv_write_ = std::async(std::launch::async, [report, path, timestamp, first, dropped] {
+            std::error_code ec;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            if (ec) return false;
+            const bool header = first || !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
+            std::ofstream out(path, first ? std::ios::trunc : std::ios::app);
+            if (!out) return false;
+            if (header) {
+                out << "report_unix_ms,frame_id,fence,frequency,valid,invalid_frames,busy_frames,overflow_frames,"
+                       "dropped_intervals,auto_closed_scopes,unresolved_frames,readback_errors,pending_frames,"
+                       "frame_sample_evicted,export_dropped_frames";
+                for (uint32_t stage = 0; stage < DofGpuTiming::kStageCount; ++stage) {
+                    std::string name = DofGpuTiming::StageName(DofGpuTiming::Stage(stage));
+                    std::replace(name.begin(), name.end(), ' ', '_');
+                    out << ",s" << stage << '_' << name << "_ticks,s" << stage << '_' << name << "_intervals";
+                }
+                out << '\n';
+            }
+            for (uint32_t i = 0; i < report.frame_sample_count; ++i) {
+                const auto& frame = report.frame_samples[i];
+                out << timestamp << ',' << frame.frame_id << ',' << frame.fence << ',' << report.frequency << ",1,"
+                    << report.invalid_frames << ',' << report.busy_frames << ',' << report.overflow_frames << ','
+                    << report.dropped_intervals << ',' << report.auto_closed_scopes << ',' << report.unresolved_frames << ','
+                    << report.readback_errors << ',' << report.pending_frames << ',' << report.frame_sample_evicted << ',' << dropped;
+                for (uint32_t stage = 0; stage < DofGpuTiming::kStageCount; ++stage)
+                    out << ',' << frame.ticks[stage] << ',' << frame.intervals[stage];
+                out << '\n';
+            }
+            out.flush();
+            return bool(out);
+        });
+        dof_csv_started_ = true;
+        dof_csv_pending_frames_ = report.frame_sample_count;
+    } catch (...) { dof_csv_dropped_ += report.frame_sample_count; }
 }
 
 void D3D12Backend::Flush() { Submit(true); }
@@ -2184,7 +2269,8 @@ D3D12Backend::~D3D12Backend() {
     // The SDK owns resources referenced by recorded/in-flight commands, including a failed dispatch.
     bool particle_resources = false;
     for (const auto& snapshot : particle_dof_.snapshots) particle_resources |= bool(snapshot.depth);
-    if (ffx_dof_.Ready() || particle_resources || particle_dof_.atlas[0] || dof_timing_.Available()) Flush();
+    if (ffx_dof_.Ready() || particle_resources || particle_dof_.atlas[0] || particle_dof_.shared[0] ||
+        particle_dof_.shared[1] || dof_timing_.Available()) Flush();
     if (ffx_dof_.Ready()) ffx_dof_.Reset();
 }
 
@@ -2281,8 +2367,29 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     prepare_timing.End();
     auto sdk_timing = dof_timing_.Measure(DofGpuTiming::Stage::Sdk, cl_.Get());
+    struct SdkTiming {
+        DofGpuTiming* timer;
+        DofGpuTiming::Scope pass;
+    } sdk_pass{&dof_timing_, {}};
+    const FidelityFxDofTiming sdk_marks{&sdk_pass,
+        [](void* user, ID3D12GraphicsCommandList* list, FidelityFxDofPass pass, bool begin) noexcept {
+            auto& current = *static_cast<SdkTiming*>(user);
+            current.pass.End();
+            if (!begin) return;
+            DofGpuTiming::Stage stage;
+            switch (pass) {
+            case FidelityFxDofPass::DownsampleDepth: stage = DofGpuTiming::Stage::SdkDownsampleDepth; break;
+            case FidelityFxDofPass::DownsampleColor: stage = DofGpuTiming::Stage::SdkDownsampleColor; break;
+            case FidelityFxDofPass::Dilate: stage = DofGpuTiming::Stage::SdkDilate; break;
+            case FidelityFxDofPass::Blur: stage = DofGpuTiming::Stage::SdkBlur; break;
+            case FidelityFxDofPass::Composite: stage = DofGpuTiming::Stage::SdkComposite; break;
+            default: return;
+            }
+            current.pass = current.timer->Measure(stage, list);
+        }};
     bool dispatched = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
-                                        ffx_dof_targets_[2].Get(), c[10]);
+        ffx_dof_targets_[2].Get(), c[10], dof_timing_.Recording() ? &sdk_marks : nullptr);
+    sdk_pass.pass.End();
     sdk_timing.End();
     // The SDK switches descriptor heaps and compute root signatures. Its external textures return to their
     // entry states. Restore the engine's heaps/root and invalidate cached bindings even if dispatch failed.
@@ -2483,11 +2590,37 @@ void D3D12Backend::ParticleDofSkipped(uint32_t reason, const char* message) {
     LOGR("Particle DOF native fallback: %s", message);
 }
 
+bool D3D12Backend::EnsureParticleDofDepthRange(uint32_t index, uint32_t w, uint32_t h) {
+    auto& snapshot = particle_dof_.snapshots[index];
+    if (!w || !h) return false;
+    if (snapshot.range) {
+        const auto desc = snapshot.range->GetDesc();
+        if (desc.Width == w && desc.Height == h && desc.MipLevels == 1) return true;
+    }
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    auto desc = Texture2DDesc(DXGI_FORMAT_R32G32_UINT, w, h);
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ComPtr<ID3D12Resource> range;
+    if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&range)))) return false;
+    // Loading preparation already polled the retirement fence. Unexpected target changes
+    // retain the existing safe descriptor replacement rule, never overwrite in-flight RTVs.
+    if (snapshot.range_view_used && !dof_resources_quiescent_) Flush();
+    if (snapshot.range) Release(std::move(snapshot.range));
+    snapshot.range = std::move(range);
+    snapshot.range_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    snapshot.source = nullptr;
+    dev_->CreateRenderTargetView(snapshot.range.Get(), nullptr, ParticleDofRangeView(index));
+    snapshot.range_view_used = true;
+    return true;
+}
+
 bool D3D12Backend::ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* range,
     D3D12_RESOURCE_STATES& range_state, uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h) {
     const auto source = DofParticleRangeSource(samples);
     auto* pipeline = EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_UINT, -1, true);
     if (!pipeline) return false;
+    auto range_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleRange, cl_.Get());
     const uint32_t slot = AllocSrvSlots(4);
     for (uint32_t i = 0; i < 4; ++i) {
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
@@ -2671,24 +2804,8 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
         snapshot->source = nullptr;
     }
     const uint32_t snapshot_index = uint32_t(snapshot - p.snapshots);
-    if (samples > 1 && (!snapshot->range || snapshot->range->GetDesc().Width != desc.Width ||
-        snapshot->range->GetDesc().Height != desc.Height)) {
-        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-        auto range_desc = Texture2DDesc(DXGI_FORMAT_R32G32_UINT, rt->w, rt->h);
-        range_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        ComPtr<ID3D12Resource> range;
-        if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &range_desc,
-            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&range)))) {
-            ParticleDofSkipped(7, "MSAA depth range allocation failed"); return false;
-        }
-        // An RTV slot cannot be replaced while earlier recorded work can still refer to it.
-        if (snapshot->range_view_used) Flush();
-        if (snapshot->range) Release(std::move(snapshot->range));
-        snapshot->range = std::move(range);
-        snapshot->range_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        dev_->CreateRenderTargetView(snapshot->range.Get(), nullptr, ParticleDofRangeView(snapshot_index));
-        snapshot->range_view_used = true;
-        snapshot->source = nullptr;
+    if (samples > 1 && !EnsureParticleDofDepthRange(snapshot_index, rt->w, rt->h)) {
+        ParticleDofSkipped(7, "MSAA depth range allocation failed"); return false;
     }
     snapshot->used = ++p.uses;
     if (snapshot->source != ds->res.Get() || snapshot->serial != particle_depth_serial_ || snapshot->frame != frame_) {
@@ -2704,7 +2821,6 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         copy_timing.End();
         if (samples > 1) {
-            auto range_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleRange, cl_.Get());
             const bool range_ready = ParticleDofDepthRange(snapshot->depth.Get(), snapshot->range.Get(),
                 snapshot->range_state, snapshot_index, samples, rt->w, rt->h);
             // The prepass replaced graphics bindings; restore the native targets even on a PSO failure.
@@ -2724,7 +2840,8 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
         stages.sv[2].Format = DXGI_FORMAT_R32G32_UINT;
         stages.sv[2].Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         stages.sv[2].ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        stages.sv[2].Texture2D.MipLevels = 1;
+        stages.sv[2].Texture2D.MipLevels = snapshot->range->GetDesc().MipLevels;
+        params.globals.projection[3] = float(stages.sv[2].Texture2D.MipLevels);
     }
     stages.res[3] = snapshot->depth.Get();
     stages.sv[3] = {};
@@ -3447,13 +3564,16 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
         }
         // Native 15BB00 uses GREATER; disabled alpha testing maps to ALWAYS. Other alpha/raster/mask
         // states remain supported by the same embedded library and a single asynchronous PSO worker.
-        for (uint32_t pass = 0; pass < 3; ++pass) {
+        for (uint32_t pass = 0; pass < 6; ++pass) {
+            const bool shared = pass >= 3;
+            if (shared && samples != 2) continue;
             uint64_t vertex_hash;
             auto* vs = CompileDof(DofParticleVertexSource(pass), "main", "vs_5_0", vertex_hash);
             if (!vs) { ready = false; continue; }
             for (int alpha : {4, 7}) for (bool kill : {false, true}) for (uint32_t blend = 0; blend < 2; ++blend) {
+                if (shared && (alpha != 4 || kill || (pass != 4 && blend))) continue;
                 uint64_t pixel_hash;
-                auto* ps = CompileDof(DofParticlePixelSource(samples, blend, alpha, kill, pass),
+                auto* ps = CompileDof(DofParticlePixelSource(samples, blend, shared ? 0 : alpha, kill, pass),
                                       "main", "ps_5_0", pixel_hash);
                 if (!ps) { ready = false; continue; }
                 for (uint32_t cull = 0; cull < 2; ++cull)
@@ -3469,12 +3589,18 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
                         state.zfunc = depth; state.src = 0x302; state.dst = blend ? 1 : 0x303; state.op = 0x8006;
                         state.wmask = mask; state.cull = state.ccw = cull;
                         state.msaa = samples > 1 ? samples : 0;
-                        if (pass == 1) {
+                        if (pass == 1 || pass == 3 || pass == 5) {
                             state.has_ds = state.zen = state.blend = state.msaa = 0;
                             state.rtfmt = kDofFormats[0]; state.wmask = D3D12_COLOR_WRITE_ENABLE_ALL;
+                            if (pass == 3) {
+                                state.rtfmt = DXGI_FORMAT_R32G32_FLOAT;
+                                state.cull = state.ccw = 0;
+                            } else if (pass == 5) {
+                                state.rtfmt = DXGI_FORMAT_R8_UNORM; state.msaa = 2;
+                            }
                         }
                         EnsureParticlePipeline(state, vs, ps);
-                        if (pass != 1) {
+                        if (pass != 1 && pass != 3 && pass != 5) {
                             if (blend) {
                                 state.op = 0x800B;  // native SRC_ALPHA/ONE reverse-subtract uses the same P/Q shader
                                 EnsureParticlePipeline(state, vs, ps);
@@ -3516,6 +3642,8 @@ bool D3D12Backend::PrepareDofResources(uint32_t width, uint32_t height, bool bal
     // At high native resolutions a small-CoC full-size quad may need a 4096 cell. Reserve that page
     // before gameplay instead of allocating it and flushing the current frame during the first reload.
     ready &= EnsureParticleDofAtlas(std::max(width, height) > 2044 ? 4096 : 2048);
+    // Optional optimization: allocation failure must not disable the established DOF path.
+    if (msaa_ == 2) PrepareParticleSharedCoverage(width, height);
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     const auto prepare_depth = [&](ComPtr<ID3D12Resource>& resource, D3D12_RESOURCE_STATES& state,
                                    uint32_t w, uint32_t h, uint32_t samples) {
@@ -3541,19 +3669,7 @@ bool D3D12Backend::PrepareDofResources(uint32_t width, uint32_t height, bool bal
         const uint32_t samples = i ? 1 : msaa_;
         ready &= prepare_depth(snapshot.depth, snapshot.state, w, h, samples);
         snapshot.source = nullptr;
-        if (samples > 1 && (!snapshot.range || snapshot.range->GetDesc().Width != w || snapshot.range->GetDesc().Height != h)) {
-            auto desc = Texture2DDesc(DXGI_FORMAT_R32G32_UINT, w, h);
-            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            ComPtr<ID3D12Resource> range;
-            if (SUCCEEDED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&range)))) {
-                if (snapshot.range) Release(std::move(snapshot.range));
-                snapshot.range = std::move(range);
-                snapshot.range_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                dev_->CreateRenderTargetView(snapshot.range.Get(), nullptr, ParticleDofRangeView(i));
-                snapshot.range_view_used = true;
-            } else ready = false;
-        }
+        if (samples > 1) ready &= EnsureParticleDofDepthRange(i, w, h);
     }
     return ready;
 }
@@ -4727,6 +4843,33 @@ void D3D12Backend::RecordWeaponDofCoverage(const State& s, const Assembled& a, c
     SetViewportScissor(s, guest_width);
 }
 
+bool D3D12Backend::PrepareParticleSharedCoverage(uint32_t width, uint32_t height) {
+    auto& p = particle_dof_;
+    if (p.shared[0] && p.shared[1] && p.shared_width == width && p.shared_height == height) return true;
+    // Only normal loading preparation may allocate these optional targets or replace
+    // their persistent RTVs. A later mismatched target uses the existing per-quad path.
+    if (!dof_resources_quiescent_ || !width || !height) return false;
+    const DXGI_FORMAT formats[] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32G32_FLOAT};
+    D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    ComPtr<ID3D12Resource> resources[2];
+    for (uint32_t i = 0; i < 2; ++i) {
+        auto desc = Texture2DDesc(formats[i], width, height);
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        desc.SampleDesc.Count = i == 0 ? 2 : 1;
+        if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&resources[i])))) return false;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (p.shared[i]) Release(std::move(p.shared[i]));
+        p.shared[i] = std::move(resources[i]);
+        p.shared_states[i] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        dev_->CreateRenderTargetView(p.shared[i].Get(), nullptr, ParticleSharedView(i));
+    }
+    p.shared_width = width; p.shared_height = height;
+    LOGR("Particle DOF shared coverage prepared: %ux%u support 2x R8, transmission RG32F", width, height);
+    return true;
+}
+
 bool D3D12Backend::EnsureParticleDofAtlas(uint32_t extent) {
     auto& p = particle_dof_;
     if (p.atlas[0] && p.atlas_extent == extent) return true;
@@ -4760,10 +4903,12 @@ bool D3D12Backend::EnsureParticleDofAtlas(uint32_t extent) {
 bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, const PixelKey& pk,
     const DrawShaders& sh, DrawTextures& stages, const PsoKey& native_key, bool clamp) {
     auto& p = particle_dof_;
+    const bool reuse_coverage = DofParticleCoverageReuseEnabled();
     Target* rt = bound_rt_;
     Target* ds = bound_ds_;
     uint32_t extent = p.atlas_extent ? p.atlas_extent : 2048;
     std::vector<ParticleDofAtlasPage> pages;
+    std::vector<ParticleSharedCoverage> shared_pages;
     uint32_t mapped = 0;
     try {
         pages = BuildParticleDofAtlasPages(p.vertices, p.params, p.quads, extent, extent);
@@ -4784,6 +4929,14 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         }
         // No vector growth is allowed once an earlier chunk may already have been composited.
         p.atlas_rects.reserve(p.quads.size());
+        // Preserve page-index alignment when disabled, without running admission
+        // work or counting deliberately disabled pages as rejected candidates.
+        shared_pages.resize(pages.size());
+        if (reuse_coverage) for (size_t i = 0; i < pages.size(); ++i) {
+            shared_pages[i] = BuildParticleSharedCoverage(p.vertices, p.quads, p.params, pages[i],
+                                                         sh.particle_samples, sh.particle_coverage);
+            ++p.shared_admission[size_t(shared_pages[i].rejection)];
+        }
     } catch (const std::bad_alloc&) {
         if (!(p.reported & (1u << 9))) {
             p.reported |= 1u << 9;
@@ -4797,17 +4950,29 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     source.particle_pass = 1;
     composite.particle_pass = 2;
     auto pipeline = [&](DrawShaders& variant, bool prepare) -> ID3D12PipelineState* {
-        DrawShaderKeys(s, a, pk, variant);
+        PixelKey pixel = pk;
+        if (variant.particle_pass >= 3) {
+            pixel.alphakill = 0;
+            variant.particle_alpha_function = 0;
+            if (variant.particle_pass != 4) variant.particle_blend = 0;
+        }
+        DrawShaderKeys(s, a, pixel, variant);
         EnsureVertexShader(s, a, variant);
-        EnsurePixelShader(pk, variant);
+        EnsurePixelShader(pixel, variant);
         if (!variant.vs_code || !variant.ps_code) return nullptr;
         PsoKey key = native_key;
         key.vs = variant.vh; key.ps = variant.ph;
-        if (prepare) {
+        if (prepare || variant.particle_pass == 3 || variant.particle_pass == 5) {
             key.has_ds = key.zen = key.zwrite = key.sten = key.blend = key.msaa = 0;
             key.has_rt = 1;
             key.rtfmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
             key.wmask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            if (variant.particle_pass == 3) {
+                key.rtfmt = DXGI_FORMAT_R32G32_FLOAT;
+                key.cull = key.ccw = 0;
+            } else if (variant.particle_pass == 5) {
+                key.rtfmt = DXGI_FORMAT_R8_UNORM; key.msaa = 2;
+            }
         } else if (variant.particle_coverage) {
             key.zen = 0;  // the shader preserves native/focused sample rejection and softens defocused coverage
         }
@@ -4827,6 +4992,20 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         return false;
     }
     if (!EnsureParticleDofAtlas(extent)) return false;
+    DrawShaders support = sh, field = sh, shared_composite = sh;
+    support.particle_pass = 5; field.particle_pass = 3; shared_composite.particle_pass = 4;
+    ID3D12PipelineState* support_pso = nullptr;
+    ID3D12PipelineState* field_pso = nullptr;
+    ID3D12PipelineState* shared_pso = nullptr;
+    const bool shared_candidate = reuse_coverage && std::any_of(shared_pages.begin(), shared_pages.end(),
+        [](const ParticleSharedCoverage& plan) { return bool(plan); });
+    if (shared_candidate && p.shared[0] && p.shared[1] && p.shared_width >= rt->w && p.shared_height >= rt->h) {
+        support_pso = pipeline(support, false);
+        field_pso = pipeline(field, false);
+        shared_pso = pipeline(shared_composite, false);
+    }
+    const bool shared_ready = reuse_coverage && support_pso && field_pso && shared_pso;
+    if (shared_candidate && !shared_ready) ++p.shared_unavailable;
     const auto restore_target = [&]() {
         const auto color = Cpu(rtv_heap_.Get(), rt->view, rtv_inc_);
         const auto depth = Cpu(dsv_heap_.Get(), ds->view, dsv_inc_);
@@ -4846,7 +5025,10 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         radii[q] = ParticleDofRadius(1.0f / p.vertices[q * 4].position[2], p.params.globals) * p.quads[q].atlas_scale;
     Alloc radius_constants = Upload(sizeof(radii), 256);
     std::memcpy(radius_constants.cpu, radii, sizeof(radii));
-    UploadVertexBuffers(a);
+    Alloc native_vertices = Upload(a.buffers[0].bytes, 16);
+    std::memcpy(native_vertices.cpu, a.buffers[0].src, a.buffers[0].bytes);
+    const D3D12_VERTEX_BUFFER_VIEW native_view{native_vertices.gpu, a.buffers[0].bytes, a.buffers[0].stride};
+    cl_->IASetVertexBuffers(0, 1, &native_view);
     Alloc indices = Upload(uint64_t(a.index_count) * sizeof(uint32_t), 4);
     std::memcpy(indices.cpu, a.index_src, size_t(a.index_count) * sizeof(uint32_t));
     D3D12_INDEX_BUFFER_VIEW index_view{indices.gpu, a.index_count * uint32_t(sizeof(uint32_t)), DXGI_FORMAT_R32_UINT};
@@ -4862,6 +5044,19 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     filtered.sv[1].Texture2D.MipLevels = 1;
     filtered.rt[1] = false;
     filtered.wide[1] = 0; filtered.blur[1] = false; filtered.k[1] = 1;
+    DrawTextures field_inputs = stages, shared_filtered = filtered;
+    field_inputs.res[1] = p.shared[0].Get();
+    field_inputs.info[1] = TexInfo{kTex2D};
+    field_inputs.sv[1] = {};
+    field_inputs.sv[1].Format = DXGI_FORMAT_R8_UNORM;
+    field_inputs.sv[1].ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    field_inputs.sv[1].Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    field_inputs.rt[1] = false; field_inputs.wide[1] = 0; field_inputs.blur[1] = false; field_inputs.k[1] = 1;
+    shared_filtered.res[2] = p.shared[1].Get();
+    shared_filtered.info[2] = TexInfo{kTex2D};
+    shared_filtered.sv[2] = filtered.sv[1];
+    shared_filtered.sv[2].Format = DXGI_FORMAT_R32G32_FLOAT;
+    shared_filtered.rt[2] = false; shared_filtered.wide[2] = 0; shared_filtered.blur[2] = false; shared_filtered.k[2] = 1;
     DrawTextures unfiltered = stages;
     unfiltered.res[0] = p.atlas[0].Get();
     unfiltered.info[0] = TexInfo{kTex2D};
@@ -4869,7 +5064,10 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     GuestExtent size{};
     SurfaceSize(s.rt, size.w, size.h);
     p.globals.atlas_target[0] = p.globals.atlas_target[1] = float(extent);
-    for (const auto& page : pages) {
+    for (size_t page_index = 0; page_index < pages.size(); ++page_index) {
+        const auto& page = pages[page_index];
+        const auto& shared = shared_pages[page_index];
+        const bool use_shared = shared_ready && bool(shared);
         p.globals.atlas_target[2] = float(page.first_quad);
         p.globals.atlas_target[3] = float(page.quad_count);
         DrawConstants constants{};
@@ -4909,12 +5107,61 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             cl_->DrawInstanced(6, page.quad_count, 0, 0);
             Transition(p.atlas[1].Get(), p.atlas_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
+        if (use_shared) {
+            const D3D12_RECT box{shared.bounds[0], shared.bounds[1], shared.bounds[2], shared.bounds[3]};
+            Alloc field_vertices = Upload(sizeof(shared.vertices), 16);
+            std::memcpy(field_vertices.cpu, shared.vertices.data(), sizeof(shared.vertices));
+            const D3D12_VERTEX_BUFFER_VIEW field_vb{field_vertices.gpu, UINT(sizeof(shared.vertices)), sizeof(NativeParticleVertex)};
+            // A synthetic rectangle uses SV_VertexID/4==0. Only its representative
+            // metadata is needed; native page IDs/metadata remain unchanged for final blends.
+            auto globals = p.globals; globals.target[2] = 1;
+            Alloc field_constants = Upload(sizeof(constants) + sizeof(globals) + sizeof(ParticleDofQuad), 256);
+            auto* bytes = static_cast<uint8_t*>(field_constants.cpu);
+            std::memcpy(bytes, &constants, sizeof(constants));
+            std::memcpy(bytes + sizeof(constants), &globals, sizeof(globals));
+            std::memcpy(bytes + sizeof(constants) + sizeof(globals), &p.quads[page.first_quad], sizeof(ParticleDofQuad));
+            // Keep the original target's pixel-coordinate viewport even though scratch
+            // resources were reserved at the largest native extent during loading.
+            restore_target();
+            SetViewportScissor(s, size.w);
+            cl_->RSSetScissorRects(1, &box);
+            auto support_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleSupport, cl_.Get());
+            Transition(p.shared[0].Get(), p.shared_states[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const auto mask_view = ParticleSharedView(0);
+            cl_->OMSetRenderTargets(1, &mask_view, FALSE, nullptr);
+            const float zero[4] = {};
+            cl_->ClearRenderTargetView(mask_view, zero, 1, &box);
+            cl_->SetPipelineState(support_pso);
+            cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
+            cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
+            cl_->IASetVertexBuffers(0, 1, &native_view);
+            cl_->IASetIndexBuffer(&index_view);
+            cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            SetTextureViewsAndSamplers(s, filtered, clamp);
+            cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
+            Transition(p.shared[0].Get(), p.shared_states[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            support_timing.End();
+
+            auto field_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleTransmission, cl_.Get());
+            Transition(p.shared[1].Get(), p.shared_states[1], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const auto field_view = ParticleSharedView(1);
+            cl_->OMSetRenderTargets(1, &field_view, FALSE, nullptr);
+            cl_->IASetVertexBuffers(0, 1, &field_vb);
+            cl_->SetGraphicsRootConstantBufferView(1, field_constants.gpu);
+            cl_->SetPipelineState(field_pso);
+            SetTextureViewsAndSamplers(s, field_inputs, clamp);
+            cl_->DrawIndexedInstanced(6, 1, 0, 0, 0);
+            Transition(p.shared[1].Get(), p.shared_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            cl_->IASetVertexBuffers(0, 1, &native_view);
+            ++p.shared_pages;
+            p.shared_sum_area += shared.sum_area; p.shared_union_area += shared.union_area;
+        }
         auto composite_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleComposite, cl_.Get());
         restore_target();
-        cl_->SetPipelineState(composite_pso);
+        cl_->SetPipelineState(use_shared ? shared_pso : composite_pso);
         cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
         cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
-        SetTextureViewsAndSamplers(s, filtered, clamp);
+        SetTextureViewsAndSamplers(s, use_shared ? shared_filtered : filtered, clamp);
         SetViewportScissor(s, size.w);
         SetBlendFactorStencilRef(s, native_key);
         cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -5787,6 +6034,18 @@ void D3D12Backend::Present(const Surface& front) {
         LOGR("Particle DOF destination coverage totals: %llu blur-aware batches, %llu unknown depth, %llu varying native depth",
              (unsigned long long)particle.coverage_batches, (unsigned long long)particle.coverage_unknown,
              (unsigned long long)particle.coverage_varying_depth);
+        const auto& shared = particle.shared_admission;
+        LOGR("Particle DOF shared coverage: %llu admitted/%llu used pages, %llu unavailable batches, %.0f summed/%.0f union pixels; "
+             "reject samples %llu, projection %llu, count %llu, mapping %llu, depth %llu, bounds %llu, overlap %llu",
+             (unsigned long long)shared[size_t(ParticleSharedReject::None)], (unsigned long long)particle.shared_pages,
+             (unsigned long long)particle.shared_unavailable, particle.shared_sum_area, particle.shared_union_area,
+             (unsigned long long)shared[size_t(ParticleSharedReject::Samples)],
+             (unsigned long long)shared[size_t(ParticleSharedReject::Projection)],
+             (unsigned long long)shared[size_t(ParticleSharedReject::Count)],
+             (unsigned long long)shared[size_t(ParticleSharedReject::Mapping)],
+             (unsigned long long)shared[size_t(ParticleSharedReject::Depth)],
+             (unsigned long long)shared[size_t(ParticleSharedReject::Bounds)],
+             (unsigned long long)shared[size_t(ParticleSharedReject::Overlap)]);
     }
     particle.previous_world = particle.world_valid;
     particle.marker = particle.world_valid = false;

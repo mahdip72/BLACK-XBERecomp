@@ -25,7 +25,8 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 struct Counters { unsigned static_pairs=0,range_pairs=0,atlas_pairs=0,particle_vs=0,
-                           particle_ps=0,coverage_ps=0,tile_vs=0,lookups=0; };
+                           particle_ps=0,shared_vs=0,shared_ps=0,
+                           coverage_ps=0,tile_vs=0,lookups=0; };
 void Check(bool value,const char* message) {
     if (!value) throw std::runtime_error(message);
 }
@@ -103,6 +104,18 @@ void CheckParticleMatrix(Counters& count) {
         RequireEmbedded(source,"main","vs_5_0",count);
         ++count.particle_vs;
     }
+    // The shared-field stages have independent consumer keys even where the
+    // generated source deduplicates to the native pass-0 vertex shader.
+    for (uint32_t pass:{3u,4u,5u}) {
+        const auto source=gpu::DofParticleVertexSource(pass);
+        Check(!source.empty(),"particle VS source generator rejected a shared-field pass");
+        RequireEmbedded(source,"main","vs_5_0",count);
+        ++count.shared_vs;
+    }
+    Check(gpu::DofParticleVertexSource(3)==gpu::DofParticleVertexSource(0) &&
+          gpu::DofParticleVertexSource(4)==gpu::DofParticleVertexSource(0) &&
+          gpu::DofParticleVertexSource(5)==gpu::DofParticleVertexSource(0),
+          "shared-field particle VS sources no longer canonicalize to the native pass-0 source");
     for (uint32_t pass:{0u,1u,2u})
         for (uint32_t samples:{1u,2u,4u,8u})
             for (uint32_t blend:{0u,1u})
@@ -114,7 +127,30 @@ void CheckParticleMatrix(Counters& count) {
                         RequireEmbedded(source,"main","ps_5_0",count);
                         ++count.particle_ps;
                     }
-    Check(count.particle_vs==3 && count.particle_ps==384,
+    // Shared-field consumers only use native 2x samples and do not depend on
+    // material alpha state. Pass 4 alone has both blend modes; passes 3 and 5
+    // canonicalize to blend 0. Check every shipped key and prove caller-state
+    // aliases resolve to the same canonical source.
+    for (uint32_t pass:{3u,4u,5u}) {
+        const uint32_t blend_count=pass==4 ? 2u : 1u;
+        for (uint32_t blend=0;blend<blend_count;++blend) {
+            const auto canonical=gpu::DofParticlePixelSource(2,blend,0,false,pass);
+            Check(!canonical.empty(),"shared-field particle PS source generator rejected a canonical key");
+            RequireEmbedded(canonical,"main","ps_5_0",count);
+            ++count.shared_ps;
+            for (int alpha=0;alpha<8;++alpha)
+                for (bool kill:{false,true})
+                    Check(gpu::DofParticlePixelSource(2,blend,alpha,kill,pass)==canonical,
+                          "shared-field particle PS alpha state did not canonicalize to its embedded key");
+        }
+        if (pass!=4) {
+            Check(gpu::DofParticlePixelSource(2,1,0,false,pass)==
+                      gpu::DofParticlePixelSource(2,0,0,false,pass),
+                  "shared-field particle PS blend state did not canonicalize to blend 0");
+        }
+    }
+    Check(count.particle_vs==3 && count.particle_ps==384 &&
+          count.shared_vs==3 && count.shared_ps==4,
           "particle DOF consumer matrix changed without updating test");
 }
 void CheckSelectedBytecode(std::string_view source,const char* entry,const char* profile,
@@ -188,9 +224,11 @@ int main(int argc,char** argv) {
         }
         std::printf("embedded DOF first use PASS: %u static pairs, %u viewmodel coverage PS, "
                     "%u viewmodel tile VS, %u range pairs, %u atlas pair, "
-                    "%u particle VS, %u particle PS; %u successful lookups; cache initially %s; FXC references %s\n",
+                    "%u particle VS, %u particle PS, %u shared-field VS, %u shared-field PS; "
+                    "%u successful lookups; cache initially %s; FXC references %s\n",
                     count.static_pairs,count.coverage_ps,count.tile_vs,count.range_pairs,
-                    count.atlas_pairs,count.particle_vs,count.particle_ps,count.lookups,
+                    count.atlas_pairs,count.particle_vs,count.particle_ps,count.shared_vs,
+                    count.shared_ps,count.lookups,
                     initially_empty?"absent":"already present",no_fxc?"disabled":"four byte-exact");
         return 0;
     } catch (const std::exception& error) {

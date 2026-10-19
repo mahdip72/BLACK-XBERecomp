@@ -47,6 +47,13 @@ inline std::string DofParticleVertexSource(uint32_t pass) {
 
 inline std::string DofParticlePixelSource(uint32_t samples, uint32_t blend, int alpha_function, bool alpha_kill,
                                          uint32_t pass = 0) {
+    // Field/support/consumer never reevaluate a native material. Canonicalize
+    // their dead source-alpha callbacks to keep the embedded family bounded.
+    if (pass >= 3) {
+        alpha_function = 0;
+        alpha_kill = false;
+        if (pass != 4) blend = 0;
+    }
     auto key = ParticleDofNativePixelKey(TexInfo{kTex2D});
     key.alphakill = alpha_kill ? 1 : 0;
     return MakeParticleDofPixelShader(PixelHlsl(key), samples, blend, alpha_function, pass);

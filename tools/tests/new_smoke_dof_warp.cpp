@@ -34,6 +34,7 @@
 
 #include "d3d/particle_dof.h"
 #include "d3d/particle_dof_atlas.h"
+#include "d3d/particle_dof_shared_coverage.h"
 #include "d3d/particle_dof_geometry.h"
 #include "d3d/particle_dof_small_radius.h"
 #include "d3d/particle_dof_wrapper.h"
@@ -733,13 +734,18 @@ public:
                               bool baseline_filter = false,
                               bool small_radius_filter = false,
                               std::vector<Pixel>* filter_pixels = nullptr,
-                              bool interior_filter = false) {
+                              bool interior_filter = false,
+                              bool shared_coverage = false) {
         const bool aware = scene.geometry.globals.projection[2] > 0;
+        const uint32_t range_levels=1;
         const bool float_range = reference || v25;
         const bool true_ms = aware || scene.native_msaa;
         const uint32_t target_samples = true_ms ? depth_samples : 1;
         Check(!aware || (atlas && wrapped),
               "blur-aware smoke fixture must use the actual atlas composite");
+        Check(!shared_coverage || (aware && atlas && depth_samples==2 &&
+                                   !reference && !v25),
+              "shared smoke fixture requires production aware 2x atlas path");
         Check(!additive || blend, "additive smoke needs its native blend state");
         Check(!additive || !reference, "the frozen reference predates additive smoke");
         Check(!reference || !v25, "select only one frozen smoke reference");
@@ -791,7 +797,8 @@ public:
                                      float_range?DXGI_FORMAT_R32G32_FLOAT:
                                                  DXGI_FORMAT_R32G32_UINT,
                                      D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+                                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                     1,range_levels);
         ComPtr<ID3D12Resource> target = NewTexture(scene.width, scene.height,
                                                    DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -843,7 +850,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
             sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             device_->CreateShaderResourceView(world_texture.Get(),&sv,handle);
         }
-        ComPtr<ID3D12Resource> atlas_source,atlas_filtered;
+        ComPtr<ID3D12Resource> atlas_source,atlas_filtered,support_mask,transmission;
         if (atlas) {
             atlas_source = NewTexture(kAtlasExtent,kAtlasExtent,
                 DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -851,6 +858,14 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
             atlas_filtered = NewTexture(kAtlasExtent,kAtlasExtent,
                 DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            if (shared_coverage) {
+                support_mask=NewTexture(scene.width,scene.height,DXGI_FORMAT_R8_UNORM,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,2);
+                transmission=NewTexture(scene.width,scene.height,DXGI_FORMAT_R32G32_FLOAT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            }
         }
         auto tex_upload = UploadTexture(texture.Get(), scene.texture.data(), scene.tex_width * 4);
         auto vb = UploadBuffer(vertices.data(), vertices.size() * sizeof(vertices[0]));
@@ -901,6 +916,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
         auto dcb = UploadBuffer(constants.data(), constants.size());
         ComPtr<ID3D12Resource> radii_cb;
         std::vector<ComPtr<ID3D12Resource>> atlas_page_cb;
+        std::vector<ComPtr<ID3D12Resource>> shared_field_cb,shared_field_vb;
+        std::vector<gpu::ParticleSharedCoverage> shared_pages;
         std::vector<ComPtr<ID3D12Resource>> legacy_filter_page_cb;
         std::array<float,gpu::kParticleDofMaxQuads> radii{};
         if (atlas) {
@@ -910,6 +927,14 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
                                                    scene.geometry.globals)*metadata[q].atlas_scale;
             radii_cb=UploadBuffer(radii.data(),sizeof(radii));
             for (const auto& page:pages) {
+                if (shared_coverage) {
+                    auto admission=gpu::BuildParticleSharedCoverage(vertices,metadata,
+                        scene.geometry,page,depth_samples,true);
+                    Check(bool(admission),"shared smoke fixture did not meet production admission");
+                    shared_pages.push_back(admission);
+                    shared_field_vb.push_back(UploadBuffer(admission.vertices.data(),
+                        sizeof(admission.vertices)));
+                }
                 auto page_globals=globals;
                 page_globals.atlas_target[0]=page_globals.atlas_target[1]=float(kAtlasExtent);
                 page_globals.atlas_target[2]=float(page.first_quad);
@@ -921,6 +946,14 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
                 std::memcpy(bytes.data()+sizeof(dc)+sizeof(page_globals),metadata.data(),
                             metadata.size()*sizeof(metadata[0]));
                 atlas_page_cb.push_back(UploadBuffer(bytes.data(),bytes.size()));
+                if (shared_coverage) {
+                    auto field_globals=page_globals;
+                    field_globals.target[2]=1;
+                    std::memcpy(bytes.data()+sizeof(dc),&field_globals,sizeof(field_globals));
+                    std::memcpy(bytes.data()+sizeof(dc)+sizeof(field_globals),
+                        &metadata[page.first_quad],sizeof(metadata[0]));
+                    shared_field_cb.push_back(UploadBuffer(bytes.data(),bytes.size()));
+                }
                 if (baseline_filter) {
                     constexpr size_t legacy_prefix=offsetof(gpu::DrawConstants,rtshift);
                     static_assert(legacy_prefix==2080 && sizeof(dc)==2096);
@@ -963,6 +996,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
         cpu.ptr += increment;
         view.Format = float_range?DXGI_FORMAT_R32G32_FLOAT:
                                    DXGI_FORMAT_R32G32_UINT;
+        view.Texture2D.MipLevels=range_levels;
         if (depth_samples > 1)
             device_->CreateShaderResourceView(depth_range.Get(), &view, cpu);
         else
@@ -973,6 +1007,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
                                                   D3D12_SRV_DIMENSION_TEXTURE2DMS;
         device_->CreateShaderResourceView(depth_copy.Get(), &view, cpu);
         ComPtr<ID3D12DescriptorHeap> atlas_source_srvs,atlas_composite_srvs;
+        ComPtr<ID3D12DescriptorHeap> shared_support_srvs,shared_field_srvs,
+                                     shared_composite_srvs;
         if (atlas) {
             Hr(device_->CreateDescriptorHeap(&srv_heap_desc,IID_PPV_ARGS(&atlas_source_srvs)),
                "Create source-atlas SRV heap");
@@ -994,6 +1030,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
                 slot.ptr+=increment;
                 v.Format=float_range?DXGI_FORMAT_R32G32_FLOAT:
                                      DXGI_FORMAT_R32G32_UINT;
+                v.Texture2D.MipLevels=range_levels;
                 device_->CreateShaderResourceView(depth_samples>1?depth_range.Get():nullptr,&v,slot);
                 slot.ptr+=increment;
                 v.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -1003,11 +1040,45 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
             };
             fill_atlas_heap(atlas_source_srvs.Get(),true);
             fill_atlas_heap(atlas_composite_srvs.Get(),false);
+            if (shared_coverage) {
+                auto make_heap=[&](ComPtr<ID3D12DescriptorHeap>& heap,const char* name) {
+                    Hr(device_->CreateDescriptorHeap(&srv_heap_desc,IID_PPV_ARGS(&heap)),name);
+                };
+                make_heap(shared_support_srvs,"Create shared support SRVs");
+                make_heap(shared_field_srvs,"Create shared field SRVs");
+                make_heap(shared_composite_srvs,"Create shared composite SRVs");
+                auto write=[&](ID3D12DescriptorHeap* heap,uint32_t index,
+                               ID3D12Resource* resource,DXGI_FORMAT format,bool ms) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+                    v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    v.Format=format;
+                    v.ViewDimension=ms?D3D12_SRV_DIMENSION_TEXTURE2DMS:
+                                       D3D12_SRV_DIMENSION_TEXTURE2D;
+                    if (!ms) v.Texture2D.MipLevels=1;
+                    auto h=heap->GetCPUDescriptorHandleForHeapStart();h.ptr+=size_t(index)*increment;
+                    device_->CreateShaderResourceView(resource,&v,h);
+                };
+                // Each pass receives the same production root-table t0..t3 layout.
+                for (auto* heap:{shared_support_srvs.Get(),shared_field_srvs.Get(),
+                                 shared_composite_srvs.Get()}) {
+                    write(heap,0,texture.Get(),DXGI_FORMAT_R8G8B8A8_UNORM,false);
+                    write(heap,3,depth_copy.Get(),DXGI_FORMAT_R24_UNORM_X8_TYPELESS,true);
+                }
+                write(shared_support_srvs.Get(),1,atlas_filtered.Get(),
+                      DXGI_FORMAT_R16G16B16A16_FLOAT,false);
+                write(shared_support_srvs.Get(),2,depth_range.Get(),DXGI_FORMAT_R32G32_UINT,false);
+                write(shared_field_srvs.Get(),1,support_mask.Get(),DXGI_FORMAT_R8_UNORM,true);
+                write(shared_field_srvs.Get(),2,depth_range.Get(),DXGI_FORMAT_R32G32_UINT,false);
+                write(shared_composite_srvs.Get(),1,atlas_filtered.Get(),
+                      DXGI_FORMAT_R16G16B16A16_FLOAT,false);
+                write(shared_composite_srvs.Get(),2,transmission.Get(),
+                      DXGI_FORMAT_R32G32_FLOAT,false);
+            }
         }
 
         D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
         rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtv_heap_desc.NumDescriptors = atlas ? 4 : 2;
+        rtv_heap_desc.NumDescriptors = (atlas ? (shared_coverage?6:4) : 2)+(range_levels-1);
         ComPtr<ID3D12DescriptorHeap> rtvs;
         Hr(device_->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtvs)), "Create RTV heap");
         const auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
@@ -1017,14 +1088,20 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
         if (depth_samples > 1)
             device_->CreateRenderTargetView(depth_range.Get(), nullptr, range_rtv);
         auto source_rtv=range_rtv,filtered_rtv=range_rtv;
+        auto support_rtv=range_rtv,transmission_rtv=range_rtv;
         if (atlas) {
             const UINT rtv_step=device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
             source_rtv.ptr+=rtv_step;
             filtered_rtv.ptr+=2*rtv_step;
             device_->CreateRenderTargetView(atlas_source.Get(),nullptr,source_rtv);
             device_->CreateRenderTargetView(atlas_filtered.Get(),nullptr,filtered_rtv);
+            if (shared_coverage) {
+                support_rtv.ptr+=3*rtv_step;
+                transmission_rtv.ptr+=4*rtv_step;
+                device_->CreateRenderTargetView(support_mask.Get(),nullptr,support_rtv);
+                device_->CreateRenderTargetView(transmission.Get(),nullptr,transmission_rtv);
+            }
         }
-
         D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{};
         dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
         dsv_heap_desc.NumDescriptors = 1;
@@ -1067,6 +1144,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
                                                    scene.reverse_subtract,
                                                    scene.geometry.globals.target[3] > 0.5f);
         ComPtr<ID3D12PipelineState> source_pso,composite_pso,filter_pso;
+        ComPtr<ID3D12PipelineState> support_pso,transmission_pso,shared_composite_pso;
         if (atlas) {
             const uint32_t mode=additive?1:0;
             const auto source_vs=Compile(atlas_source_vs_,"vs_5_0");
@@ -1161,6 +1239,28 @@ float4 coverage_probe(VOut i, bool front : SV_IsFrontFace,
                                    target_samples,true_ms,false,scene.reverse_subtract);
             filter_pso=RangePipeline(filter_vs.Get(),filter_ps.Get(),
                                      DXGI_FORMAT_R16G16B16A16_FLOAT);
+            if (shared_coverage) {
+                const auto support_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs_,5),
+                                              "vs_5_0");
+                const auto support_ps=Compile(gpu::MakeParticleDofPixelShader(
+                    native_ps_,2,0,0,5),"ps_5_0");
+                const auto transmission_vs=Compile(gpu::MakeParticleDofVertexShader(
+                    native_vs_,3),"vs_5_0");
+                const auto transmission_ps=Compile(gpu::MakeParticleDofPixelShader(
+                    native_ps_,2,0,0,3),"ps_5_0");
+                const auto shared_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs_,4),
+                                             "vs_5_0");
+                const auto shared_ps=Compile(gpu::MakeParticleDofPixelShader(
+                    native_ps_,2,mode,0,4),"ps_5_0");
+                support_pso=Pipeline(support_vs.Get(),support_ps.Get(),false,false,2,
+                                     false,false,false,false,DXGI_FORMAT_R8_UNORM);
+                transmission_pso=Pipeline(transmission_vs.Get(),transmission_ps.Get(),
+                                          false,false,1,false,false,false,false,
+                                          DXGI_FORMAT_R32G32_FLOAT);
+                shared_composite_pso=Pipeline(shared_vs.Get(),shared_ps.Get(),blend,additive,
+                                              2,false,false,scene.reverse_subtract,false,
+                                              DXGI_FORMAT_R16G16B16A16_FLOAT);
+            }
         }
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
@@ -1273,6 +1373,8 @@ float4 coverage_probe(VOut i, bool front : SV_IsFrontFace,
         else {
             D3D12_RESOURCE_STATES source_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
             D3D12_RESOURCE_STATES filtered_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+            D3D12_RESOURCE_STATES support_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+            D3D12_RESOURCE_STATES transmission_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
             const float zero[4]{};
             const D3D12_VIEWPORT atlas_viewport{0,0,float(kAtlasExtent),float(kAtlasExtent),0,1};
             const D3D12_RECT atlas_scissor{0,0,LONG(kAtlasExtent),LONG(kAtlasExtent)};
@@ -1335,14 +1437,68 @@ float4 coverage_probe(VOut i, bool front : SV_IsFrontFace,
                     list->ResourceBarrier(1,&b);
                     filtered_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
                 }
-                list->OMSetRenderTargets(1,&rtv,FALSE,true_ms ? &dsv : nullptr);
+                if (shared_coverage) {
+                    const auto& admitted=shared_pages[pi];
+                    const D3D12_RECT shared_rect{admitted.bounds[0],admitted.bounds[1],
+                                                  admitted.bounds[2],admitted.bounds[3]};
+                    if (support_state!=D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                        auto b=Transition(support_mask.Get(),support_state,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->ResourceBarrier(1,&b);
+                        support_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    }
+                    list->ClearRenderTargetView(support_rtv,zero,0,nullptr);
+                    list->OMSetRenderTargets(1,&support_rtv,FALSE,nullptr);
+                    list->RSSetViewports(1,&viewport);
+                    list->RSSetScissorRects(1,&shared_rect);
+                    bind_heap(shared_support_srvs.Get());
+                    list->SetGraphicsRootConstantBufferView(1,vcb->GetGPUVirtualAddress());
+                    list->SetGraphicsRootConstantBufferView(2,
+                        atlas_page_cb[pi]->GetGPUVirtualAddress());
+                    list->SetPipelineState(support_pso.Get());
+                    list->IASetVertexBuffers(0,1,&vview);
+                    list->DrawIndexedInstanced(page.quad_count*6,1,page.first_quad*6,0,0);
+                    auto support_read=Transition(support_mask.Get(),
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    list->ResourceBarrier(1,&support_read);
+                    support_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+                    if (transmission_state!=D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                        auto b=Transition(transmission.Get(),transmission_state,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        list->ResourceBarrier(1,&b);
+                        transmission_state=D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    }
+                    list->ClearRenderTargetView(transmission_rtv,zero,0,nullptr);
+                    list->OMSetRenderTargets(1,&transmission_rtv,FALSE,nullptr);
+                    list->RSSetScissorRects(1,&shared_rect);
+                    bind_heap(shared_field_srvs.Get());
+                    list->SetGraphicsRootConstantBufferView(2,
+                        shared_field_cb[pi]->GetGPUVirtualAddress());
+                    list->SetPipelineState(transmission_pso.Get());
+                    D3D12_VERTEX_BUFFER_VIEW field_view{shared_field_vb[pi]->GetGPUVirtualAddress(),
+                        UINT(sizeof(admitted.vertices)),sizeof(gpu::NativeParticleVertex)};
+                    list->IASetVertexBuffers(0,1,&field_view);
+                    list->DrawIndexedInstanced(6,1,0,0,0);
+                    auto transmission_read=Transition(transmission.Get(),
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    list->ResourceBarrier(1,&transmission_read);
+                    transmission_state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    list->IASetVertexBuffers(0,1,&vview);
+                }
+                list->OMSetRenderTargets(1,&rtv,FALSE,
+                    true_ms && !shared_coverage ? &dsv : nullptr);
                 list->RSSetViewports(1,&viewport);
                 list->RSSetScissorRects(1,&scene.scissor);
-                bind_heap(atlas_composite_srvs.Get());
+                bind_heap(shared_coverage?shared_composite_srvs.Get():
+                                          atlas_composite_srvs.Get());
                 list->SetGraphicsRootConstantBufferView(1,vcb->GetGPUVirtualAddress());
                 list->SetGraphicsRootConstantBufferView(2,
                     atlas_page_cb[pi]->GetGPUVirtualAddress());
-                list->SetPipelineState(composite_pso.Get());
+                list->SetPipelineState(shared_coverage?shared_composite_pso.Get():
+                                                     composite_pso.Get());
                 list->DrawIndexedInstanced(page.quad_count*6,1,page.first_quad*6,0,0);
             }
         }
@@ -1417,11 +1573,12 @@ private:
 
     ComPtr<ID3D12Resource> NewTexture(uint32_t width, uint32_t height, DXGI_FORMAT format,
         D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE,
-        uint32_t samples = 1) {
+        uint32_t samples = 1,uint32_t mips = 1) {
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         auto desc = TextureDesc(width, height, format, flags);
         desc.SampleDesc.Count = samples;
+        desc.MipLevels=UINT16(mips);
         ComPtr<ID3D12Resource> result;
         Hr(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
                                             nullptr, IID_PPV_ARGS(&result)), "Create smoke texture");
@@ -1663,7 +1820,8 @@ private:
                                           bool native_depth_attached = false,
                                           bool hardware_depth = false,
                                           bool reverse_subtract = false,
-                                          bool less_equal = false) {
+                                          bool less_equal = false,
+                                          DXGI_FORMAT target_format = DXGI_FORMAT_R16G16B16A16_FLOAT) {
         D3D12_INPUT_ELEMENT_DESC attributes[] = {
             {"ATTR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -1689,7 +1847,7 @@ private:
         p.DSVFormat = native_depth_attached ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
         p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         p.NumRenderTargets = 1;
-        p.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        p.RTVFormats[0] = target_format;
         p.SampleDesc.Count = samples;
         auto& b = p.BlendState.RenderTarget[0];
         b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -3005,6 +3163,181 @@ void CheckSmallRadiusFilter(Warp& warp) {
     }
 }
 
+SmokeScene SharedCoverageScene(bool additive=false) {
+    auto scene=Scene(3.0f);
+    EnableAwareCoverage(scene);
+    scene.geometry.globals.optics[1]=1.0f;
+    const float unit=gpu::ParticleDofRadius(3.0f,scene.geometry.globals);
+    Check(unit>0,"shared fixture needs a defocused particle");
+    scene.geometry.globals.optics[1]=2.0f/unit;
+    scene.geometry.globals.viewport[0]=7;
+    scene.geometry.globals.viewport[1]=9;
+    scene.geometry.globals.viewport[2]=82;
+    scene.geometry.globals.viewport[3]=50;
+    scene.scissor={7,9,89,59};
+    scene.clear=additive?Pixel{.06f,.08f,.12f,.2f}:Pixel{.04f,.06f,.09f,.15f};
+    auto quad=scene.vertices;
+    scene.vertices.clear();
+    for (uint32_t q=0;q<8;++q) {
+        for (auto v:quad) {
+            const uint32_t red=70+q*19,green=215-q*18,blue=45+q*22;
+            // Native SRC_ALPHA/ONE updates destination alpha with alpha squared.
+            // Keep eight stacked additive plumes below the FP16 [0,1] safety gate.
+            v.argb=(uint32_t(48+q*3)<<24)|(red<<16)|(green<<8)|blue;
+            scene.vertices.push_back(v);
+        }
+    }
+    return scene;
+}
+
+void CheckSharedCoverageAdmission() {
+    auto scene=SharedCoverageScene();
+    std::vector<gpu::NativeParticleVertex> expanded;
+    std::vector<gpu::ParticleDofQuad> meta;
+    gpu::ParticleDofGeometryStats stats{};
+    Check(gpu::BuildParticleDofGeometry(scene.vertices,scene.geometry,expanded,meta,stats),
+          "shared fixture did not expand native quads");
+    const auto pages=gpu::BuildParticleDofAtlasPages(expanded,scene.geometry,meta,64,64);
+    Check(pages.size()==2 && pages[1].first_quad>0,
+          "shared fixture must cross a real atlas page boundary");
+    for (const auto& page:pages) {
+        const auto okay=gpu::BuildParticleSharedCoverage(expanded,meta,scene.geometry,
+                                                         page,2,true);
+        Check(bool(okay),"shared fixture was not admitted by production helper");
+        Check(okay.sum_area>=3*okay.union_area && okay.bounds[0]>=7 &&
+              okay.bounds[1]>=9 && okay.bounds[2]<=89 && okay.bounds[3]<=59,
+              "shared admission ignored overlap or odd viewport clipping");
+        Check(!gpu::BuildParticleSharedCoverage(expanded,meta,scene.geometry,page,4,true),
+              "shared path admitted unsupported 4x target");
+        Check(!gpu::BuildParticleSharedCoverage(expanded,meta,scene.geometry,page,2,false),
+              "shared path admitted unverified projection");
+        auto depth_change=expanded;
+        depth_change[size_t(page.first_quad+1)*4].position[2]=.25f;
+        Check(!gpu::BuildParticleSharedCoverage(depth_change,meta,scene.geometry,page,2,true),
+              "shared path merged quads with different native depth bits");
+        auto map_change=meta;
+        map_change[page.first_quad+1].atlas_scale=0;
+        Check(!gpu::BuildParticleSharedCoverage(expanded,map_change,scene.geometry,page,2,true),
+              "shared path admitted an unmapped late quad");
+        auto sparse=expanded;
+        for (uint32_t q=page.first_quad+1;q<page.first_quad+page.quad_count;++q)
+            for (uint32_t k=0;k<4;++k) sparse[size_t(q)*4+k].position[0]+=float(12*q);
+        Check(!gpu::BuildParticleSharedCoverage(sparse,meta,scene.geometry,page,2,true),
+              "shared path admitted insufficient page overlap");
+    }
+}
+
+void CheckSharedCoverageField(Warp& warp) {
+    CheckSharedCoverageAdmission();
+    for (bool additive:{false,true}) {
+        auto scene=SharedCoverageScene(additive);
+        const auto direct=warp.Render(scene,true,true,2,false,false,additive,
+                                      false,true,64);
+        const auto shared=warp.Render(scene,true,true,2,false,false,additive,
+                                      false,true,64,false,false,nullptr,false,true);
+        const auto error=CompareAtlasPixels(scene,direct,shared,false);
+        std::printf("shared 2x %s: resolved RGB RMS %.6f, alpha energy %.4f%%, maxRGBA %.6f\n",
+                    additive?"additive":"alpha-over",error.rgb_rms,
+                    100*error.alpha_energy,error.max_rgba);
+        WriteBmp(additive?"shared-additive-direct.bmp":"shared-alpha-direct.bmp",
+                 scene,direct,false);
+        WriteBmp(additive?"shared-additive-field.bmp":"shared-alpha-field.bmp",
+                 scene,shared,false);
+        Check(error.rgb_rms<1e-6f && error.alpha_energy<1e-5f &&
+              error.max_rgba<1e-5f,
+              "shared field changed ordered alpha/additive 2x composite");
+        auto partial=scene;
+        partial.sample_occluder={40,24,56,40};
+        const auto direct_partial=warp.Render(partial,true,true,2,true,false,additive,
+                                              false,true,64);
+        const auto shared_partial=warp.Render(partial,true,true,2,true,false,additive,
+                                              false,true,64,false,false,nullptr,false,true);
+        const auto mixed_error=CompareAtlasPixels(partial,direct_partial,shared_partial,false);
+        std::printf("shared 2x mixed-depth %s: RGB RMS %.6f, alpha energy %.4f%%\n",
+                    additive?"additive":"alpha-over",mixed_error.rgb_rms,
+                    100*mixed_error.alpha_energy);
+        Check(mixed_error.rgb_rms<1e-6f && mixed_error.alpha_energy<1e-5f &&
+              mixed_error.max_rgba<1e-5f,
+              "shared field changed partial-MSAA wall occlusion");
+    }
+    auto transparent=SharedCoverageScene();
+    std::fill(transparent.texture.begin(),transparent.texture.end(),0u);
+    const auto empty_direct=warp.Render(transparent,true,true,2,false,false,false,
+                                        false,true,64);
+    const auto empty_shared=warp.Render(transparent,true,true,2,false,false,false,
+                                        false,true,64,false,false,nullptr,false,true);
+    Check(CompareAtlasPixels(transparent,empty_direct,empty_shared,false).max_rgba<1e-5f,
+          "transparent shared support changed the native destination");
+
+    // A far particle behind a nearer defocused wall forces the costly 0<T<1
+    // aperture path; the earlier near fixture can take the all-visible shortcut.
+    auto far_scene=SharedCoverageScene();
+    for (auto& v:far_scene.vertices) {
+        v.position[2]=1.0f/12.0f;
+        v.position[0]+=.43f;
+        v.position[1]+=.37f;
+    }
+    far_scene.geometry.globals.optics[1]=1;
+    const float far_unit=gpu::ParticleDofRadius(12.0f,far_scene.geometry.globals);
+    Check(far_unit>0,"shared defocused-wall fixture has no far aperture");
+    far_scene.geometry.globals.optics[1]=4.0f/far_unit;
+    for (uint32_t y=14;y<50;++y)
+        for (uint32_t x=28;x<68;++x)
+            if ((x/6)%2==0) far_scene.source_depth[At(far_scene,x,y)]=RawDepth(4.0f);
+    const auto far_direct=warp.Render(far_scene,true,true,2,false,false,false,
+                                      false,true,64);
+    const auto far_shared=warp.Render(far_scene,true,true,2,false,false,false,
+                                      false,true,64,false,false,nullptr,false,true);
+    const auto far_error=CompareAtlasPixels(far_scene,far_direct,far_shared,false);
+    std::printf("shared defocused wall/subpixel raster: RGB RMS %.6f, alpha energy %.4f%%, maxRGBA %.6f\n",
+                far_error.rgb_rms,100*far_error.alpha_energy,far_error.max_rgba);
+    WriteBmp("shared-wall-direct.bmp",far_scene,far_direct,false);
+    WriteBmp("shared-wall-field.bmp",far_scene,far_shared,false);
+    Check(far_error.rgb_rms<1e-6f && far_error.alpha_energy<1e-5f &&
+          far_error.max_rgba<1e-5f,
+          "shared 2x transmission changed defocused-wall or subpixel edge output");
+
+    auto colored=far_scene;
+    colored.mixed_sample_color=true;
+    colored.sample_color={.8f,.07f,.65f,.35f};
+    colored.sample_color_rect={38,22,58,42};
+    const auto colored_direct=warp.Render(colored,true,true,2,false,false,false,
+                                          false,true,64);
+    const auto colored_shared=warp.Render(colored,true,true,2,false,false,false,
+                                          false,true,64,false,false,nullptr,false,true);
+    const auto colored_error=CompareAtlasPixels(colored,colored_direct,colored_shared,false);
+    std::printf("shared colored 2x destination samples: RGB RMS %.6f, "
+                "alpha energy %.4f%%, maxRGBA %.6f\n",colored_error.rgb_rms,
+                100*colored_error.alpha_energy,colored_error.max_rgba);
+    WriteBmp("shared-colored-direct.bmp",colored,colored_direct,false);
+    WriteBmp("shared-colored-field.bmp",colored,colored_shared,false);
+    Check(colored_error.rgb_rms<1e-6f && colored_error.alpha_energy<1e-5f &&
+          colored_error.max_rgba<1e-5f,
+          "shared field changed per-sample coverage over different destination colors");
+
+    // D24 tie behavior belongs to the actual LESS/LEQUAL predicate, including
+    // source and destination tests. Both sides render through true D24S8.
+    auto coplanar=far_scene;
+    std::fill(coplanar.source_depth.begin(),coplanar.source_depth.end(),RawDepth(12.0f));
+    for (bool lequal:{false,true}) {
+        coplanar.geometry.globals.target[3]=lequal?1.0f:0.0f;
+        const auto direct=warp.Render(coplanar,true,true,2,false,false,false,
+                                      false,true,64);
+        const auto shared=warp.Render(coplanar,true,true,2,false,false,false,
+                                      false,true,64,false,false,nullptr,false,true);
+        const auto e=CompareAtlasPixels(coplanar,direct,shared,false);
+        const size_t center=At(coplanar,48,32);
+        std::printf("shared coplanar D24 %s: center alpha %.6f/%.6f, maxRGBA %.6f\n",
+                    lequal?"LEQUAL":"LESS",direct[center].a,shared[center].a,e.max_rgba);
+        Check(e.rgb_rms<1e-6f && e.alpha_energy<1e-5f && e.max_rgba<1e-5f,
+              "shared field changed exact coplanar D24 LESS/LEQUAL output");
+        if (lequal) Check(shared[center].a>coplanar.clear.a+.01f,
+                          "LEQUAL coplanar particle was fully rejected");
+        else Check(std::abs(shared[center].a-coplanar.clear.a)<.0001f,
+                   "LESS coplanar particle leaked through the wall");
+    }
+}
+
 } // namespace
 
 int main(int argc,char** argv) {
@@ -3015,12 +3348,20 @@ int main(int argc,char** argv) {
               (std::strcmp(argv[1],"--optimization-only")==0 ||
                std::strcmp(argv[1],"--small-radius-only")==0 ||
                std::strcmp(argv[1],"--coverage-only")==0 ||
+               std::strcmp(argv[1],"--shared-only")==0 ||
                std::strcmp(argv[1],"--mixed-focus-only")==0)),
-              "usage: new_smoke_dof_warp [--optimization-only|--small-radius-only|--coverage-only|--mixed-focus-only]");
+              "usage: new_smoke_dof_warp [--optimization-only|--small-radius-only|--coverage-only|--shared-only|--mixed-focus-only]");
         g_small_radius_only=argc==2 && std::strcmp(argv[1],"--small-radius-only")==0;
         g_coverage_only=argc==2 && std::strcmp(argv[1],"--coverage-only")==0;
         g_mixed_focus_only=argc==2 && std::strcmp(argv[1],"--mixed-focus-only")==0;
         g_optimization_only=argc==2 && !g_coverage_only && !g_mixed_focus_only;
+        if (argc==2 && std::strcmp(argv[1],"--shared-only")==0) {
+            Warp warp;
+            std::puts("RUN shared 2x support/transmission/composite fixtures");
+            CheckSharedCoverageField(warp);
+            std::puts("production shared smoke DoF WARP checks PASS");
+            return 0;
+        }
         if (g_optimization_only) {
             Warp warp;
             std::puts("RUN small-radius optimization fixtures");
@@ -3075,6 +3416,7 @@ int main(int argc,char** argv) {
         CheckWorldThenLateParticles(warp);
         CheckAwareSampleCovariance(warp);
         CheckAwareAdditiveAndOrder(warp);
+        CheckSharedCoverageField(warp);
         CheckAtlasFallbackAndOrder(warp);
         CheckAtlasAdditive(warp);
         CheckAtlasClippedAlphaTest(warp);

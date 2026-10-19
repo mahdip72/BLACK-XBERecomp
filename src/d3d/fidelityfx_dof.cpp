@@ -8,7 +8,9 @@
 #include <d3d12.h>
 
 #include <cmath>
+#include <array>
 #include <cstdio>
+#include <cwchar>
 #include <vector>
 
 #include "d3d/fidelityfx_dof.h"
@@ -34,6 +36,12 @@ struct FidelityFxDof::Impl {
     FfxErrorCode callback_error = FFX_OK;
     bool backend_created = false;
     bool poisoned = false;
+    const FidelityFxDofTiming* timing = nullptr;
+    // The pinned DoF component schedules exactly five jobs. Keep copies until Execute supplies its command list;
+    // staged constant data remains SDK-owned, with the same lifetime as the original backend's shallow job copies.
+    std::array<FfxGpuJobDescription, 5> timed_jobs{};
+    size_t timed_job_count = 0;
+    bool timing_overflow = false;
     // The SDK copies FfxInterface and owns scratchBuffer. A scoped thread-local association preserves that ABI
     // while monitoring callbacks; separate render/test threads do not share error state.
     static inline thread_local Impl* calling = nullptr;
@@ -77,14 +85,65 @@ struct FidelityFxDof::Impl {
     static FfxErrorCode Schedule(FfxInterface* i, const FfxGpuJobDescription* job) {
         auto& self = *calling;
         if (self.callback_error != FFX_OK) return self.callback_error;
-        return self.Check("FidelityFX job scheduling failed", [&] { return self.original.fpScheduleGpuJob(i, job); });
+        return self.Check("FidelityFX job scheduling failed", [&]() -> FfxErrorCode {
+            if (self.timing && !self.timing_overflow) {
+                if (self.timed_job_count < self.timed_jobs.size()) {
+                    self.timed_jobs[self.timed_job_count++] = *job;
+                    return FFX_OK;
+                }
+                // A future SDK with more jobs stays correct and simply loses child timing for this dispatch.
+                self.timing_overflow = true;
+                for (size_t n = 0; n < self.timed_job_count; ++n) {
+                    const auto result = self.original.fpScheduleGpuJob(i, &self.timed_jobs[n]);
+                    if (result != FFX_OK) return result;
+                }
+                self.timed_job_count = 0;
+            }
+            return self.original.fpScheduleGpuJob(i, job);
+        });
+    }
+    static bool TimedPass(const FfxGpuJobDescription& job, FidelityFxDofPass& pass) {
+        if (job.jobType != FFX_GPU_JOB_COMPUTE) return false;
+        constexpr const wchar_t* labels[] = {L"DOF-DOWNSAMPLE-DEPTH", L"DOF-DOWNSAMPLE-COLOR",
+            L"DOF-DILATE", L"DOF-BLUR", L"DOF-COMPOSITE"};
+        for (size_t n = 0; n < std::size(labels); ++n) {
+            if (std::wcscmp(job.jobLabel, labels[n]) == 0) {
+                pass = static_cast<FidelityFxDofPass>(n);
+                return true;
+            }
+        }
+        return false;
     }
     static FfxErrorCode Execute(FfxInterface* i, FfxCommandList list, FfxUInt32 id) {
         auto& self = *calling;
         if (self.callback_error != FFX_OK) return self.callback_error;
         // The DX12 backend throws on some allocation failures. Catch here so the component still unregisters
         // external resources and records their return barriers before the caller selects Balanced.
-        return self.Check("FidelityFX GPU job execution failed", [&] { return self.original.fpExecuteGpuJobs(i, list, id); });
+        return self.Check("FidelityFX GPU job execution failed", [&]() -> FfxErrorCode {
+            // Drain any context-initialization jobs first. Execute only records commands and clears the job queue:
+            // resource states, descriptor/constant rings and dispatch order persist across these calls.
+            auto result = self.original.fpExecuteGpuJobs(i, list, id);
+            if (result != FFX_OK || !self.timing || self.timing_overflow) return result;
+            auto* command_list = reinterpret_cast<ID3D12GraphicsCommandList*>(list);
+            for (size_t n = 0; n < self.timed_job_count; ++n) {
+                const auto& job = self.timed_jobs[n];
+                result = self.original.fpScheduleGpuJob(i, &job);
+                if (result != FFX_OK) return result;
+                FidelityFxDofPass pass{};
+                const bool measured = TimedPass(job, pass);
+                struct EndMarker {
+                    const FidelityFxDofTiming* timing;
+                    ID3D12GraphicsCommandList* list;
+                    FidelityFxDofPass pass;
+                    ~EndMarker() { if (timing) timing->mark(timing->user, list, pass, false); }
+                } end{measured ? self.timing : nullptr, command_list, pass};
+                if (measured) self.timing->mark(self.timing->user, command_list, pass, true);
+                result = self.original.fpExecuteGpuJobs(i, list, id);
+                if (result != FFX_OK) return result;
+            }
+            self.timed_job_count = 0;
+            return FFX_OK;
+        });
     }
     static FfxErrorCode Unregister(FfxInterface* i, FfxCommandList list, FfxUInt32 id) {
         auto& self = *calling;
@@ -179,7 +238,8 @@ bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height
 }
 
 bool FidelityFxDof::Dispatch(ID3D12GraphicsCommandList* command_list, ID3D12Resource* color,
-                            ID3D12Resource* encoded_depth, ID3D12Resource* output, float coc_bound) {
+                            ID3D12Resource* encoded_depth, ID3D12Resource* output, float coc_bound,
+                            const FidelityFxDofTiming* timing) {
     if (!Ready() || !command_list || !color || !encoded_depth || !output || output == color ||
         output == encoded_depth || !std::isfinite(coc_bound) || coc_bound <= 0)
         return impl_->Fail("invalid FidelityFX dispatch");
@@ -197,6 +257,13 @@ bool FidelityFxDof::Dispatch(ID3D12GraphicsCommandList* command_list, ID3D12Reso
     if (impl_->poisoned) return impl_->Fail("FidelityFX context disabled after a failed dispatch");
     impl_->callback_error = FFX_OK;
     Impl::Scope scope(impl_.get());
+    struct TimingScope {
+        Impl& impl;
+        ~TimingScope() { impl.timing = nullptr; impl.timed_job_count = 0; impl.timing_overflow = false; }
+    } timing_scope{*impl_};
+    impl_->timing = timing && timing->mark ? timing : nullptr;
+    impl_->timed_job_count = 0;
+    impl_->timing_overflow = false;
     FfxDofDispatchDescription desc{};
     desc.commandList = ffxGetCommandListDX12(command_list);
     desc.color = ffxGetResourceDX12(color, ffxGetResourceDescriptionDX12(color), L"BLACK DoF input",

@@ -11,6 +11,16 @@ namespace gpu {
 
 struct FidelityFxDofSize { uint32_t width, height; };
 
+enum class FidelityFxDofPass { DownsampleDepth, DownsampleColor, Dilate, Blur, Composite };
+
+// Optional command-recording hooks for GPU timestamps, not CPU callback durations. Hooks must only record
+// timestamps on this list; they must not submit/wait, reenter the adapter, or change its graphics state.
+// Each begin is paired with an end, including backend recording failures. The descriptor lives through Dispatch.
+struct FidelityFxDofTiming {
+    void* user = nullptr;
+    void (*mark)(void*, ID3D12GraphicsCommandList*, FidelityFxDofPass, bool begin) noexcept = nullptr;
+};
+
 // Keep partial 64-pixel SDK workgroups outside the visible image. The adapter edge-extends the logical
 // viewport over this processing extent. A 2x profile replicates native inputs and averages each output 2x2;
 // CoC is expressed in processing pixels, so the caller scales both CoC and its encoding bound by the same factor.
@@ -37,7 +47,7 @@ public:
     // RGBA16F ALLOW_UNORDERED_ACCESS output enters in UNORDERED_ACCESS. All three have the context extent.
     // For signed CoC c in processing pixels (near negative), depth = .5+c/(2*bound), bound >= abs(c).
     bool Dispatch(ID3D12GraphicsCommandList* command_list, ID3D12Resource* color, ID3D12Resource* encoded_depth,
-                  ID3D12Resource* output, float coc_bound);
+                  ID3D12Resource* output, float coc_bound, const FidelityFxDofTiming* timing = nullptr);
     void Reset();
     // Transfer a separately prepared context only after the receiver's GPU work has completed.
     void Swap(FidelityFxDof& other) noexcept;

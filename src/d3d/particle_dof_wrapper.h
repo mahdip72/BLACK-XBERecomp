@@ -78,7 +78,7 @@ inline bool Common(std::string& s) {
 // Empty means that the translator changed its contract; the renderer must use native geometry/shaders.
 inline std::string MakeParticleDofVertexShader(std::string s, uint32_t pass = 0) {
     using namespace particle_dof_detail;
-    if (pass > 2 || !Common(s)) return {};
+    if (pass > 5 || !Common(s)) return {};
     if (!ReplaceOne(s, "VOut main(VIn i)", "VOut main(VIn i, uint vertexId : SV_VertexID)") &&
         !ReplaceOne(s, "VOut main(VRaw ri)", "VOut main(VRaw ri, uint vertexId : SV_VertexID)")) return {};
     std::string finish = "    o.particleQuad = vertexId / 4;\n"
@@ -103,11 +103,14 @@ inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples, u
                                              int alphaFunction = -1, uint32_t pass = 0) {
     using namespace particle_dof_detail;
     if ((samples != 1 && samples != 2 && samples != 4 && samples != 8) || blend > 1 ||
-        alphaFunction < -1 || alphaFunction > 7 || pass > 2) return {};
+        alphaFunction < -1 || alphaFunction > 7 || pass > 5) return {};
+    // Shared fields are an explicitly eligible2x path. These passes consume
+    // filtered source energy, so native source alpha variants are unnecessary.
+    if (pass >= 3 && (samples != 2 || alphaFunction != 0 || (pass != 4 && blend != 0))) return {};
     if (!Common(s)) return {};
     // Unused native stages can retain stale 2D/cube/shadow bindings. Remove their declarations
     // to make room for the exact MSAA bounds at t2 and original-sample depth copy at t3.
-    for (int stage = pass == 2 ? 1 : 2; stage < 4; ++stage) {
+    for (int stage = pass >= 2 ? 1 : 2; stage < 4; ++stage) {
         const auto declaration = " tex" + std::to_string(stage) + " : register(t" + std::to_string(stage) + ");";
         auto at = s.find(declaration);
         if (at == std::string::npos) return {};
@@ -121,6 +124,7 @@ inline std::string MakeParticleDofPixelShader(std::string s, uint32_t samples, u
     auto at = s.find(entry);
     if (at == std::string::npos || s.find(entry, at + entry.size()) != std::string::npos) return {};
     std::string body = s.substr(at + entry.size());
+    if (pass >= 3 && body.find("if (t0.a == 0) discard;") != std::string::npos) return {};
     // The translated native main is last. Reject added functions or unexpected texture accesses.
     if (body.find("tex1.") != std::string::npos || body.find("tex2.") != std::string::npos ||
         body.find("tex3.") != std::string::npos || body.find("spreadtap(") != std::string::npos) return {};

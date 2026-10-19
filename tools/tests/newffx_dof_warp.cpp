@@ -29,6 +29,7 @@
 
 #include "d3d/fidelityfx_dof.h"
 #include "d3d/fidelityfx_dof_shader.h"
+#include "d3d/dof_gpu_timing.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -45,6 +46,46 @@ struct AdapterResult {
     std::vector<Pixel> destination;
     std::vector<Pixel> prepared_color;
     std::vector<float> encoded_depth;
+    gpu::DofGpuTiming::FrameSample timing{};
+    uint64_t timing_frequency = 0;
+    uint32_t timing_repetitions = 0;
+    bool has_timing = false;
+};
+
+struct SdkTimingHooks {
+    gpu::DofGpuTiming* timing = nullptr;
+    std::array<gpu::DofGpuTiming::Scope, 5> scopes{};
+    std::array<bool, 5> started{};
+    std::array<bool, 5> ended{};
+    uint32_t next = 0;
+    bool invalid = false;
+
+    static void Mark(void* user, ID3D12GraphicsCommandList* list,
+                     gpu::FidelityFxDofPass pass, bool begin) noexcept {
+        auto& self = *static_cast<SdkTimingHooks*>(user);
+        const uint32_t index = static_cast<uint32_t>(pass);
+        if (!self.timing || !list || index >= self.scopes.size() || index != self.next) {
+            self.invalid = true;
+            return;
+        }
+        constexpr gpu::DofGpuTiming::Stage stages[] = {
+            gpu::DofGpuTiming::Stage::SdkDownsampleDepth,
+            gpu::DofGpuTiming::Stage::SdkDownsampleColor,
+            gpu::DofGpuTiming::Stage::SdkDilate,
+            gpu::DofGpuTiming::Stage::SdkBlur,
+            gpu::DofGpuTiming::Stage::SdkComposite,
+        };
+        if (begin) {
+            if (self.started[index] || self.ended[index]) { self.invalid = true; return; }
+            self.started[index] = true;
+            self.scopes[index] = self.timing->Measure(stages[index], list);
+        } else {
+            if (!self.started[index] || self.ended[index]) { self.invalid = true; return; }
+            self.scopes[index].End();
+            self.ended[index] = true;
+            ++self.next;
+        }
+    }
 };
 
 void Check(bool ok, const char* message) {
@@ -172,7 +213,7 @@ D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 
 class Warp {
 public:
-    Warp() {
+    explicit Warp(bool hardware = false) {
         ComPtr<ID3D12Debug> debug;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
             debug->EnableDebugLayer();
@@ -183,13 +224,34 @@ public:
         if (FAILED(result) && factory_flags)
             result = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_));
         Hr(result, "CreateDXGIFactory2");
-        Hr(factory_->EnumWarpAdapter(IID_PPV_ARGS(&adapter_)), "EnumWarpAdapter");
+        if (hardware) {
+            for (UINT index = 0;; ++index) {
+                ComPtr<IDXGIAdapter1> candidate;
+                const HRESULT enumeration = factory_->EnumAdapterByGpuPreference(
+                    index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
+                if (enumeration == DXGI_ERROR_NOT_FOUND) break;
+                Hr(enumeration, "EnumAdapterByGpuPreference");
+                DXGI_ADAPTER_DESC1 candidate_desc{};
+                Hr(candidate->GetDesc1(&candidate_desc), "hardware GetDesc1");
+                if (candidate_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+                adapter_ = std::move(candidate);
+                break;
+            }
+            Check(adapter_.Get() != nullptr, "no hardware D3D12 adapter was found");
+        } else {
+            Hr(factory_->EnumWarpAdapter(IID_PPV_ARGS(&adapter_)), "EnumWarpAdapter");
+        }
         DXGI_ADAPTER_DESC1 adapter_desc{};
-        Hr(adapter_->GetDesc1(&adapter_desc), "WARP GetDesc1");
-        Check((adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
-              "DXGI adapter is not software WARP");
+        Hr(adapter_->GetDesc1(&adapter_desc), hardware ? "hardware GetDesc1" : "WARP GetDesc1");
+        if (hardware) {
+            std::wprintf(L"Hardware adapter: %ls\n", adapter_desc.Description);
+        } else {
+            Check((adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0,
+                  "DXGI adapter is not software WARP");
+        }
         Hr(D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_12_0,
-                             IID_PPV_ARGS(&device_)), "D3D12CreateDevice(WARP)");
+                             IID_PPV_ARGS(&device_)), hardware ? "D3D12CreateDevice(hardware)" :
+                                                                 "D3D12CreateDevice(WARP)");
         D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_2};
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
         if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
@@ -204,12 +266,13 @@ public:
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         Hr(device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue_)),
-           "CreateCommandQueue(WARP)");
+           hardware ? "CreateCommandQueue(hardware)" : "CreateCommandQueue(WARP)");
         Hr(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence");
         event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         Check(event_ != nullptr, "CreateEvent failed");
-        std::printf("WARP software adapter; D3D12 debug layer %s\n",
-                    debug_enabled_ ? "enabled" : "unavailable (validation limitation)");
+        if (!hardware)
+            std::printf("WARP software adapter; D3D12 debug layer %s\n",
+                        debug_enabled_ ? "enabled" : "unavailable (validation limitation)");
     }
 
     ~Warp() {
@@ -217,15 +280,22 @@ public:
     }
 
     ID3D12Device* Device() const { return device_.Get(); }
+    std::wstring AdapterName() const {
+        DXGI_ADAPTER_DESC1 desc{};
+        Hr(adapter_->GetDesc1(&desc), "Get adapter name");
+        return desc.Description;
+    }
 
-    void Wait() {
+    void Wait(gpu::DofGpuTiming* timing = nullptr, uint64_t frame_id = 0) {
         const uint64_t target = ++fence_value_;
         Hr(queue_->Signal(fence_.Get(), target), "Signal");
+        if (timing) timing->Submitted(target, frame_id, true);
         if (fence_->GetCompletedValue() < target) {
             Hr(fence_->SetEventOnCompletion(target, event_), "SetEventOnCompletion");
             Check(WaitForSingleObject(event_, 30000) == WAIT_OBJECT_0,
                   "WARP dispatch timed out after 30 seconds");
         }
+        if (timing) timing->Collect(target);
         CheckDebugMessages();
     }
 
@@ -331,11 +401,21 @@ public:
                              const D3D12_RECT& rect, uint32_t scale=1,
                              float visible_radius=8.0f, float near_scale=1.0f,
                              float far_scale=0.45f,uint32_t rings=4,
-                             bool no_merge=false) {
+                             bool no_merge=false, bool collect_timing=false,
+                             uint32_t timing_repetitions=1) {
+        Check(timing_repetitions >= 1 && timing_repetitions <= 20,
+              "timing repetitions must be between 1 and 20");
         const auto processing=gpu::FidelityFxDofProcessingSize(fixture.width,fixture.height,scale);
         Check(processing.width && processing.height &&
               dof.Matches(processing.width,processing.height,rings,no_merge),
               "adapter DoF processing extent mismatch");
+        gpu::DofGpuTiming gpu_timing;
+        constexpr uint64_t timing_frame = 1;
+        if (collect_timing) {
+            Check(gpu_timing.Init(device_.Get(), queue_.Get()),
+                  "D3D12 GPU timestamp query initialization failed");
+            gpu_timing.BeginFrame(timing_frame, true, fence_->GetCompletedValue());
+        }
         Check(rect.left >= 0 && rect.top >= 0 && rect.right <= LONG(fixture.width) &&
               rect.bottom <= LONG(fixture.height) && rect.right>rect.left &&
               rect.bottom>rect.top, "invalid adapter logical viewport");
@@ -437,56 +517,119 @@ public:
                                       IID_PPV_ARGS(&list)),"Create adapter list");
         CopyUpload(list.Get(),scene.Get(),scene_upload.Get(),color_fp);
         CopyUpload(list.Get(),raw_depth.Get(),depth_upload.Get(),depth_fp);
-        auto scene_copy=Transition(scene.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
-                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->ResourceBarrier(1,&scene_copy);
-        list->CopyResource(destination.Get(),scene.Get());
         D3D12_RESOURCE_BARRIER prepare_inputs[]={
-            Transition(scene.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(scene.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             Transition(raw_depth.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
         list->ResourceBarrier(2,prepare_inputs);
         ID3D12DescriptorHeap* heaps[]={srv_heap.Get()};
-        list->SetDescriptorHeaps(1,heaps);
-        list->SetGraphicsRootSignature(adapter_root_.Get());
-        list->SetGraphicsRootDescriptorTable(0,srv_heap->GetGPUDescriptorHandleForHeapStart());
-        list->SetGraphicsRootConstantBufferView(1,constants->GetGPUVirtualAddress());
-        list->SetPipelineState(prepare_pso_.Get());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         D3D12_VIEWPORT processing_viewport{0,0,float(processing.width),float(processing.height),0,1};
         D3D12_RECT full_processing{0,0,LONG(processing.width),LONG(processing.height)};
         list->RSSetViewports(1,&processing_viewport);
         list->RSSetScissorRects(1,&full_processing);
         list->OMSetRenderTargets(2,rtvs,FALSE,nullptr);
-        list->DrawInstanced(3,1,0,0);
-        D3D12_RESOURCE_BARRIER for_compute[]={
-            Transition(prepared.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
-                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            Transition(encoded.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
-                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
-        list->ResourceBarrier(2,for_compute);
-        if (!dof.Dispatch(list.Get(),prepared.Get(),encoded.Get(),filtered.Get(),fixture.bound*scale))
-            throw std::runtime_error(std::string("adapter FidelityFX Dispatch: ")+dof.Failure());
-        // The SDK changes heaps/root bindings, so the caller must explicitly restore them.
-        list->SetDescriptorHeaps(1,heaps);
-        list->SetGraphicsRootSignature(adapter_root_.Get());
         D3D12_GPU_DESCRIPTOR_HANDLE present_table=srv_heap->GetGPUDescriptorHandleForHeapStart();
         present_table.ptr+=UINT64(2)*srv_increment;
-        list->SetGraphicsRootDescriptorTable(0,present_table);
-        list->SetGraphicsRootConstantBufferView(1,constants->GetGPUVirtualAddress());
-        D3D12_RESOURCE_BARRIER for_present[]={
-            Transition(filtered.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            Transition(prepared.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            Transition(destination.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
-                       D3D12_RESOURCE_STATE_RENDER_TARGET)};
-        list->ResourceBarrier(3,for_present);
-        list->SetPipelineState(present_pso_.Get());
         D3D12_VIEWPORT logical_viewport{0,0,float(fixture.width),float(fixture.height),0,1};
         list->RSSetViewports(1,&logical_viewport);
         list->RSSetScissorRects(1,&rect);
         list->OMSetRenderTargets(1,&rtvs[2],FALSE,nullptr);
-        list->DrawInstanced(3,1,0,0);
+        std::vector<SdkTimingHooks> hooks(collect_timing ? timing_repetitions : 0);
+        std::vector<gpu::FidelityFxDofTiming> hook_descriptors(collect_timing ? timing_repetitions : 0);
+        for (uint32_t iteration=0; iteration<timing_repetitions; ++iteration) {
+            gpu::DofGpuTiming::Scope prepare_scope;
+            if (collect_timing)
+                prepare_scope = gpu_timing.Measure(gpu::DofGpuTiming::Stage::ScenePrepare,list.Get());
+            if (iteration) {
+                D3D12_RESOURCE_BARRIER reuse_inputs[]={
+                    Transition(scene.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    Transition(destination.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_COPY_DEST),
+                    Transition(prepared.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET),
+                    Transition(encoded.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET),
+                    Transition(filtered.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                };
+                list->ResourceBarrier(static_cast<UINT>(std::size(reuse_inputs)),reuse_inputs);
+                list->CopyResource(destination.Get(),scene.Get());
+                D3D12_RESOURCE_BARRIER restore_inputs[]={
+                    Transition(scene.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                    Transition(destination.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET),
+                };
+                list->ResourceBarrier(static_cast<UINT>(std::size(restore_inputs)),restore_inputs);
+            } else {
+                auto scene_copy=Transition(scene.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1,&scene_copy);
+                list->CopyResource(destination.Get(),scene.Get());
+                D3D12_RESOURCE_BARRIER restore_inputs[]={
+                    Transition(scene.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                    Transition(destination.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET),
+                };
+                list->ResourceBarrier(static_cast<UINT>(std::size(restore_inputs)),restore_inputs);
+            }
+            list->SetDescriptorHeaps(1,heaps);
+            list->SetGraphicsRootSignature(adapter_root_.Get());
+            list->SetGraphicsRootDescriptorTable(0,srv_heap->GetGPUDescriptorHandleForHeapStart());
+            list->SetGraphicsRootConstantBufferView(1,constants->GetGPUVirtualAddress());
+            list->SetPipelineState(prepare_pso_.Get());
+            list->OMSetRenderTargets(2,rtvs,FALSE,nullptr);
+            list->DrawInstanced(3,1,0,0);
+            D3D12_RESOURCE_BARRIER for_compute[]={
+                Transition(prepared.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                Transition(encoded.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+            list->ResourceBarrier(2,for_compute);
+            prepare_scope.End();
+
+            SdkTimingHooks* current_hooks = collect_timing ? &hooks[iteration] : nullptr;
+            gpu::FidelityFxDofTiming* current_sdk_timing = nullptr;
+            if (collect_timing) {
+                current_hooks->timing = &gpu_timing;
+                hook_descriptors[iteration] = {current_hooks,&SdkTimingHooks::Mark};
+                current_sdk_timing = &hook_descriptors[iteration];
+            }
+            auto sdk_scope = collect_timing
+                ? gpu_timing.Measure(gpu::DofGpuTiming::Stage::Sdk,list.Get())
+                : gpu::DofGpuTiming::Scope{};
+            if (!dof.Dispatch(list.Get(),prepared.Get(),encoded.Get(),filtered.Get(),fixture.bound*scale,
+                              current_sdk_timing))
+                throw std::runtime_error(std::string("adapter FidelityFX Dispatch: ")+dof.Failure());
+            sdk_scope.End();
+            if (collect_timing) {
+                Check(!current_hooks->invalid && current_hooks->next == 5 &&
+                      std::all_of(current_hooks->started.begin(),current_hooks->started.end(),[](bool v){return v;}) &&
+                      std::all_of(current_hooks->ended.begin(),current_hooks->ended.end(),[](bool v){return v;}),
+                      "FidelityFX timing callbacks were missing, duplicated, or out of pass order");
+            }
+            // The SDK changes heaps/root bindings, so restore them before the production present shader.
+            list->SetDescriptorHeaps(1,heaps);
+            list->SetGraphicsRootSignature(adapter_root_.Get());
+            list->SetGraphicsRootDescriptorTable(0,present_table);
+            list->SetGraphicsRootConstantBufferView(1,constants->GetGPUVirtualAddress());
+            D3D12_RESOURCE_BARRIER for_present[]={
+                Transition(filtered.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                Transition(prepared.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            };
+            list->ResourceBarrier(2,for_present);
+            auto compose_scope = collect_timing
+                ? gpu_timing.Measure(gpu::DofGpuTiming::Stage::SceneCompose,list.Get())
+                : gpu::DofGpuTiming::Scope{};
+            list->SetPipelineState(present_pso_.Get());
+            list->OMSetRenderTargets(1,&rtvs[2],FALSE,nullptr);
+            list->DrawInstanced(3,1,0,0);
+            compose_scope.End();
+        }
         D3D12_RESOURCE_BARRIER for_readback[]={
             Transition(destination.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
                        D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -506,16 +649,27 @@ public:
         copy_to_buffer(destination.Get(),destination_readback.Get(),color_fp);
         copy_to_buffer(prepared.Get(),prepared_readback.Get(),processing_color_fp);
         copy_to_buffer(encoded.Get(),encoded_readback.Get(),processing_depth_fp);
+        if (collect_timing) gpu_timing.Resolve(list.Get());
         Hr(list->Close(),"Close adapter list");
         ID3D12CommandList* lists[]={list.Get()};
         queue_->ExecuteCommandLists(1,lists);
-        Wait();
+        Wait(collect_timing ? &gpu_timing : nullptr, timing_frame);
         AdapterResult result;
         result.destination=ReadColor(destination_readback.Get(),color_fp,fixture.width,fixture.height);
         result.prepared_color=ReadColor(prepared_readback.Get(),processing_color_fp,
                                         processing.width,processing.height);
         result.encoded_depth=ReadFloat(encoded_readback.Get(),processing_depth_fp,
                                         processing.width,processing.height);
+        if (collect_timing) {
+            const auto report = gpu_timing.TakeReport();
+            Check(report.available && report.complete_frames == 1 && report.invalid_frames == 0 &&
+                  report.frame_sample_count == 1,
+                  "GPU timing report did not contain one valid completed frame");
+            result.timing = report.frame_samples[0];
+            result.timing_frequency = report.frequency;
+            result.timing_repetitions = timing_repetitions;
+            result.has_timing = true;
+        }
         return result;
     }
 
@@ -1515,12 +1669,261 @@ void CompareQualityModes(Warp& warp, gpu::FidelityFxDof& dof) {
     dof.Reset();
 }
 
+Fixture MakeTimingFixture(uint32_t width, uint32_t height, bool mixed) {
+    Fixture f = MakeFixture(width, height, 32.0f);
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const float fx = float(x) / float(std::max(1u, width - 1));
+            const float fy = float(y) / float(std::max(1u, height - 1));
+            const float checker = ((x / 7 + y / 5) & 1) ? 0.12f : 0.0f;
+            const float edge = ((x / std::max(1u, width / 12)) & 1) ? 0.23f : 0.0f;
+            f.color[At(f,x,y)] = {std::clamp(0.12f + 0.68f * fx + checker, 0.0f, 1.0f),
+                                  std::clamp(0.10f + 0.70f * fy + edge, 0.0f, 1.0f),
+                                  std::clamp(0.18f + 0.44f * (1.0f - fx) + checker, 0.0f, 1.0f),
+                                  1.0f};
+            if (!mixed) {
+                f.depth[At(f,x,y)] = fx < 0.30f ? 0.27f : fx < 0.70f ? 0.50f : 0.74f;
+            } else {
+                const uint32_t region = ((x / std::max(1u, width / 8)) +
+                                         2 * (y / std::max(1u, height / 6))) % 3;
+                const float plane = region == 0 ? 0.24f : region == 1 ? 0.50f : 0.77f;
+                const float texture = (((x * 13u + y * 7u) & 15u) < 8u) ? -0.025f : 0.025f;
+                f.depth[At(f,x,y)] = std::clamp(plane + texture, 0.18f, 0.84f);
+            }
+        }
+    }
+    return f;
+}
+
+void CompareTimingImages(const std::vector<Pixel>& reference, const std::vector<Pixel>& timed) {
+    Check(reference.size() == timed.size(), "timed/untimed output sizes differ");
+    float max_error = 0.0f;
+    double squared = 0.0;
+    uint64_t values = 0;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const float a[] = {reference[i].r, reference[i].g, reference[i].b, reference[i].a};
+        const float b[] = {timed[i].r, timed[i].g, timed[i].b, timed[i].a};
+        for (size_t c = 0; c < 4; ++c) {
+            const float error = std::fabs(a[c] - b[c]);
+            max_error = std::max(max_error, error);
+            squared += double(error) * error;
+            ++values;
+        }
+    }
+    const double rms = std::sqrt(squared / double(values));
+    std::printf("timing parity: max %.8f RMS %.8f\n", max_error, rms);
+    Check(max_error <= 1.0e-3f && rms <= 1.0e-5,
+          "enabling FidelityFX GPU timing callbacks changed output pixels");
+}
+
+using SdkTicks = std::array<uint64_t, 5>;
+constexpr gpu::DofGpuTiming::Stage kTimedSdkStages[] = {
+    gpu::DofGpuTiming::Stage::SdkDownsampleDepth,
+    gpu::DofGpuTiming::Stage::SdkDownsampleColor,
+    gpu::DofGpuTiming::Stage::SdkDilate,
+    gpu::DofGpuTiming::Stage::SdkBlur,
+    gpu::DofGpuTiming::Stage::SdkComposite,
+};
+constexpr const char* kTimedSdkNames[] = {
+    "downsample_depth", "downsample_color", "dilate", "blur", "composite",
+};
+
+SdkTicks GetSdkTicks(const gpu::DofGpuTiming::FrameSample& sample) {
+    SdkTicks ticks{};
+    for (size_t i = 0; i < ticks.size(); ++i)
+        ticks[i] = sample.ticks[static_cast<uint32_t>(kTimedSdkStages[i])];
+    return ticks;
+}
+
+double TicksToMs(uint64_t ticks, uint64_t frequency) {
+    return double(ticks) * 1000.0 / double(frequency);
+}
+
+struct WorldBenchSample {
+    uint64_t total_ticks = 0;
+    SdkTicks sdk_ticks{};
+};
+
+struct WorldBenchCase {
+    const char* name = nullptr;
+    uint32_t width = 0, height = 0;
+    uint32_t processing_width = 0, processing_height = 0;
+    bool mixed = false;
+    uint32_t scale = 1, rings = 4;
+    uint32_t iterations = 0;
+    bool no_merge = false;
+    uint64_t frequency = 0;
+    std::vector<WorldBenchSample> samples;
+};
+
+void CheckTimingHierarchy(const AdapterResult& timed) {
+    Check(timed.has_timing && timed.timing_frequency != 0,
+          "timed adapter run did not return a GPU timestamp sample");
+    const uint64_t total = timed.timing.ticks[static_cast<uint32_t>(gpu::DofGpuTiming::Stage::DofTotal)];
+    const auto sdk = GetSdkTicks(timed.timing);
+    uint64_t child_sum = 0;
+    for (size_t i = 0; i < sdk.size(); ++i) {
+        Check(timed.timing.intervals[static_cast<uint32_t>(kTimedSdkStages[i])] == timed.timing_repetitions,
+              "SDK timing sample count does not match measured repetitions");
+        child_sum += sdk[i];
+    }
+    Check(total + 1 >= child_sum,
+          "prepare + SDK + present total is shorter than its five nested SDK passes");
+}
+
+std::vector<WorldBenchCase> RunWorldBenchmark(Warp& warp, uint32_t repetitions) {
+    std::vector<WorldBenchCase> cases;
+    constexpr std::pair<uint32_t,uint32_t> extents[] = {{1280,720},{2880,2160}};
+    for (const auto [width,height] : extents) {
+        for (const bool mixed : {false,true}) {
+            WorldBenchCase bench{};
+            bench.name = mixed ? "mixed" : "typical";
+            bench.width = width;
+            bench.height = height;
+            bench.mixed = mixed;
+            // Production High/Cinematic profile: 2x processing extent, eight SDK rings, no merge.
+            bench.scale = 2;
+            bench.rings = 8;
+            bench.no_merge = true;
+            bench.iterations = repetitions;
+            const auto processing = gpu::FidelityFxDofProcessingSize(width,height,bench.scale);
+            Check(processing.width && processing.height,"benchmark processing extent is unsupported");
+            bench.processing_width = processing.width;
+            bench.processing_height = processing.height;
+            gpu::FidelityFxDof dof;
+            Check(dof.Create(warp.Device(),processing.width,processing.height,bench.rings,bench.no_merge),
+                  dof.Failure());
+            const Fixture fixture = MakeTimingFixture(width,height,mixed);
+            const D3D12_RECT full{0,0,LONG(width),LONG(height)};
+            // The untimed pass warms the SDK context/PSOs and provides a same-input parity reference.
+            std::vector<Pixel> untimed_reference;
+            {
+                auto warmup = warp.RunAdapter(dof,fixture,full,bench.scale,12.0f,1.0f,0.45f,
+                                              bench.rings,bench.no_merge,false);
+                CheckFiniteAndBounded(warmup.destination);
+                untimed_reference = std::move(warmup.destination);
+            }
+            // RunAdapter allocates its input/output/query resources and binds its PSOs before this
+            // repeated command-list loop. The loop reuses those objects and excludes context setup.
+            const auto timed = warp.RunAdapter(dof,fixture,full,bench.scale,12.0f,1.0f,0.45f,
+                                               bench.rings,bench.no_merge,true,repetitions);
+            CheckTimingHierarchy(timed);
+            CompareTimingImages(untimed_reference,timed.destination);
+            const uint32_t total_index = static_cast<uint32_t>(gpu::DofGpuTiming::Stage::DofTotal);
+            bench.frequency = timed.timing_frequency;
+            bench.samples.push_back({timed.timing.ticks[total_index] / repetitions,
+                                     GetSdkTicks(timed.timing)});
+            for (uint64_t& ticks : bench.samples.back().sdk_ticks) ticks /= repetitions;
+            std::printf("world timing native %ux%u -> processing %ux%u %s, scale %u, %u rings, "
+                        "merge disabled, 1x scene/depth inputs: ",
+                        width,height,processing.width,processing.height,bench.name,bench.scale,bench.rings);
+            const auto& last = bench.samples.back();
+            std::printf("total %.3f ms; SDK",TicksToMs(last.total_ticks,bench.frequency));
+            for (size_t i = 0; i < last.sdk_ticks.size(); ++i)
+                std::printf(" %s=%.3f",kTimedSdkNames[i],TicksToMs(last.sdk_ticks[i],bench.frequency));
+            std::puts(" ms");
+            cases.push_back(std::move(bench));
+        }
+    }
+    return cases;
+}
+
+std::string Utf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int bytes = WideCharToMultiByte(CP_UTF8,0,value.data(),int(value.size()),nullptr,0,nullptr,nullptr);
+    Check(bytes > 0,"failed to encode adapter name as UTF-8");
+    std::string out(size_t(bytes),'\0');
+    Check(WideCharToMultiByte(CP_UTF8,0,value.data(),int(value.size()),out.data(),bytes,nullptr,nullptr) == bytes,
+          "failed to encode adapter name as UTF-8");
+    return out;
+}
+
+std::string JsonEscape(const std::string& value) {
+    std::string out;
+    for (const unsigned char c : value) {
+        if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(char(c)); }
+        else if (c < 0x20) out.push_back(' ');
+        else out.push_back(char(c));
+    }
+    return out;
+}
+
+void WriteWorldBenchmarkJson(const std::filesystem::path& path, const std::wstring& adapter,
+                             const std::vector<WorldBenchCase>& cases) {
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path,std::ios::binary);
+    Check(bool(out),"cannot create world timing JSON output");
+    out << "{\n  \"adapter\":\"" << JsonEscape(Utf8(adapter)) << "\",\n"
+        << "  \"timing_source\":\"D3D12 timestamp queries\",\n"
+        << "  \"sample_count\":1,\n  \"cases\":[\n";
+    for (size_t c = 0; c < cases.size(); ++c) {
+        const auto& bench = cases[c];
+        out << "    {\"name\":\"" << bench.name << "\",\"width\":" << bench.width
+            << ",\"height\":" << bench.height << ",\"scene\":\""
+            << (bench.mixed ? "mixed" : "typical") << "\",\"processing_width\":"
+            << bench.processing_width << ",\"processing_height\":" << bench.processing_height
+            << ",\"scale\":" << bench.scale
+            << ",\"profile\":\"production High/Cinematic 2x, eight-ring\",\"rings\":" << bench.rings
+            << ",\"input_samples\":1,\"iterations_per_sample\":"
+            << bench.iterations << ",\"ring_merge_disabled\":"
+            << (bench.no_merge ? "true" : "false") << ",\"frequency_hz\":" << bench.frequency
+            << ",\"samples\":[";
+        for (size_t i = 0; i < bench.samples.size(); ++i) {
+            const auto& sample = bench.samples[i];
+            if (i) out << ',';
+            uint64_t child_sum = 0;
+            for (const uint64_t ticks : sample.sdk_ticks) child_sum += ticks;
+            out << "{\"pipeline_total_ms\":" << TicksToMs(sample.total_ticks,bench.frequency)
+                << ",\"pipeline_total_ticks\":" << sample.total_ticks
+                << ",\"sdk_pass_sum_ms\":" << TicksToMs(child_sum,bench.frequency)
+                << ",\"hierarchy_margin_ms\":" << TicksToMs(sample.total_ticks-child_sum,bench.frequency)
+                << ",\"sdk_passes\":[";
+            for (size_t j = 0; j < sample.sdk_ticks.size(); ++j) {
+                if (j) out << ',';
+                out << "{\"name\":\"" << kTimedSdkNames[j] << "\",\"order\":" << j
+                    << ",\"ticks\":" << sample.sdk_ticks[j]
+                    << ",\"milliseconds\":" << TicksToMs(sample.sdk_ticks[j],bench.frequency) << '}';
+            }
+            out << "]}";
+        }
+        out << "]}" << (c + 1 == cases.size() ? "\n" : ",\n");
+    }
+    out << "  ]\n}\n";
+    Check(bool(out),"failed while writing world timing JSON output");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        bool hardware = false;
+        bool benchmark = false;
+        uint32_t repetitions = 3;
+        std::filesystem::path json_path = "out/tests/fidelityfx-dof/world-timing.json";
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg == "--hardware") hardware = true;
+            else if (arg == "--benchmark") benchmark = true;
+            else if (arg == "--json" && i + 1 < argc) json_path = argv[++i];
+            else if (arg == "--samples" && i + 1 < argc) {
+                const int parsed = std::stoi(argv[++i]);
+                Check(parsed >= 1 && parsed <= 20,"--samples must be between 1 and 20");
+                repetitions = uint32_t(parsed);
+            } else {
+                throw std::runtime_error("usage: newffx_dof_warp [--hardware] [--benchmark --hardware] "
+                                         "[--samples 1..20] [--json path]");
+            }
+        }
+        Check(!benchmark || hardware,"--benchmark requires explicit --hardware; WARP timing is not performance data");
         CheckAdapterCompilation();
-        Warp warp;
+        Warp warp(hardware);
+        if (benchmark) {
+            const auto cases = RunWorldBenchmark(warp,repetitions);
+            WriteWorldBenchmarkJson(json_path,warp.AdapterName(),cases);
+            std::printf("PASS: hardware world timing benchmark (%u samples/case), JSON %s\n",
+                        repetitions,json_path.string().c_str());
+            return 0;
+        }
         gpu::FidelityFxDof dof;
         Check(dof.Create(warp.Device(), 96, 64), dof.Failure());
         Check(dof.Ready() && dof.Matches(96,64), "initial FidelityFX context not ready");
@@ -1559,7 +1962,8 @@ int main() {
         CheckCinematicOddBottomEdge(warp,dof);
         dof.Reset();
         CompareQualityModes(warp,dof);
-        std::puts("PASS: production FidelityFX DoF on D3D12 WARP");
+        std::puts(hardware ? "PASS: production FidelityFX DoF on D3D12 hardware"
+                           : "PASS: production FidelityFX DoF on D3D12 WARP");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
