@@ -74,6 +74,9 @@ bool CoverageBenchmark=false,F793Benchmark=false,DepthLessEqual=false,SceneVisib
 bool SharedOff=false;
 bool GatherBenchmark=false;
 bool VisibilityBenchmark=false;
+bool GroupColorPages=false;
+bool MixedCacheEligibility=false;
+bool CompareColorBatching=false;
 bool MixedSamples=false,AdditiveBenchmark=false,WarpCorrectness=false;
 uint32_t Warmups=8,MeasuredPairs=16;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
@@ -292,7 +295,8 @@ public:
                                VisibilityBenchmark ||
                                (GatherBenchmark && mode==Mode::F793After);
         const bool shared=mode==Mode::F793After && Samples==2 && !SharedOff;
-        const bool visibility=VisibilityBenchmark && mode==Mode::F793After;
+        const bool visibility=VisibilityBenchmark &&
+            (mode==Mode::F793After || (CompareColorBatching && mode==Mode::F793Before));
         const uint32_t range_levels=1;
         Require(!capture_samples || coverage,"sample capture requires an MSAA coverage mode");
         // Resource creation, uploads and PSO creation are deliberately outside GPU timestamps.
@@ -469,6 +473,7 @@ public:
             const auto barrier = Barrier(resource, state, next);
             list->ResourceBarrier(1, &barrier); state = next;
         };
+        const bool group_color_pages=visibility && GroupColorPages && mode==Mode::F793After;
         for (uint32_t batch = 0; batch < Batches; ++batch) {
             if (!UsesAtlas(mode)) {
                 timed(composites, [&] {
@@ -478,11 +483,15 @@ public:
                 });
                 continue;
             }
-            const auto& active_rects=visibility?visibility_rects_:page_rects_;
-            const auto& active_cb=visibility?visibility_page_dcbs_:page_dcbs_;
-            const size_t page_count=visibility?visibility_pages_.size():pages_.size();
+            const auto& active_rects=visibility && !group_color_pages?
+                visibility_rects_:page_rects_;
+            const auto& active_cb=visibility && !group_color_pages?
+                visibility_page_dcbs_:page_dcbs_;
+            const size_t page_count=visibility && !group_color_pages?
+                visibility_pages_.size():pages_.size();
+            size_t next_visibility_chunk=0;
             for (size_t page_index = 0; page_index < page_count; ++page_index) {
-                const auto page=visibility?
+                const auto page=visibility && !group_color_pages?
                     gpu::ParticleDofAtlasPage{visibility_pages_[page_index].first_quad,
                                               visibility_pages_[page_index].quad_count}:
                     pages_[page_index];
@@ -563,50 +572,78 @@ public:
                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     });
                 }
-                if (visibility && visibility_pages_[page_index].cached) {
-                    timed(transmissions,[&] {
-                        transition(visibility_atlas.Get(),visibility_state,
-                                   D3D12_RESOURCE_STATE_RENDER_TARGET);
-                        list->RSSetViewports(1,&atlas_viewport);
-                        list->RSSetScissorRects(1,&atlas_scissor);
-                        list->SetGraphicsRootDescriptorTable(0,descriptors.native_srv);
+                size_t chunk_begin=page_index,chunk_end=page_index+1;
+                if (group_color_pages) {
+                    chunk_begin=next_visibility_chunk;
+                    uint32_t next_quad=page.first_quad;
+                    const uint32_t page_end=page.first_quad+page.quad_count;
+                    while (next_visibility_chunk<visibility_pages_.size() &&
+                           visibility_pages_[next_visibility_chunk].first_quad<page_end) {
+                        const auto& chunk=visibility_pages_[next_visibility_chunk++];
+                        Require(chunk.first_quad==next_quad && chunk.quad_count>0 &&
+                                chunk.quad_count<=page_end-next_quad,
+                                "visibility chunk escaped its original color page or changed draw order");
+                        next_quad+=chunk.quad_count;
+                    }
+                    chunk_end=next_visibility_chunk;
+                    Require(chunk_begin<chunk_end && next_quad==page_end,
+                            "visibility chunks did not cover their original color page");
+                }
+                for (size_t chunk_index=chunk_begin;chunk_index<chunk_end;++chunk_index) {
+                    const auto draw_page=group_color_pages?
+                        gpu::ParticleDofAtlasPage{visibility_pages_[chunk_index].first_quad,
+                                                  visibility_pages_[chunk_index].quad_count}:page;
+                    const auto draw_cb=group_color_pages?
+                        visibility_page_dcbs_[chunk_index]->GetGPUVirtualAddress():page_cb;
+                    const bool cached=visibility && visibility_pages_[chunk_index].cached;
+                    if (cached) {
+                        timed(transmissions,[&] {
+                            transition(visibility_atlas.Get(),visibility_state,
+                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            list->RSSetViewports(1,&atlas_viewport);
+                            list->RSSetScissorRects(1,&atlas_scissor);
+                            list->SetGraphicsRootDescriptorTable(0,descriptors.native_srv);
+                            list->SetGraphicsRootConstantBufferView(1,
+                                visibility_vcb_->GetGPUVirtualAddress());
+                            list->SetGraphicsRootConstantBufferView(2,draw_cb);
+                            list->IASetVertexBuffers(0,1,&native_vbv);
+                            list->SetPipelineState(visibility_source_pso_.Get());
+                            list->OMSetRenderTargets(1,&descriptors.visibility_rtv,FALSE,nullptr);
+                            list->DrawIndexedInstanced(draw_page.quad_count*6,1,
+                                                       draw_page.first_quad*6,0,0);
+                            list->IASetVertexBuffers(0,1,&vbv);
+                            transition(visibility_atlas.Get(),visibility_state,
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        });
+                    }
+                    timed(composites, [&] {
+                        list->RSSetViewports(1, &viewport);
+                        list->RSSetScissorRects(1, &scissor);
+                        list->SetGraphicsRootDescriptorTable(0,
+                            cached?descriptors.visibility_composite_srv:
+                            shared?descriptors.shared_composite_srv:descriptors.composite_srv);
                         list->SetGraphicsRootConstantBufferView(1,
-                            visibility_vcb_->GetGPUVirtualAddress());
-                        list->SetGraphicsRootConstantBufferView(2,page_cb);
-                        list->IASetVertexBuffers(0,1,&native_vbv);
-                        list->SetPipelineState(visibility_source_pso_.Get());
-                        list->OMSetRenderTargets(1,&descriptors.visibility_rtv,FALSE,nullptr);
-                        list->DrawIndexedInstanced(page.quad_count*6,1,page.first_quad*6,0,0);
-                        list->IASetVertexBuffers(0,1,&vbv);
-                        transition(visibility_atlas.Get(),visibility_state,
-                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                            visibility?visibility_vcb_->GetGPUVirtualAddress():
+                                       vcb_->GetGPUVirtualAddress());
+                        list->SetGraphicsRootConstantBufferView(2, draw_cb);
+                        list->SetPipelineState(visibility?
+                            (cached?visibility_composite_pso_.Get():coverage_after_pso_.Get()):
+                            mode==Mode::CoverageBefore?coverage_before_pso_.Get():
+                            mode==Mode::CoverageAfter?coverage_after_pso_.Get():
+                            mode==Mode::F793Before?f793_composite_pso_.Get():
+                            mode==Mode::F793After?
+                                (shared?shared_composite_pso_.Get():coverage_after_pso_.Get()):
+                            composite_pso_.Get());
+                        list->OMSetRenderTargets(1,&descriptors.target_rtv,FALSE,
+                                                  coverage?&descriptors.dsv_read:nullptr);
+                        list->DrawIndexedInstanced(draw_page.quad_count * 6, 1,
+                                                   draw_page.first_quad * 6, 0, 0);
                     });
                 }
-                timed(composites, [&] {
-                    list->RSSetViewports(1, &viewport);
-                    list->RSSetScissorRects(1, &scissor);
-                    list->SetGraphicsRootDescriptorTable(0,
-                        visibility && visibility_pages_[page_index].cached?
-                            descriptors.visibility_composite_srv:
-                        shared?descriptors.shared_composite_srv:descriptors.composite_srv);
-                    list->SetGraphicsRootConstantBufferView(1,
-                        visibility?visibility_vcb_->GetGPUVirtualAddress():
-                                   vcb_->GetGPUVirtualAddress());
-                    list->SetGraphicsRootConstantBufferView(2, page_cb);
-                    list->SetPipelineState(mode==Mode::CoverageBefore?coverage_before_pso_.Get():
-                                           mode==Mode::CoverageAfter?coverage_after_pso_.Get():
-                                           mode==Mode::F793Before?f793_composite_pso_.Get():
-                                            mode==Mode::F793After?
-                                                (visibility && visibility_pages_[page_index].cached?
-                                                    visibility_composite_pso_.Get():
-                                                 shared?shared_composite_pso_.Get():
-                                                        coverage_after_pso_.Get()):
-                                           composite_pso_.Get());
-                    list->OMSetRenderTargets(1,&descriptors.target_rtv,FALSE,
-                                              coverage?&descriptors.dsv_read:nullptr);
-                    list->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
-                });
             }
+            if (group_color_pages)
+                Require(next_visibility_chunk==visibility_pages_.size(),
+                        "grouped color pages left visibility chunks undrawn");
         }
         const UINT all_end = ticks; stamp();
         list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,0,ticks,
@@ -1089,8 +1126,14 @@ private:
         for (uint32_t q=0;q<Quads;++q) {
             const float x=(260+float(q%4)*5)*float(W)/1280.0f;
             const float y=(120+float(q/4)*5)*float(H)/720.0f;
-            const float quad_width=QuadScale*760.0f*float(W)/1280.0f;
-            const float quad_height=QuadScale*480.0f*float(H)/720.0f;
+            const float full_width=QuadScale*760.0f*float(W)/1280.0f;
+            const float full_height=QuadScale*480.0f*float(H)/720.0f;
+            // Tiny alternating native quads still draw/filter, but their
+            // receiver footprint is below the production Vq admission limit.
+            const float quad_width=MixedCacheEligibility && (q&1)?
+                std::min(full_width,16.0f):full_width;
+            const float quad_height=MixedCacheEligibility && (q&1)?
+                std::min(full_height,16.0f):full_height;
             const float z=(GatherBenchmark || VisibilityBenchmark)?
                            1.0f/gather_depths[q%gather_depths.size()]:
                           CoverageBenchmark?1.0f/12.0f:1.0f/3.0f;
@@ -1130,6 +1173,13 @@ private:
                 cached+=page.cached?1u:0u;
             }
             Require(next==Quads,"visibility planner lost native quads");
+            if (MixedCacheEligibility) {
+                Require(Quads>=2 && cached>0 && cached<visibility_pages_.size(),
+                        "mixed eligibility fixture needs cached and fallback chunks");
+                for (uint32_t q=0;q<Quads;++q)
+                    Require((visibility_maps_[q].atlas_xy!=0xffffffffu)==!(q&1),
+                            "alternating native quads did not split cache eligibility");
+            }
             std::printf("Visibility planner: %zu ordered chunks, %u cached, halo %u px\n",
                         visibility_pages_.size(),cached,visibility_halo_);
         }
@@ -1483,6 +1533,8 @@ void Print(const char* name,const std::vector<Result>& runs) {
 struct Difference {
     float maximum=0;
     double rms=0,active_rms=0,rgb_energy_percent=0,alpha_energy_percent=0;
+    size_t max_pixel=0,max_channel=0;
+    float max_before=0,max_after=0;
 };
 Difference Compare(const Result& reference,const Result& candidate,const char* label) {
     Require(reference.rgba.size()==candidate.rgba.size(),"RGBA readback sizes differ");
@@ -1498,7 +1550,13 @@ Difference Compare(const Result& reference,const Result& candidate,const char* l
             const float a=FromHalf(reference.rgba[index]),b=FromHalf(candidate.rgba[index]);
             Require(std::isfinite(a)&&std::isfinite(b),"benchmark RGBA is nonfinite");
             const float delta=std::abs(a-b);
-            difference.maximum=std::max(difference.maximum,delta);
+            if (delta>difference.maximum) {
+                difference.maximum=delta;
+                difference.max_pixel=pixel;
+                difference.max_channel=channel;
+                difference.max_before=a;
+                difference.max_after=b;
+            }
             pixel_squared+=double(delta)*delta;
             old_energy[channel]+=std::abs(double(a)-clear[channel]);
             new_energy[channel]+=std::abs(double(b)-clear[channel]);
@@ -1514,9 +1572,16 @@ Difference Compare(const Result& reference,const Result& candidate,const char* l
     difference.rgb_energy_percent=100*std::abs(new_rgb-old_rgb)/std::max(old_rgb,1e-12);
     difference.alpha_energy_percent=100*std::abs(new_energy[3]-old_energy[3])/std::max(old_energy[3],1e-12);
     std::printf("%s RGBA16F: max %.6f, full RMS %.6f, active RMS %.6f (%zu pixels), "
-                "absolute background-relative RGB/alpha energy delta %.4f%%/%.4f%%\n",
+                "absolute background-relative RGB/alpha energy delta %.4f%%/%.4f%%",
                 label,difference.maximum,difference.rms,difference.active_rms,active_pixels,
                 difference.rgb_energy_percent,difference.alpha_energy_percent);
+    if (difference.maximum>0) {
+        const size_t row_width=reference.rgba.size()/4==size_t(W)*H?W:64;
+        std::printf("; max at (%zu,%zu) channel %zu: %.8f -> %.8f",
+                    difference.max_pixel%row_width,difference.max_pixel/row_width,
+                    difference.max_channel,difference.max_before,difference.max_after);
+    }
+    std::puts("");
     return difference;
 }
 
@@ -1580,6 +1645,12 @@ int main(int argc,char** argv) {
                 GatherBenchmark=CoverageBenchmark=F793Benchmark=SharedOff=true;
             } else if (std::strcmp(argv[arg],"--visibility-cache")==0) {
                 VisibilityBenchmark=CoverageBenchmark=F793Benchmark=SharedOff=true;
+            } else if (std::strcmp(argv[arg],"--group-color-pages")==0) {
+                GroupColorPages=true;
+            } else if (std::strcmp(argv[arg],"--mixed-cache-eligibility")==0) {
+                MixedCacheEligibility=true;
+            } else if (std::strcmp(argv[arg],"--compare-color-batching")==0) {
+                CompareColorBatching=true;
             } else if (std::strcmp(argv[arg],"--mixed-samples")==0) {
                 MixedSamples=true;
             } else if (std::strcmp(argv[arg],"--additive")==0) {
@@ -1668,6 +1739,9 @@ int main(int argc,char** argv) {
             } else {
                 throw std::runtime_error("usage: new_smoke_dof_gpu_bench "
                     "[--coverage|--coverage-baseline|--gather|--visibility-cache] "
+                    "[--group-color-pages requires --visibility-cache] "
+                    "[--mixed-cache-eligibility requires --visibility-cache] "
+                    "[--compare-color-batching requires --visibility-cache --group-color-pages] "
                     "[--height 720|2160; --warp also 64..2160] "
                     "[--width 64..4096] [--radius px] "
                     "[--focus worldZ] [--near scale] [--far scale] "
@@ -1698,6 +1772,12 @@ int main(int argc,char** argv) {
                 "--gather compares both production shaders at O1");
         Require(!VisibilityBenchmark || Samples==2,
                 "--visibility-cache requires the production 2x MSAA FLOAT bounds variant");
+        Require(!GroupColorPages || VisibilityBenchmark,
+                "--group-color-pages requires --visibility-cache");
+        Require(!MixedCacheEligibility || VisibilityBenchmark,
+                "--mixed-cache-eligibility requires --visibility-cache");
+        Require(!CompareColorBatching || (VisibilityBenchmark && GroupColorPages),
+                "--compare-color-batching requires --visibility-cache --group-color-pages");
         Require(!VisibilityBenchmark || CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
                 "--visibility-cache compares both particle shaders at O1");
         Require(!CoverageBenchmark || F793Benchmark ||
@@ -1710,6 +1790,7 @@ int main(int argc,char** argv) {
                         "radius %.3f px, %u quads x %u layers, quad scale %.2f, %s scene, native %s, "
                         "candidate %s/%s; "
                         "%u warmups and %u measured runs/variant in ABBA order\n",
+                         CompareColorBatching?"split versus grouped Vq color pages":
                          VisibilityBenchmark?"bc30216 versus Vq visibility cache":
                          GatherBenchmark?"production UINT versus FLOAT gather":
                         F793Benchmark?"f793 shared coverage":"c591 quantized",W,H,Samples,
@@ -1729,6 +1810,16 @@ int main(int argc,char** argv) {
                             "and atlas material/filter; candidate times production cache "
                             "page splits, Vq generation and cached composition.\n",
                             FocusDistance,NearScale,FarScale,WallZ,ZeroInputW?0.0f:2.25f);
+            if (GroupColorPages)
+                std::puts("Grouped color pages: source/filter once per original atlas page, "
+                          "then ordered visibility-cache/fallback chunks; baseline uses "
+                          "the original color pages.");
+            if (CompareColorBatching)
+                std::puts("Color batching parity: before uses split Vq color pages and after "
+                          "uses grouped parent color pages; shaders and cache maps are identical.");
+            if (MixedCacheEligibility)
+                std::puts("Mixed cache eligibility: alternating native quads are 16x16 px "
+                          "and must use direct fallback without losing color filtering.");
             if (MixedSamples)
                 std::puts("Mixed 2x control: sample0 z4 wall/red, sample1 far/blue in a center stripe; "
                           "preparation is outside GPU timestamps for both variants.");
@@ -1763,13 +1854,16 @@ int main(int argc,char** argv) {
                 }
             Require(before.size()==MeasuredPairs && after.size()==MeasuredPairs,
                     "coverage ABBA pairing lost a measurement");
-            Print(VisibilityBenchmark?"bc30216 FLOAT direct pass2":
-                  GatherBenchmark?"production UINT bounds/direct pass2":
-                  F793Benchmark?"f793e2d baseline":"c591162 blur-aware pass2",before);
-            Print(VisibilityBenchmark?"Vq cache generation plus pass7":
-                  GatherBenchmark?"production FLOAT gather/direct pass2":
-                  F793Benchmark?"shared coverage candidate":"quantized blur-aware pass2",after);
+            if (!CompareColorBatching) {
+                Print(VisibilityBenchmark?"bc30216 FLOAT direct pass2":
+                      GatherBenchmark?"production UINT bounds/direct pass2":
+                      F793Benchmark?"f793e2d baseline":"c591162 blur-aware pass2",before);
+                Print(VisibilityBenchmark?"Vq cache generation plus pass7":
+                      GatherBenchmark?"production FLOAT gather/direct pass2":
+                      F793Benchmark?"shared coverage candidate":"quantized blur-aware pass2",after);
+            }
             const auto difference=Compare(before.front(),after.front(),
+                CompareColorBatching?"split/grouped Vq resolved":
                 VisibilityBenchmark?"bc30216/Vq resolved":
                 GatherBenchmark?"production UINT/FLOAT gather resolved":
                 F793Benchmark?"f793/shared resolved":"c591/quantized resolved");
@@ -1778,6 +1872,7 @@ int main(int argc,char** argv) {
             before_samples.rgba=before.front().sample_rgba;
             after_samples.rgba=after.front().sample_rgba;
             const auto sample_difference=Compare(before_samples,after_samples,
+                CompareColorBatching?"split/grouped Vq physical MS samples (64x16 ROI)":
                 VisibilityBenchmark?"bc30216/Vq physical MS samples (64x16 ROI)":
                 GatherBenchmark?"production UINT/FLOAT gather physical MS samples (64x16 ROI)":
                 F793Benchmark?"f793/shared physical MS samples (64x16 ROI)":
@@ -1789,27 +1884,35 @@ int main(int argc,char** argv) {
                  GatherBenchmark?"-production-float-gather":
                  F793Benchmark?"-f793-shared":
                                 "-c591-quantized")+
+                (GroupColorPages?"-grouped-color-pages":"")+
+                (MixedCacheEligibility?"-mixed-cache-eligibility":"")+
+                (CompareColorBatching?"-split-vs-grouped":"")+
                 (VisibilityBenchmark?"-wallz"+std::to_string(int(WallZ)):
                                      std::string{})+
                 (ZeroInputW?"-zero-w":"")+(MixedSamples?"-mixed":"")+
                 (AdditiveBenchmark?"-additive":"");
             WriteBmp(("coverage-before-"+suffix+".bmp").c_str(),before.front());
             WriteBmp(("coverage-after-"+suffix+".bmp").c_str(),after.front());
-            const double old_ms=MedianTotal(before),new_ms=MedianTotal(after);
-            std::printf("Coverage total median %.3f -> %.3f ms; composite median ",old_ms,new_ms);
-            std::vector<double> old_composite,new_composite;
-            for (const auto& r:before) old_composite.push_back(r.ms.composite);
-            for (const auto& r:after) new_composite.push_back(r.ms.composite);
-            std::printf("%.3f -> %.3f ms; reduction %.2f%% total, %.2f%% composite\n",
-                Percentile(old_composite,.5),Percentile(new_composite,.5),
-                100*(old_ms-new_ms)/std::max(old_ms,1e-9),
-                100*(Percentile(old_composite,.5)-Percentile(new_composite,.5))/
-                    std::max(Percentile(old_composite,.5),1e-9));
+            if (!CompareColorBatching) {
+                const double old_ms=MedianTotal(before),new_ms=MedianTotal(after);
+                std::printf("Coverage total median %.3f -> %.3f ms; composite median ",old_ms,new_ms);
+                std::vector<double> old_composite,new_composite;
+                for (const auto& r:before) old_composite.push_back(r.ms.composite);
+                for (const auto& r:after) new_composite.push_back(r.ms.composite);
+                std::printf("%.3f -> %.3f ms; reduction %.2f%% total, %.2f%% composite\n",
+                    Percentile(old_composite,.5),Percentile(new_composite,.5),
+                    100*(old_ms-new_ms)/std::max(old_ms,1e-9),
+                    100*(Percentile(old_composite,.5)-Percentile(new_composite,.5))/
+                        std::max(Percentile(old_composite,.5),1e-9));
+            }
             if (GatherBenchmark) {
                 Require(difference.maximum<=1e-5f && sample_difference.maximum<=1e-5f,
                         "production FLOAT gather changed resolved or physical-MS output");
             }
-            if (VisibilityBenchmark) {
+            if (CompareColorBatching) {
+                Require(difference.maximum==0 && sample_difference.maximum==0,
+                        "grouping color cells changed resolved or physical-MS output");
+            } else if (VisibilityBenchmark) {
                 Require(difference.maximum<=1e-5f && sample_difference.maximum<=1e-5f,
                         "Vq cache changed resolved or physical-MS output");
             }
@@ -1822,8 +1925,11 @@ int main(int argc,char** argv) {
                     sample_difference.rgb_energy_percent<=.15 &&
                     sample_difference.alpha_energy_percent<=.15,
                     "optimized blur-aware physical MS samples changed beyond tolerance");
-            std::puts("Coverage benchmark PASS; offscreen hardware timestamps are workload "
-                      "measurements, not gameplay FPS; GPU clocks and power state were not fixed.");
+            if (CompareColorBatching)
+                std::puts("Color batching parity PASS: resolved and physical-MS output matched exactly.");
+            else
+                std::puts("Coverage benchmark PASS; offscreen hardware timestamps are workload "
+                          "measurements, not gameplay FPS; GPU clocks and power state were not fixed.");
             return 0;
         }
         // Declared before measurement. These variants use the same source/composite,

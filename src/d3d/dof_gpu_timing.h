@@ -39,12 +39,17 @@ public:
         SdkComposite,
         ParticleSupport,
         ParticleTransmission,
+#if defined(BLACK_MISSION_BENCHMARK)
+        FrameGpu,
+#endif
         Count
     };
 
     static constexpr uint32_t kStageCount = uint32_t(Stage::Count);
     static constexpr uint32_t kSlots = 8;
-    static constexpr uint32_t kIntervalsPerFrame = 512;
+    // Dense native particle scenes exceed 512 intervals. Preserve complete
+    // frame measurements instead of losing the busiest frames to overflow.
+    static constexpr uint32_t kIntervalsPerFrame = 4096;
     static constexpr uint32_t kSamplesPerReport = 240;
     static constexpr uint32_t kFrameSamplesPerReport = 240;
     static_assert(kIntervalsPerFrame <= 0xffff);
@@ -376,7 +381,11 @@ public:
             "particle depth copy", "particle range", "particle source", "particle filter",
             "particle composite", "particle direct", "particle hierarchy",
             "SDK depth downsample", "SDK color downsample", "SDK dilate", "SDK blur", "SDK composite",
-            "particle support", "particle visibility"};
+            "particle support", "particle visibility"
+#if defined(BLACK_MISSION_BENCHMARK)
+            , "GPU frame"
+#endif
+        };
         static_assert(sizeof(names) / sizeof(names[0]) == kStageCount);
         const uint32_t index = uint32_t(stage);
         return index < kStageCount ? names[index] : "unknown";

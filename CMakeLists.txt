@@ -43,6 +43,12 @@ endif()
 
 add_xbe_image(Black default.xbe game.toml ${GAME_PARTITIONS} game)
 
+option(BLACK_MISSION_BENCHMARK "Build the opt-in hidden Mission 1 benchmark driver" OFF)
+if(BLACK_MISSION_BENCHMARK)
+    target_compile_definitions(Black PRIVATE BLACK_MISSION_BENCHMARK=1)
+    target_sources(Black PRIVATE tools/tests/mission1_host.cpp tools/tests/mission1_scene.cpp)
+endif()
+
 # Build the project's fixed/native-particle DoF shaders independently of the optional
 # official FidelityFX host component. This library is also used by balanced/viewmodel
 # paths and by offline fallback builds with BLACK_FIDELITYFX_DOF=OFF.

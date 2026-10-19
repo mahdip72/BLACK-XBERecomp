@@ -18,6 +18,7 @@
 #include "common/monitor.h"
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
+#include "common/mission_benchmark.h"
 #include "core/log.h"
 
 namespace game {
@@ -36,6 +37,9 @@ HCURSOR WindowCursor() {
 
 // the panel's keys and the mouse; F3 and the display mode stay with the host
 bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* result) {
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (bench::Enabled() && bench::Message(hwnd, msg, wp, lp, result)) return true;
+#endif
     using namespace app;
     switch (msg) {
         case WM_CREATE:
@@ -110,6 +114,9 @@ void UpdateTriggerRest(int port, input::Pad& pad) {
 
 // port 0 has the keyboard; the game sees no input while the panel is open
 void Pad(int port, input::Pad& pad) {
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (bench::Enabled()) { bench::Pad(port, pad); return; }
+#endif
     UpdateTriggerRest(port, pad);
     input::SeenPad(pad);
     if (port == 0) pad.connected = true;
@@ -119,6 +126,9 @@ void Pad(int port, input::Pad& pad) {
 
 // the vibration at the rumble intensity, none while the keyboard and mouse are in use
 void Rumble(int port, uint16_t& left, uint16_t& right) {
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (bench::Enabled()) { left = right = 0; return; }
+#endif
     uint32_t percent = std::clamp(Opt().rumble_intensity, 10u, 200u);
     if (port == 0 && input::KeyboardActive()) percent = 0;
     left = uint16_t(std::min(left * percent / 100, 0xFFFFu));  // past 100% the motors saturate
@@ -170,6 +180,16 @@ void Init() {
     BootLanguage();  // latched before the panel can change the setting
     input::LoadBindings();
     audio::SetOutputMode(Opt().audio_output);
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (bench::Enabled()) bench::Init();
+#endif
+}
+
+void Window(void* hwnd) {
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (bench::Enabled()) { bench::Window(hwnd); return; }
+#endif
+    input::StartMouse(hwnd);
 }
 
 void Save(void* table) {
@@ -246,7 +266,7 @@ const app::GameInfo app::kGame = {
     .save = game::Save,
     .init = game::Init,
     .loaded = nullptr,
-    .window = input::StartMouse,
+    .window = game::Window,
     .message = game::Message,
     .ui = app::DrawUi,
     .pad = game::Pad,

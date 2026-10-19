@@ -51,6 +51,7 @@
 #include "d3d/particle_dof_atlas.h"
 #include "d3d/particle_dof_shared_coverage.h"
 #include "d3d/particle_dof_visibility.h"
+#include "common/mission_benchmark.h"
 #include "d3d/particle_dof_wrapper.h"
 #include "d3d/dof_shader_source.h"
 #include "d3d/dof_shader_library.h"
@@ -1223,6 +1224,13 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
     std::unique_ptr<DofPipelineCache> dof_pipelines_;
     DofGpuTiming dof_timing_;
+#if defined(BLACK_MISSION_BENCHMARK)
+    DofGpuTiming::Scope benchmark_gpu_scope_;
+    bool benchmark_gpu_scope_open_ = false;
+    bool benchmark_proof_saved_ = false;
+    uint32_t benchmark_scene_presents_ = 0;
+    PerfClock::time_point benchmark_present_clock_ = PerfClock::now();
+#endif
     // At most one bounded report can be in flight. Disk work never blocks the render
     // thread; overloaded export batches are counted rather than queued indefinitely.
     std::future<bool> dof_csv_write_;
@@ -1607,6 +1615,10 @@ void D3D12Backend::Begin() {
 }
 
 void D3D12Backend::Submit(bool wait, bool final_native_present) {
+#if defined(BLACK_MISSION_BENCHMARK)
+    benchmark_gpu_scope_.End();
+    benchmark_gpu_scope_open_ = false;
+#endif
     dof_timing_.Resolve(cl_.Get());
     cl_->Close();
     ID3D12CommandList* lists[] = {cl_.Get()};
@@ -1626,6 +1638,12 @@ void D3D12Backend::Submit(bool wait, bool final_native_present) {
         f.used = 0;
         cl_->Reset(f.alloc.Get(), nullptr);
         Begin();
+#if defined(BLACK_MISSION_BENCHMARK)
+        if (game::bench::Enabled() && dof_timing_.Recording()) {
+            benchmark_gpu_scope_ = dof_timing_.Measure(DofGpuTiming::Stage::FrameGpu, cl_.Get());
+            benchmark_gpu_scope_open_ = true;
+        }
+#endif
     }
 }
 
@@ -1633,6 +1651,12 @@ void D3D12Backend::BeginDofTiming() {
     const bool enabled = dof_prepared_ && DofGpuProfilingEnabled();
     if (enabled && !dof_timing_.Available()) dof_timing_.Init(dev_.Get(), queue_.Get());
     dof_timing_.BeginFrame(presents_ + 1, enabled, fence_->GetCompletedValue());
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (game::bench::Enabled() && dof_timing_.Recording() && !benchmark_gpu_scope_open_) {
+        benchmark_gpu_scope_ = dof_timing_.Measure(DofGpuTiming::Stage::FrameGpu, cl_.Get());
+        benchmark_gpu_scope_open_ = true;
+    }
+#endif
     if (enabled && presents_ && presents_ % 120 == 0) {
         const auto report = dof_timing_.TakeReport();
         PublishDofGpuReport(report);
@@ -5084,17 +5108,28 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             visibility_source_pso = pipeline(visibility_source, true);
             visibility_composite_pso = pipeline(visibility_composite, false);
             if (visibility_source_pso && visibility_composite_pso) {
-                try {
-                    std::vector<ParticleDofAtlasPage> split_pages;
-                    split_pages.reserve(visibility_pages.size());
-                    std::vector<ParticleSharedCoverage> no_shared(visibility_pages.size());
-                    for (const auto& page : visibility_pages)
-                        split_pages.push_back({page.first_quad, page.quad_count});
-                    pages = std::move(split_pages); shared_pages = std::move(no_shared);
+                // Visibility packing only partitions native composites. Keep the
+                // original disjoint color cells together for one source/filter pair.
+                // Validate the complete partition before any destination draw.
+                size_t next = 0;
+                bool partitioned = true;
+                for (const auto& page : pages) {
+                    uint32_t first = page.first_quad, end = first + page.quad_count;
+                    while (first < end) {
+                        if (next >= visibility_pages.size() || visibility_pages[next].first_quad != first ||
+                            !visibility_pages[next].quad_count || visibility_pages[next].quad_count > end - first) {
+                            partitioned = false;
+                            break;
+                        }
+                        first += visibility_pages[next++].quad_count;
+                    }
+                    if (!partitioned) break;
+                }
+                if (partitioned && next == visibility_pages.size()) {
                     p.visibility_active = true;
                     p.visibility_target[0] = p.visibility_target[1] = float(p.visibility_extent);
                     p.visibility_target[2] = float(halo); p.visibility_target[3] = 0;
-                } catch (const std::bad_alloc&) { /* Keep the original ordered pages. */ }
+                }
             }
         }
     }
@@ -5103,7 +5138,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     ID3D12PipelineState* support_pso = nullptr;
     ID3D12PipelineState* field_pso = nullptr;
     ID3D12PipelineState* shared_pso = nullptr;
-    const bool shared_candidate = reuse_coverage && std::any_of(shared_pages.begin(), shared_pages.end(),
+    const bool shared_candidate = reuse_coverage && !p.visibility_active && std::any_of(shared_pages.begin(), shared_pages.end(),
         [](const ParticleSharedCoverage& plan) { return bool(plan); });
     if (shared_candidate && p.shared[0] && p.shared[1] && p.shared_width >= rt->w && p.shared_height >= rt->h) {
         support_pso = pipeline(support, false);
@@ -5181,11 +5216,11 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     GuestExtent size{};
     SurfaceSize(s.rt, size.w, size.h);
     p.globals.atlas_target[0] = p.globals.atlas_target[1] = float(extent);
+    size_t visibility_index = 0;
     for (size_t page_index = 0; page_index < pages.size(); ++page_index) {
         const auto& page = pages[page_index];
         const auto& shared = shared_pages[page_index];
         const bool use_shared = shared_ready && bool(shared);
-        const bool use_visibility = p.visibility_active && visibility_pages[page_index].cached;
         p.globals.atlas_target[2] = float(page.first_quad);
         p.globals.atlas_target[3] = float(page.quad_count);
         DrawConstants constants{};
@@ -5225,83 +5260,92 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
             cl_->DrawInstanced(6, page.quad_count, 0, 0);
             Transition(p.atlas[1].Get(), p.atlas_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
-        if (use_visibility) {
-            auto visibility_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleTransmission, cl_.Get());
-            Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            SetBlitTarget(ParticleVisibilityView(), p.visibility_extent, p.visibility_extent);
-            cl_->SetPipelineState(visibility_source_pso);
-            cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
-            cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
-            cl_->IASetVertexBuffers(0, 1, &native_view);
-            cl_->IASetIndexBuffer(&index_view);
-            cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            SetTextureViewsAndSamplers(s, stages, clamp);
-            cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
-            Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            ++p.visibility_pages; p.visibility_quads += page.quad_count;
-            if (p.visibility_pages == 1)
-                LOGR("Particle DOF native visibility cache active: %ux%u R16F, unchanged aperture samples",
-                     p.visibility_extent, p.visibility_extent);
-        }
-        if (use_shared) {
-            const D3D12_RECT box{shared.bounds[0], shared.bounds[1], shared.bounds[2], shared.bounds[3]};
-            Alloc field_vertices = Upload(sizeof(shared.vertices), 16);
-            std::memcpy(field_vertices.cpu, shared.vertices.data(), sizeof(shared.vertices));
-            const D3D12_VERTEX_BUFFER_VIEW field_vb{field_vertices.gpu, UINT(sizeof(shared.vertices)), sizeof(NativeParticleVertex)};
-            // A synthetic rectangle uses SV_VertexID/4==0. Only its representative
-            // metadata is needed; native page IDs/metadata remain unchanged for final blends.
-            auto globals = p.globals; globals.target[2] = 1;
-            Alloc field_constants = Upload(sizeof(constants) + sizeof(globals) + sizeof(ParticleDofQuad), 256);
-            auto* bytes = static_cast<uint8_t*>(field_constants.cpu);
-            std::memcpy(bytes, &constants, sizeof(constants));
-            std::memcpy(bytes + sizeof(constants), &globals, sizeof(globals));
-            std::memcpy(bytes + sizeof(constants) + sizeof(globals), &p.quads[page.first_quad], sizeof(ParticleDofQuad));
-            // Keep the original target's pixel-coordinate viewport even though scratch
-            // resources were reserved at the largest native extent during loading.
-            restore_target();
-            SetViewportScissor(s, size.w);
-            cl_->RSSetScissorRects(1, &box);
-            auto support_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleSupport, cl_.Get());
-            Transition(p.shared[0].Get(), p.shared_states[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const auto mask_view = ParticleSharedView(0);
-            cl_->OMSetRenderTargets(1, &mask_view, FALSE, nullptr);
-            const float zero[4] = {};
-            cl_->ClearRenderTargetView(mask_view, zero, 1, &box);
-            cl_->SetPipelineState(support_pso);
-            cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
-            cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
-            cl_->IASetVertexBuffers(0, 1, &native_view);
-            cl_->IASetIndexBuffer(&index_view);
-            cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            SetTextureViewsAndSamplers(s, filtered, clamp);
-            cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
-            Transition(p.shared[0].Get(), p.shared_states[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            support_timing.End();
+        // The filtered color page remains immutable until every ordered native
+        // chunk consumes it. Only the smaller visibility cache is reused here.
+        const uint32_t page_end = page.first_quad + page.quad_count;
+        for (uint32_t chunk_first = page.first_quad; chunk_first < page_end;) {
+            const ParticleDofVisibilityPage chunk = p.visibility_active ? visibility_pages[visibility_index++] :
+                ParticleDofVisibilityPage{chunk_first, page_end - chunk_first, false};
+            const bool use_visibility = p.visibility_active && chunk.cached;
+            if (use_visibility) {
+                auto visibility_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleTransmission, cl_.Get());
+                Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                SetBlitTarget(ParticleVisibilityView(), p.visibility_extent, p.visibility_extent);
+                cl_->SetPipelineState(visibility_source_pso);
+                cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
+                cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
+                cl_->IASetVertexBuffers(0, 1, &native_view);
+                cl_->IASetIndexBuffer(&index_view);
+                cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                SetTextureViewsAndSamplers(s, stages, clamp);
+                cl_->DrawIndexedInstanced(chunk.quad_count * 6, 1, chunk.first_quad * 6, 0, 0);
+                Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                ++p.visibility_pages; p.visibility_quads += chunk.quad_count;
+                if (p.visibility_pages == 1)
+                    LOGR("Particle DOF native visibility cache active: %ux%u R16F, unchanged aperture samples",
+                         p.visibility_extent, p.visibility_extent);
+            }
+            if (use_shared) {
+                const D3D12_RECT box{shared.bounds[0], shared.bounds[1], shared.bounds[2], shared.bounds[3]};
+                Alloc field_vertices = Upload(sizeof(shared.vertices), 16);
+                std::memcpy(field_vertices.cpu, shared.vertices.data(), sizeof(shared.vertices));
+                const D3D12_VERTEX_BUFFER_VIEW field_vb{field_vertices.gpu, UINT(sizeof(shared.vertices)), sizeof(NativeParticleVertex)};
+                // A synthetic rectangle uses SV_VertexID/4==0. Only its representative
+                // metadata is needed; native page IDs/metadata remain unchanged for final blends.
+                auto globals = p.globals; globals.target[2] = 1;
+                Alloc field_constants = Upload(sizeof(constants) + sizeof(globals) + sizeof(ParticleDofQuad), 256);
+                auto* bytes = static_cast<uint8_t*>(field_constants.cpu);
+                std::memcpy(bytes, &constants, sizeof(constants));
+                std::memcpy(bytes + sizeof(constants), &globals, sizeof(globals));
+                std::memcpy(bytes + sizeof(constants) + sizeof(globals), &p.quads[page.first_quad], sizeof(ParticleDofQuad));
+                // Keep the original target's pixel-coordinate viewport even though scratch
+                // resources were reserved at the largest native extent during loading.
+                restore_target();
+                SetViewportScissor(s, size.w);
+                cl_->RSSetScissorRects(1, &box);
+                auto support_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleSupport, cl_.Get());
+                Transition(p.shared[0].Get(), p.shared_states[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
+                const auto mask_view = ParticleSharedView(0);
+                cl_->OMSetRenderTargets(1, &mask_view, FALSE, nullptr);
+                const float zero[4] = {};
+                cl_->ClearRenderTargetView(mask_view, zero, 1, &box);
+                cl_->SetPipelineState(support_pso);
+                cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
+                cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
+                cl_->IASetVertexBuffers(0, 1, &native_view);
+                cl_->IASetIndexBuffer(&index_view);
+                cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                SetTextureViewsAndSamplers(s, filtered, clamp);
+                cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
+                Transition(p.shared[0].Get(), p.shared_states[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                support_timing.End();
 
-            auto field_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleTransmission, cl_.Get());
-            Transition(p.shared[1].Get(), p.shared_states[1], D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const auto field_view = ParticleSharedView(1);
-            cl_->OMSetRenderTargets(1, &field_view, FALSE, nullptr);
-            cl_->IASetVertexBuffers(0, 1, &field_vb);
-            cl_->SetGraphicsRootConstantBufferView(1, field_constants.gpu);
-            cl_->SetPipelineState(field_pso);
-            SetTextureViewsAndSamplers(s, field_inputs, clamp);
-            cl_->DrawIndexedInstanced(6, 1, 0, 0, 0);
-            Transition(p.shared[1].Get(), p.shared_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            cl_->IASetVertexBuffers(0, 1, &native_view);
-            ++p.shared_pages;
-            p.shared_sum_area += shared.sum_area; p.shared_union_area += shared.union_area;
+                auto field_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleTransmission, cl_.Get());
+                Transition(p.shared[1].Get(), p.shared_states[1], D3D12_RESOURCE_STATE_RENDER_TARGET);
+                const auto field_view = ParticleSharedView(1);
+                cl_->OMSetRenderTargets(1, &field_view, FALSE, nullptr);
+                cl_->IASetVertexBuffers(0, 1, &field_vb);
+                cl_->SetGraphicsRootConstantBufferView(1, field_constants.gpu);
+                cl_->SetPipelineState(field_pso);
+                SetTextureViewsAndSamplers(s, field_inputs, clamp);
+                cl_->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                Transition(p.shared[1].Get(), p.shared_states[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                cl_->IASetVertexBuffers(0, 1, &native_view);
+                ++p.shared_pages;
+                p.shared_sum_area += shared.sum_area; p.shared_union_area += shared.union_area;
+            }
+            auto composite_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleComposite, cl_.Get());
+            restore_target();
+            cl_->SetPipelineState(use_visibility ? visibility_composite_pso : use_shared ? shared_pso : composite_pso);
+            cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
+            cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
+            SetTextureViewsAndSamplers(s, use_visibility ? visibility_filtered : use_shared ? shared_filtered : filtered, clamp);
+            SetViewportScissor(s, size.w);
+            SetBlendFactorStencilRef(s, native_key);
+            cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cl_->DrawIndexedInstanced(chunk.quad_count * 6, 1, chunk.first_quad * 6, 0, 0);
+            chunk_first += chunk.quad_count;
         }
-        auto composite_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleComposite, cl_.Get());
-        restore_target();
-        cl_->SetPipelineState(use_visibility ? visibility_composite_pso : use_shared ? shared_pso : composite_pso);
-        cl_->SetGraphicsRootConstantBufferView(0, cb[0]);
-        cl_->SetGraphicsRootConstantBufferView(1, cb[1]);
-        SetTextureViewsAndSamplers(s, use_visibility ? visibility_filtered : use_shared ? shared_filtered : filtered, clamp);
-        SetViewportScissor(s, size.w);
-        SetBlendFactorStencilRef(s, native_key);
-        cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        cl_->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
     }
     ++p.atlas_batches;
     p.atlas_pages += pages.size();
@@ -6200,6 +6244,23 @@ void D3D12Backend::Present(const Surface& front) {
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (t) Resolve(*t);
+#if defined(BLACK_MISSION_BENCHMARK)
+    bool benchmark_proof_this_frame = false;
+    if (game::bench::Enabled() && game::bench::SceneReady() && particle.previous_world)
+        ++benchmark_scene_presents_;
+    if (game::bench::Enabled() && game::bench::SceneReady() && !benchmark_proof_saved_ && t &&
+        benchmark_scene_presents_ >= 600) {
+        const auto previous_path = cap_dir_;
+        cap_dir_ = app::ExeDir() / "logs" / "mission1-proof";
+        std::error_code capture_error;
+        std::filesystem::create_directories(cap_dir_, capture_error);
+        if (!capture_error) CapSave(*t, "opening-view", t->range);
+        cap_dir_ = previous_path;
+        benchmark_proof_saved_ = true;
+        benchmark_proof_this_frame = true;
+        LOGR("Mission 1 benchmark: opening-view readback requested during excluded warmup");
+    }
+#endif
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -6209,8 +6270,20 @@ void D3D12Backend::Present(const Surface& front) {
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     bool vsync = app::Get().vsync;
     auto perf_swap = PerfClock::now();
-    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    const HRESULT present_result = swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
     g_perf.swap += PerfMs(perf_swap);
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (game::bench::Enabled()) {
+        const double frame_ms = PerfMs(benchmark_present_clock_);
+        benchmark_present_clock_ = PerfClock::now();
+        game::bench::Present({presents_ + 1, particle.batches, particle.atlas_pages, particle.atlas_quads,
+            particle.visibility_pages, particle.visibility_quads, particle.atlas_fallback,
+            bb_w_, bb_h_, msaa_, particle.previous_world, present_result, PerfMs(perf_swap), frame_ms,
+            benchmark_proof_this_frame});
+    }
+#else
+    (void)present_result;
+#endif
 
     presents_++;
     presents_seen_.store(presents_);

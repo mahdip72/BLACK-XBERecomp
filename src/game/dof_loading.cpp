@@ -1,5 +1,6 @@
 // Prepare graphics while the native mission loading screen continues ticking and presenting.
 #include "d3d/dof_loading.h"
+#include "common/mission_benchmark.h"
 #include "game/layout.h"
 #include "xdk/hle.h"
 
@@ -36,6 +37,9 @@ void CancelLoading() {
 // Before 0x20F6E5 dispatches the transition phase, ESI is the game object.
 // Both new missions (0x20DCA0) and same-state restarts (0x20DBC0) reach this path.
 void ObserveMissionDofLoading(X86Context& ctx, uint8_t*) {
+#if defined(BLACK_MISSION_BENCHMARK)
+    if (game::bench::Enabled()) game::bench::Tick(ctx);
+#endif
     if (!MissionLoading(ctx.esi)) {
         CancelLoading();
         return;
