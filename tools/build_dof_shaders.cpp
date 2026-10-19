@@ -21,7 +21,7 @@
 namespace {
 
 constexpr uint32_t kSamples[] = {1, 2, 4, 8};
-constexpr size_t kExpectedUniqueKeys = 432;
+constexpr size_t kExpectedUniqueKeys = 436;
 const gpu::ShaderCache* g_bytecode_cache = nullptr;
 
 struct Key {
