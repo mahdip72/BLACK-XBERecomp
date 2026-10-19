@@ -2486,7 +2486,7 @@ void D3D12Backend::ParticleDofSkipped(uint32_t reason, const char* message) {
 bool D3D12Backend::ParticleDofDepthRange(ID3D12Resource* depth, ID3D12Resource* range,
     D3D12_RESOURCE_STATES& range_state, uint32_t snapshot_index, uint32_t samples, uint32_t w, uint32_t h) {
     const auto source = DofParticleRangeSource(samples);
-    auto* pipeline = EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_FLOAT, -1, true);
+    auto* pipeline = EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_UINT, -1, true);
     if (!pipeline) return false;
     const uint32_t slot = AllocSrvSlots(4);
     for (uint32_t i = 0; i < 4; ++i) {
@@ -2674,7 +2674,7 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
     if (samples > 1 && (!snapshot->range || snapshot->range->GetDesc().Width != desc.Width ||
         snapshot->range->GetDesc().Height != desc.Height)) {
         D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-        auto range_desc = Texture2DDesc(DXGI_FORMAT_R32G32_FLOAT, rt->w, rt->h);
+        auto range_desc = Texture2DDesc(DXGI_FORMAT_R32G32_UINT, rt->w, rt->h);
         range_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         ComPtr<ID3D12Resource> range;
         if (FAILED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &range_desc,
@@ -2721,7 +2721,7 @@ bool D3D12Backend::PrepareParticleDof(const State& s, Assembled& a, const PixelK
     if (samples > 1) {
         stages.res[2] = snapshot->range.Get();
         stages.sv[2] = {};
-        stages.sv[2].Format = DXGI_FORMAT_R32G32_FLOAT;
+        stages.sv[2].Format = DXGI_FORMAT_R32G32_UINT;
         stages.sv[2].Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         stages.sv[2].ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         stages.sv[2].Texture2D.MipLevels = 1;
@@ -3443,7 +3443,7 @@ void D3D12Backend::QueueDofPipelines(uint32_t native_samples) {
         ready &= EnsureDepthOfFieldPipeline("ffx_dof_present", kBgra, samples) != nullptr;
         if (samples > 1) {
             const auto source = DofParticleRangeSource(samples);
-            ready &= EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_FLOAT, -1, true) != nullptr;
+            ready &= EnsurePassPipeline(source.c_str(), "vs", "range_ps", DXGI_FORMAT_R32G32_UINT, -1, true) != nullptr;
         }
         // Native 15BB00 uses GREATER; disabled alpha testing maps to ALWAYS. Other alpha/raster/mask
         // states remain supported by the same embedded library and a single asynchronous PSO worker.
@@ -3542,7 +3542,7 @@ bool D3D12Backend::PrepareDofResources(uint32_t width, uint32_t height, bool bal
         ready &= prepare_depth(snapshot.depth, snapshot.state, w, h, samples);
         snapshot.source = nullptr;
         if (samples > 1 && (!snapshot.range || snapshot.range->GetDesc().Width != w || snapshot.range->GetDesc().Height != h)) {
-            auto desc = Texture2DDesc(DXGI_FORMAT_R32G32_FLOAT, w, h);
+            auto desc = Texture2DDesc(DXGI_FORMAT_R32G32_UINT, w, h);
             desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             ComPtr<ID3D12Resource> range;
             if (SUCCEEDED(dev_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,

@@ -47,13 +47,18 @@ using ::gpu::kTexWide;
 namespace smoke_f543 {
 #include "reference/f543f54/particle_dof_shader.h"
 }
+namespace smoke_c591 {
+#include "reference/c591162/particle_dof_shader.h"
+}
 using Microsoft::WRL::ComPtr;
 
 namespace {
 uint32_t W = 1280, H = 720, AtlasExtent = 2048;
 float TargetRadius = 4.0f;
 UINT CandidateOptimization=D3DCOMPILE_OPTIMIZATION_LEVEL1;
-constexpr uint32_t Samples = 8, Quads = 12, Batches = 4;
+uint32_t Samples = 8, Quads = 12, Batches = 4;
+bool CoverageBenchmark=false,DepthLessEqual=false,SceneVisible=false;
+uint32_t Warmups=8,MeasuredPairs=16;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
 void CheckAtlasFilterCbufferLayout(ID3DBlob* shader, size_t expected_prefix,
                                    size_t expected_globals) {
@@ -99,11 +104,13 @@ void Hr(HRESULT value, const char* what) {
     }
 }
 ComPtr<ID3DBlob> Compile(const std::string& source, const char* entry, const char* profile,
-                        UINT optimization=D3DCOMPILE_OPTIMIZATION_LEVEL1) {
+                        UINT optimization=D3DCOMPILE_OPTIMIZATION_LEVEL1,
+                        bool shipped_flags=false) {
     Require(!source.empty(), "native smoke wrapper rejected production source");
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "particle GPU benchmark",
-        nullptr, nullptr, entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | optimization,
+        nullptr, nullptr, entry, profile,
+        (shipped_flags?0u:D3DCOMPILE_ENABLE_STRICTNESS) | optimization,
         0, &code, &errors);
     if (FAILED(hr) && errors)
         std::fprintf(stderr, "%s/%s: %s\n", entry, profile,
@@ -131,13 +138,18 @@ D3D12_RESOURCE_DESC TextureDesc(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; d.Flags = flags;
     return d;
 }
-enum class Mode { Native, V25, Atlas, Candidate };
+enum class Mode { Native, V25, Atlas, Candidate, CoverageBefore, CoverageAfter };
 bool UsesAtlas(Mode mode) {
-    return mode==Mode::Atlas || mode==Mode::Candidate;
+    return mode==Mode::Atlas || mode==Mode::Candidate ||
+           mode==Mode::CoverageBefore || mode==Mode::CoverageAfter;
 }
 struct Intervals { double copy = 0, range = 0, prepare = 0, filter = 0,
                    composite = 0, total = 0; };
-struct Result { Intervals ms; std::vector<uint16_t> rgba; };
+struct Result {
+    Intervals ms;
+    std::vector<uint16_t> rgba,sample_rgba;
+    uint64_t image_hash=14695981039346656037ull;
+};
 
 class Bench {
 public:
@@ -183,7 +195,10 @@ public:
     }
     ~Bench() { if (event_) CloseHandle(event_); }
 
-    Result Run(Mode mode) {
+    Result Run(Mode mode,bool capture_samples=false) {
+        const bool coverage=mode==Mode::CoverageBefore || mode==Mode::CoverageAfter;
+        const bool float_range=mode==Mode::V25 || mode==Mode::CoverageBefore;
+        Require(!capture_samples || coverage,"sample capture requires an MSAA coverage mode");
         // Resource creation, uploads and PSO creation are deliberately outside GPU timestamps.
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> list;
@@ -195,10 +210,18 @@ public:
             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, Samples), D3D12_RESOURCE_STATE_DEPTH_WRITE);
         auto snapshot = MakeTexture(TextureDesc(DXGI_FORMAT_R24G8_TYPELESS,
             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, Samples), D3D12_RESOURCE_STATE_COPY_DEST);
-        auto range = MakeTexture(TextureDesc(DXGI_FORMAT_R32G32_FLOAT,
+        auto range = MakeTexture(TextureDesc(float_range?DXGI_FORMAT_R32G32_FLOAT:
+                                             DXGI_FORMAT_R32G32_UINT,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
         auto target = MakeTexture(TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
-            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,coverage?Samples:1),
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+        constexpr uint32_t sample_width=64,sample_height=16;
+        ComPtr<ID3D12Resource> sample_target;
+        if (capture_samples)
+            sample_target=MakeTexture(TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,1,sample_width,
+                sample_height*Samples),D3D12_RESOURCE_STATE_RENDER_TARGET);
         ComPtr<ID3D12Resource> source_atlas, filtered_atlas;
         if (UsesAtlas(mode)) {
             const auto desc = TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -207,12 +230,31 @@ public:
             filtered_atlas = MakeTexture(desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
         auto descriptors = MakeDescriptors(snapshot.Get(), range.Get(), target.Get(),
-                                            source_atlas.Get(), filtered_atlas.Get());
+                                            source_atlas.Get(), filtered_atlas.Get(),
+                                            sample_target.Get(),float_range);
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
         dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
         device_->CreateDepthStencilView(depth.Get(), &dsv_desc, descriptors.dsv);
-        list->ClearDepthStencilView(descriptors.dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+        if (coverage) {
+            dsv_desc.Flags=D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+            device_->CreateDepthStencilView(depth.Get(),&dsv_desc,descriptors.dsv_read);
+        }
+        list->ClearDepthStencilView(descriptors.dsv,D3D12_CLEAR_FLAG_DEPTH,
+                                    coverage&&!SceneVisible?(1.0f-1.0f/4.0f):1.0f,
+                                    0,0,nullptr);
+        if (coverage&&!SceneVisible) {
+            // Repeating openings keep hidden z12 particle source energy near
+            // each defocused z4 wall edge. The blocked destination path then
+            // evaluates the expensive Ro/Rp transmission over real MS depth.
+            const uint32_t period=std::max(4u,uint32_t(std::round(4*TargetRadius)));
+            const uint32_t opening=std::max(2u,period/2);
+            for (uint32_t x=0;x<W;x+=period) {
+                const D3D12_RECT aperture{LONG(x),0,LONG(std::min(W,x+opening)),LONG(H)};
+                list->ClearDepthStencilView(descriptors.dsv,D3D12_CLEAR_FLAG_DEPTH,
+                                            1.0f,0,1,&aperture);
+            }
+        }
         const float clear[] = {.02f,.03f,.05f,.1f};
         list->ClearRenderTargetView(descriptors.target_rtv, clear, 0, nullptr);
 
@@ -270,13 +312,18 @@ public:
                 list->ResourceBarrier(2, after);
             });
             timed(ranges, [&] {
-                list->SetPipelineState(range_pso_.Get());
+                list->SetPipelineState(float_range?float_range_pso_.Get():range_pso_.Get());
                 list->OMSetRenderTargets(1, &descriptors.range_rtv, FALSE, nullptr);
                 list->DrawInstanced(3, 1, 0, 0);
                 auto b = Barrier(range.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 list->ResourceBarrier(1, &b);
             });
+        }
+        if (coverage) {
+            const auto read_depth=Barrier(depth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                          D3D12_RESOURCE_STATE_DEPTH_READ);
+            list->ResourceBarrier(1,&read_depth);
         }
         D3D12_RESOURCE_STATES source_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         D3D12_RESOURCE_STATES filtered_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -308,7 +355,8 @@ public:
                     list->SetGraphicsRootDescriptorTable(0, descriptors.native_srv);
                     list->SetGraphicsRootConstantBufferView(1, vcb_->GetGPUVirtualAddress());
                     list->SetGraphicsRootConstantBufferView(2, page_cb);
-                    list->SetPipelineState(source_pso_.Get());
+                    list->SetPipelineState(mode==Mode::CoverageBefore?
+                        coverage_before_source_pso_.Get():source_pso_.Get());
                     list->OMSetRenderTargets(1, &descriptors.source_rtv, FALSE, nullptr);
                     list->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
                     transition(source_atlas.Get(), source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -321,7 +369,7 @@ public:
                     list->SetGraphicsRootConstantBufferView(2,
                         mode==Mode::Atlas ? legacy_page_dcbs_[page_index]->GetGPUVirtualAddress() :
                                             page_cb);
-                    list->SetPipelineState(mode==Mode::Candidate ? candidate_pso_.Get() :
+                    list->SetPipelineState(mode==Mode::Candidate || coverage ? candidate_pso_.Get() :
                                            filter_pso_.Get());
                     list->OMSetRenderTargets(1, &descriptors.filtered_rtv, FALSE, nullptr);
                     list->DrawInstanced(6, page.quad_count, 0, 0);
@@ -334,8 +382,11 @@ public:
                     list->SetGraphicsRootDescriptorTable(0, descriptors.composite_srv);
                     list->SetGraphicsRootConstantBufferView(1, vcb_->GetGPUVirtualAddress());
                     list->SetGraphicsRootConstantBufferView(2, page_cb);
-                    list->SetPipelineState(composite_pso_.Get());
-                    list->OMSetRenderTargets(1, &descriptors.target_rtv, FALSE, nullptr);
+                    list->SetPipelineState(mode==Mode::CoverageBefore?coverage_before_pso_.Get():
+                                           mode==Mode::CoverageAfter?coverage_after_pso_.Get():
+                                           composite_pso_.Get());
+                    list->OMSetRenderTargets(1,&descriptors.target_rtv,FALSE,
+                                              coverage?&descriptors.dsv_read:nullptr);
                     list->DrawIndexedInstanced(page.quad_count * 6, 1, page.first_quad * 6, 0, 0);
                 });
             }
@@ -343,19 +394,65 @@ public:
         const UINT all_end = ticks; stamp();
         list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,0,ticks,
                                timing.Get(),0);
-        auto target_barrier = Barrier(target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ComPtr<ID3D12Resource> resolved;
+        ID3D12Resource* copy_source=target.Get();
+        if (coverage) {
+            resolved=MakeTexture(TextureDesc(DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_NONE),D3D12_RESOURCE_STATE_RESOLVE_DEST);
+            const auto to_resolve=Barrier(target.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                          D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            list->ResourceBarrier(1,&to_resolve);
+            list->ResolveSubresource(resolved.Get(),0,target.Get(),0,
+                                     DXGI_FORMAT_R16G16B16A16_FLOAT);
+            copy_source=resolved.Get();
+        }
+        auto target_barrier = Barrier(copy_source,
+            coverage?D3D12_RESOURCE_STATE_RESOLVE_DEST:D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1,&target_barrier);
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
         UINT rows=0; UINT64 row_bytes=0, total=0;
-        auto desc = target->GetDesc();
+        auto desc = copy_source->GetDesc();
         device_->GetCopyableFootprints(&desc,0,1,0,&fp,&rows,&row_bytes,&total);
         auto pixels = MakeBuffer(total,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION src{},dst{};
-        src.pResource=target.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource=copy_source;src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.pResource=pixels.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint=fp;
         list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT sample_fp{};
+        ComPtr<ID3D12Resource> sample_readback;
+        if (capture_samples) {
+            auto b=Barrier(target.Get(),D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1,&b);
+            const D3D12_VIEWPORT sample_viewport{0,0,float(sample_width),
+                                                  float(sample_height*Samples),0,1};
+            const D3D12_RECT sample_scissor{0,0,LONG(sample_width),
+                                             LONG(sample_height*Samples)};
+            list->RSSetViewports(1,&sample_viewport);
+            list->RSSetScissorRects(1,&sample_scissor);
+            list->SetPipelineState(sample_pso_.Get());
+            list->SetGraphicsRootDescriptorTable(0,descriptors.sample_srv);
+            list->OMSetRenderTargets(1,&descriptors.sample_rtv,FALSE,nullptr);
+            list->DrawInstanced(3,1,0,0);
+            b=Barrier(sample_target.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1,&b);
+            auto sample_desc=sample_target->GetDesc();
+            UINT sample_rows=0;UINT64 sample_row_bytes=0,sample_total=0;
+            device_->GetCopyableFootprints(&sample_desc,0,1,0,&sample_fp,
+                                           &sample_rows,&sample_row_bytes,&sample_total);
+            sample_readback=MakeBuffer(sample_total,D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION sample_src{},sample_dst{};
+            sample_src.pResource=sample_target.Get();
+            sample_src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            sample_dst.pResource=sample_readback.Get();
+            sample_dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            sample_dst.PlacedFootprint=sample_fp;
+            list->CopyTextureRegion(&sample_dst,0,0,0,&sample_src,nullptr);
+        }
         Hr(list->Close(),"Close benchmark list");
         ID3D12CommandList* lists[]{list.Get()};queue_->ExecuteCommandLists(1,lists);
         const UINT64 fence_value=++fence_value_;
@@ -387,13 +484,32 @@ public:
             std::memcpy(result.rgba.data()+size_t(y)*W*4,
                         pixel_bytes+size_t(y)*fp.Footprint.RowPitch,W*8);
         pixels->Unmap(0,&no_write);
+        for (uint16_t channel:result.rgba) {
+            result.image_hash^=channel;
+            result.image_hash*=1099511628211ull;
+        }
+        if (capture_samples) {
+            uint8_t* sample_bytes=nullptr;
+            const D3D12_RANGE sample_range{0,
+                SIZE_T(sample_fp.Footprint.RowPitch)*(sample_height*Samples-1)+sample_width*8};
+            Hr(sample_readback->Map(0,&sample_range,
+                                    reinterpret_cast<void**>(&sample_bytes)),
+               "Map MSAA sample inspection readback");
+            result.sample_rgba.resize(size_t(sample_width)*sample_height*Samples*4);
+            for (uint32_t y=0;y<sample_height*Samples;++y)
+                std::memcpy(result.sample_rgba.data()+size_t(y)*sample_width*4,
+                    sample_bytes+size_t(y)*sample_fp.Footprint.RowPitch,sample_width*8);
+            sample_readback->Unmap(0,&no_write);
+        }
         return result;
     }
 
 private:
     struct Descriptors {
         ComPtr<ID3D12DescriptorHeap> srv_heap,rtv_heap,dsv_heap;
-        D3D12_CPU_DESCRIPTOR_HANDLE range_rtv{},target_rtv{},source_rtv{},filtered_rtv{},dsv{};
+        D3D12_CPU_DESCRIPTOR_HANDLE range_rtv{},target_rtv{},source_rtv{},filtered_rtv{},
+                                    sample_rtv{},dsv{},dsv_read{};
+        D3D12_GPU_DESCRIPTOR_HANDLE sample_srv{};
         D3D12_GPU_DESCRIPTOR_HANDLE native_srv{},filter_srv{},composite_srv{};
     };
     ComPtr<ID3D12Resource> MakeBuffer(UINT64 bytes,D3D12_HEAP_TYPE type,
@@ -453,7 +569,8 @@ private:
             serialized->GetBufferSize(),IID_PPV_ARGS(&root_)),"Create benchmark root");
     }
     ComPtr<ID3D12PipelineState> Pipeline(ID3DBlob* vs,ID3DBlob* ps,
-                                        DXGI_FORMAT format,bool blend,bool vertices) {
+                                        DXGI_FORMAT format,bool blend,bool vertices,
+                                        uint32_t samples=1,bool attach_depth=false) {
         D3D12_INPUT_ELEMENT_DESC attrs[]{
             {"ATTR",0,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
             {"ATTR",3,DXGI_FORMAT_B8G8R8A8_UNORM,0,16,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
@@ -467,11 +584,13 @@ private:
         p.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;
         p.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;
         p.RasterizerState.DepthClipEnable=TRUE;
+        p.RasterizerState.MultisampleEnable=samples>1;
         p.DepthStencilState.DepthEnable=FALSE;
+        p.DSVFormat=attach_depth?DXGI_FORMAT_D24_UNORM_S8_UINT:DXGI_FORMAT_UNKNOWN;
         p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         p.NumRenderTargets=1;
         p.RTVFormats[0]=format;
-        p.SampleDesc.Count=1;
+        p.SampleDesc.Count=samples;
         p.BlendState.RenderTarget[0].RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
         if (blend) {
             auto& b=p.BlendState.RenderTarget[0];
@@ -494,17 +613,77 @@ private:
         const auto native_vertex=Compile(native_vs,"main","vs_5_0");
         const auto native_pixel=Compile(native_ps,"main","ps_5_0");
         const auto source_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs,1),"main","vs_5_0");
-        const auto source_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1),"main","ps_5_0");
+        const auto source_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1),
+                                     "main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,
+                                     CoverageBenchmark);
         const auto composite_vs=Compile(gpu::MakeParticleDofVertexShader(native_vs,2),"main","vs_5_0");
         const auto composite_ps=Compile(gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,2),"main","ps_5_0");
+        if (CoverageBenchmark) {
+            Require(std::strcmp(gpu::kParticleDofQuadHlsl,
+                                smoke_c591::gpu::kParticleDofQuadHlsl)==0 &&
+                    std::strcmp(gpu::kParticleDofDiskHlsl,
+                                smoke_c591::gpu::kParticleDofDiskHlsl)==0,
+                    "frozen coverage comparison changed quad ABI or aperture taps");
+            const auto frozen_core=[](std::string source) {
+                const std::string current_core=gpu::kParticleDofHlsl;
+                const size_t at=source.rfind(current_core);
+                Require(at!=std::string::npos && at+current_core.size()==source.size(),
+                        "production particle wrapper no longer ends with its aperture core");
+                source.replace(at,current_core.size(),smoke_c591::gpu::kParticleDofHlsl);
+                return source;
+            };
+            const std::string after=gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,2);
+            const std::string before=frozen_core(after);
+            const std::string before_source=frozen_core(
+                gpu::MakeParticleDofPixelShader(native_ps,Samples,0,7,1));
+            const auto before_ps=Compile(before,"main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            const auto after_ps=Compile(after,"main","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            const auto before_source_ps=Compile(before_source,"main","ps_5_0",
+                                                D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            coverage_before_source_pso_=Pipeline(source_vs.Get(),before_source_ps.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT,false,true);
+            coverage_before_pso_=Pipeline(composite_vs.Get(),before_ps.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,Samples,true);
+            coverage_after_pso_=Pipeline(composite_vs.Get(),after_ps.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,Samples,true);
+            // Read a small interior ROI from each physical MS sample, after the
+            // timed work. A resolved image alone can conceal sample-mask errors.
+            const std::string inspect_source=
+                "#define N " + std::to_string(Samples) + "\n"
+                "#define OX " + std::to_string(W/2-32) + "\n"
+                "#define OY " + std::to_string(H/2-8) + "\n"
+                "Texture2DMS<float4,N> scene : register(t0);\n"
+                "float4 inspect(float4 p : SV_Position) : SV_Target {\n"
+                "  uint2 q = uint2(p.xy);\n"
+                "  return scene.Load(int2(OX + q.x, OY + q.y/N), q.y%N);\n"
+                "}\n";
+            const auto inspect_ps=Compile(inspect_source,"inspect","ps_5_0",
+                                          D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            const std::string inspect_vs_source=
+                "float4 inspect_vs(uint id : SV_VertexID) : SV_Position {\n"
+                "  return float4((id==2 ? 3 : -1), (id==1 ? -3 : 1), 0, 1);\n"
+                "}\n";
+            const auto inspect_vs=Compile(inspect_vs_source,"inspect_vs","vs_5_0",
+                                          D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+            sample_pso_=Pipeline(inspect_vs.Get(),inspect_ps.Get(),
+                                 DXGI_FORMAT_R16G16B16A16_FLOAT,false,false);
+        }
         const auto old_vs=Compile(smoke_v25::gpu::MakeParticleDofVertexShader(legacy_native_vs),
                                   "main","vs_5_0");
         const auto old_ps=Compile(smoke_v25::gpu::MakeParticleDofPixelShader(legacy_native_ps,Samples,0,7),
                                   "main","ps_5_0");
-        const auto range_source=std::string("#define PARTICLE_DOF_SAMPLES 8\n")+
+        const auto range_source=std::string("#define PARTICLE_DOF_SAMPLES ")+
+                                std::to_string(Samples)+"\n"+
                                 gpu::kParticleDofDepthRangeHlsl;
         const auto range_vs=Compile(range_source,"vs","vs_5_0");
-        const auto range_ps=Compile(range_source,"range_ps","ps_5_0");
+        const auto range_ps=Compile(range_source,"range_ps","ps_5_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL1,CoverageBenchmark);
+        const auto float_range_source=std::string("#define PARTICLE_DOF_SAMPLES ")+
+                                      std::to_string(Samples)+"\n"+
+                                      smoke_c591::gpu::kParticleDofDepthRangeHlsl;
+        const auto float_range_vs=Compile(float_range_source,"vs","vs_5_0");
+        const auto float_range_ps=Compile(float_range_source,"range_ps","ps_5_0",
+                                          D3DCOMPILE_OPTIMIZATION_LEVEL1,CoverageBenchmark);
         const auto filter_vs=Compile(smoke_f543::gpu::kParticleDofAtlasFilterHlsl,"vs","vs_5_0");
         const auto filter_ps=Compile(smoke_f543::gpu::kParticleDofAtlasFilterHlsl,
                                      "filter_ps","ps_5_0");
@@ -520,18 +699,26 @@ private:
         candidate_pso_=Pipeline(candidate_vs.Get(),candidate_ps.Get(),
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,false,false);
         composite_pso_=Pipeline(composite_vs.Get(),composite_ps.Get(),DXGI_FORMAT_R16G16B16A16_FLOAT,true,true);
-        range_pso_=Pipeline(range_vs.Get(),range_ps.Get(),DXGI_FORMAT_R32G32_FLOAT,false,false);
+        range_pso_=Pipeline(range_vs.Get(),range_ps.Get(),DXGI_FORMAT_R32G32_UINT,false,false);
+        float_range_pso_=Pipeline(float_range_vs.Get(),float_range_ps.Get(),
+                                  DXGI_FORMAT_R32G32_FLOAT,false,false);
     }
     void MakeFixture() {
         gpu::ParticleDofGeometryParams p{};
         p.globals.optics[0]=5;
-        // For the fixture's z=3 plane, the production radius formula is
-        // (abs(3-5)-0.15*5)/3 = 5/12 times the base radius.
-        p.globals.optics[1]=TargetRadius*2.4f;
+        // Matched visible CoC: z3 near uses 5/12 of base; z12 far uses
+        // ((12-5)-.15*5)/12 * .45 = .234375 of base.
+        p.globals.optics[1]=CoverageBenchmark?TargetRadius/.234375f:TargetRadius*2.4f;
         p.globals.optics[2]=1;p.globals.optics[3]=.45f;
         p.globals.viewport[2]=p.globals.target[0]=p.guest_size[0]=float(W);
         p.globals.viewport[3]=p.globals.target[1]=p.guest_size[1]=float(H);
         p.globals.target[2]=float(Quads);
+        p.globals.target[3]=DepthLessEqual?1.0f:0.0f;
+        if (CoverageBenchmark) {
+            p.globals.projection[0]=-1;
+            p.globals.projection[1]=1;
+            p.globals.projection[2]=1;
+        }
         p.c97[2]=1;p.c98[0]=p.c98[1]=p.c98[3]=1;p.c98[2]=-1;
         std::vector<gpu::NativeParticleVertex> native;
         for (uint32_t q=0;q<Quads;++q) {
@@ -539,7 +726,7 @@ private:
             const float y=(120+float(q/4)*5)*float(H)/720.0f;
             const float quad_width=760.0f*float(W)/1280.0f;
             const float quad_height=480.0f*float(H)/720.0f;
-            const float z=1.0f/3.0f;
+            const float z=CoverageBenchmark?1.0f/12.0f:1.0f/3.0f;
             const uint32_t color=0x38FFE0C0;
             native.push_back({{x,y,z,2.25f},color,{0,0},0});
             native.push_back({{x,y+quad_height,z,2.25f},color,{0,1},0});
@@ -665,10 +852,11 @@ private:
     }
     Descriptors MakeDescriptors(ID3D12Resource* snapshot,ID3D12Resource* range,
                                 ID3D12Resource* target,ID3D12Resource* source,
-                                ID3D12Resource* filtered) {
+                                ID3D12Resource* filtered,ID3D12Resource* sample_target,
+                                bool float_range) {
         Descriptors d;
         D3D12_DESCRIPTOR_HEAP_DESC h{};
-        h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;h.NumDescriptors=12;
+        h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;h.NumDescriptors=16;
         h.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.srv_heap)),"SRV heap");
         const auto cpu=d.srv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -686,7 +874,8 @@ private:
             view2d(base,table==1?source:texture_.Get(),
                    table==1?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_R8G8B8A8_UNORM);
             view2d(base+1,table==2?filtered:nullptr,DXGI_FORMAT_R16G16B16A16_FLOAT);
-            view2d(base+2,table==1?nullptr:range,DXGI_FORMAT_R32G32_FLOAT);
+            view2d(base+2,table==1?nullptr:range,
+                   float_range?DXGI_FORMAT_R32G32_FLOAT:DXGI_FORMAT_R32G32_UINT);
             D3D12_SHADER_RESOURCE_VIEW_DESC depth{};
             depth.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             depth.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DMS;
@@ -696,20 +885,37 @@ private:
         d.native_srv=d.srv_heap->GetGPUDescriptorHandleForHeapStart();
         d.filter_srv=d.native_srv;d.filter_srv.ptr+=4*UINT64(step);
         d.composite_srv=d.native_srv;d.composite_srv.ptr+=8*UINT64(step);
-        h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;h.NumDescriptors=4;
+        if (sample_target) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC sample_view{};
+            sample_view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sample_view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DMS;
+            sample_view.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+            device_->CreateShaderResourceView(target,&sample_view,at(12));
+            for (UINT slot=13;slot<16;++slot)
+                device_->CreateShaderResourceView(nullptr,&sample_view,at(slot));
+            d.sample_srv=d.native_srv;d.sample_srv.ptr+=12*UINT64(step);
+        }
+        h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;h.NumDescriptors=5;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.rtv_heap)),"RTV heap");
         const UINT rtv_step=device_->GetDescriptorHandleIncrementSize(h.Type);
         d.range_rtv=d.rtv_heap->GetCPUDescriptorHandleForHeapStart();
         d.target_rtv=d.range_rtv;d.target_rtv.ptr+=rtv_step;
         d.source_rtv=d.target_rtv;d.source_rtv.ptr+=rtv_step;
         d.filtered_rtv=d.source_rtv;d.filtered_rtv.ptr+=rtv_step;
-        device_->CreateRenderTargetView(range,nullptr,d.range_rtv);
+        d.sample_rtv=d.filtered_rtv;d.sample_rtv.ptr+=rtv_step;
+        D3D12_RENDER_TARGET_VIEW_DESC range_rtv_desc{};
+        range_rtv_desc.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+        range_rtv_desc.Format=float_range?DXGI_FORMAT_R32G32_FLOAT:DXGI_FORMAT_R32G32_UINT;
+        device_->CreateRenderTargetView(range,&range_rtv_desc,d.range_rtv);
         device_->CreateRenderTargetView(target,nullptr,d.target_rtv);
         if (source) device_->CreateRenderTargetView(source,nullptr,d.source_rtv);
         if (filtered) device_->CreateRenderTargetView(filtered,nullptr,d.filtered_rtv);
-        h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;h.NumDescriptors=1;
+        if (sample_target) device_->CreateRenderTargetView(sample_target,nullptr,d.sample_rtv);
+        h={};h.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;h.NumDescriptors=2;
         Hr(device_->CreateDescriptorHeap(&h,IID_PPV_ARGS(&d.dsv_heap)),"DSV heap");
         d.dsv=d.dsv_heap->GetCPUDescriptorHandleForHeapStart();
+        d.dsv_read=d.dsv;
+        d.dsv_read.ptr+=device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         return d;
     }
     ComPtr<IDXGIAdapter1> adapter_;
@@ -718,7 +924,8 @@ private:
     ComPtr<ID3D12Fence> fence_;
     ComPtr<ID3D12RootSignature> root_;
     ComPtr<ID3D12PipelineState> native_pso_,old_pso_,source_pso_,filter_pso_,candidate_pso_,
-                                 composite_pso_,range_pso_;
+                                 composite_pso_,range_pso_,coverage_before_pso_,coverage_after_pso_,
+                                 coverage_before_source_pso_,float_range_pso_,sample_pso_;
     ComPtr<ID3D12Resource> native_vb_,vb_,ib_,vcb_,old_dcb_,radii_cb_,texture_;
     std::vector<ComPtr<ID3D12Resource>> page_dcbs_;
     std::vector<ComPtr<ID3D12Resource>> legacy_page_dcbs_;
@@ -800,6 +1007,24 @@ Difference Compare(const Result& reference,const Result& candidate,const char* l
     return difference;
 }
 
+size_t CountBlurredWallPixels(const Result& reference) {
+    Require(reference.rgba.size()==size_t(W)*H*4,"coverage occupancy readback size differs");
+    const uint32_t period=std::max(4u,uint32_t(std::round(4*TargetRadius)));
+    const uint32_t opening=std::max(2u,period/2);
+    size_t count=0;
+    for (uint32_t y=H*3/10;y<H*7/10;++y)
+        for (uint32_t x=W*35/100;x<W*65/100;++x) {
+            if (x%period<opening) continue;
+            const auto pixel=(size_t(y)*W+x)*4;
+            if (std::abs(FromHalf(reference.rgba[pixel])-.02f)>.002f)
+                ++count;
+        }
+    std::printf("Blocked-wall pixels receiving blur in central smoke ROI: %zu\n",count);
+    Require(count>size_t(W)*H/500,
+            "coverage fixture did not exercise blurred source behind blocked wall");
+    return count;
+}
+
 void WriteBmp(const char* name,const Result& result) {
     Require(result.rgba.size()==size_t(W)*H*4,"BMP readback extent differs");
     const auto dir=std::filesystem::path("out")/"reports"/"particle-optimization";
@@ -831,7 +1056,46 @@ void WriteBmp(const char* name,const Result& result) {
 
 int main(int argc,char** argv) {
     try {
+        bool samples_set=false;
+        uint32_t requested_width=0;
         for (int arg=1;arg<argc;++arg) {
+            if (std::strcmp(argv[arg],"--coverage")==0) {
+                CoverageBenchmark=true;
+            } else if (std::strcmp(argv[arg],"--scene")==0 && arg+1<argc) {
+                const char* scene=argv[++arg];
+                Require(std::strcmp(scene,"occluded")==0 ||
+                        std::strcmp(scene,"visible")==0,
+                        "--scene must be occluded or visible");
+                SceneVisible=std::strcmp(scene,"visible")==0;
+            } else if (std::strcmp(argv[arg],"--samples")==0 && arg+1<argc) {
+                const int samples=std::atoi(argv[++arg]);
+                Require(samples==2 || samples==8,"--samples must be 2 or 8");
+                Samples=uint32_t(samples);samples_set=true;
+            } else if (std::strcmp(argv[arg],"--quads")==0 && arg+1<argc) {
+                const int quads=std::atoi(argv[++arg]);
+                Require(quads>=1 && quads<=64,"--quads must be in 1..64");
+                Quads=uint32_t(quads);
+            } else if (std::strcmp(argv[arg],"--layers")==0 && arg+1<argc) {
+                const int layers=std::atoi(argv[++arg]);
+                Require(layers>=1 && layers<=16,"--layers must be in 1..16");
+                Batches=uint32_t(layers);
+            } else if (std::strcmp(argv[arg],"--warmup")==0 && arg+1<argc) {
+                const int count=std::atoi(argv[++arg]);
+                Require(count>=1 && count<=16,"--warmup must be in 1..16");
+                Warmups=uint32_t(count);
+            } else if (std::strcmp(argv[arg],"--repeat")==0 && arg+1<argc) {
+                const int count=std::atoi(argv[++arg]);
+                Require(count>=8 && count<=64 && count%2==0,
+                        "--repeat must be an even count in 8..64 per variant");
+                MeasuredPairs=uint32_t(count);
+            } else if (std::strcmp(argv[arg],"--width")==0 && arg+1<argc) {
+                const int width=std::atoi(argv[++arg]);
+                Require(width>=320 && width<=4096,
+                        "--width must be in 320..4096 pixels");
+                requested_width=uint32_t(width);
+            } else if (std::strcmp(argv[arg],"--lequal")==0) {
+                DepthLessEqual=true;
+            } else
             if (std::strcmp(argv[arg],"--height")==0 && arg+1<argc) {
                 const int height=std::atoi(argv[++arg]);
                 Require(height==720 || height==2160,"--height must be 720 or 2160");
@@ -849,9 +1113,87 @@ int main(int argc,char** argv) {
                 CandidateOptimization=std::strcmp(level,"O3")==0 ?
                     D3DCOMPILE_OPTIMIZATION_LEVEL3:D3DCOMPILE_OPTIMIZATION_LEVEL1;
             } else {
-                throw std::runtime_error("usage: new_smoke_dof_gpu_bench [--height 720|2160] "
-                                         "[--radius px] [--opt O1|O3]");
+                throw std::runtime_error("usage: new_smoke_dof_gpu_bench [--coverage] "
+                    "[--height 720|2160] [--width 320..4096] [--radius px] "
+                    "[--samples 2|8] [--quads 1..64] "
+                    "[--layers 1..16] [--warmup 1..16] [--repeat even 8..64] "
+                    "[--scene occluded|visible] [--lequal] "
+                    "[--opt O1|O3 for legacy benchmark]");
             }
+        }
+        if (requested_width) W=requested_width;
+        if (CoverageBenchmark && !samples_set) Samples=2;
+        Require(!CoverageBenchmark || CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
+                "coverage comparison requires both production pass2 variants at O1");
+        if (CoverageBenchmark) {
+            std::printf("Blur-aware coverage benchmark: %ux%u, %ux D24S8 destination, "
+                        "radius %.3f px, %u quads x %u layers, %s scene, native %s; "
+                        "%u warmups and %u measured runs/variant in ABBA order\n",
+                        W,H,Samples,TargetRadius,Quads,Batches,
+                        SceneVisible?"all-visible":"z4 wall with openings",
+                        DepthLessEqual?"LEQUAL":"LESS",Warmups,MeasuredPairs);
+            const auto cold_start=std::chrono::steady_clock::now();
+            Bench bench;
+            const double cold_seconds=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-cold_start).count();
+            std::printf("Cold device/FXC/PSO/fixture setup %.3fs (excluded from GPU timestamps)\n",
+                        cold_seconds);
+            for (uint32_t i=0;i<Warmups;++i) {
+                bench.Run(Mode::CoverageBefore);
+                bench.Run(Mode::CoverageAfter);
+            }
+            std::vector<Result> before,after;
+            const Mode order[]{Mode::CoverageBefore,Mode::CoverageAfter,
+                               Mode::CoverageAfter,Mode::CoverageBefore};
+            for (uint32_t round=0;round<MeasuredPairs/2;++round)
+                for (Mode mode:order) {
+                    auto& bucket=mode==Mode::CoverageBefore?before:after;
+                    auto result=bench.Run(mode,bucket.empty());
+                    if (!bucket.empty()) {
+                        Require(result.image_hash==bucket.front().image_hash,
+                                "repeated hardware image differed within the same shader variant");
+                        result.rgba.clear();
+                    }
+                    bucket.push_back(std::move(result));
+                }
+            Require(before.size()==MeasuredPairs && after.size()==MeasuredPairs,
+                    "coverage ABBA pairing lost a measurement");
+            Print("c591162 blur-aware pass2",before);
+            Print("optimized blur-aware pass2",after);
+            const auto difference=Compare(before.front(),after.front(),"c591/optimized resolved");
+            if (!SceneVisible) CountBlurredWallPixels(before.front());
+            Result before_samples,after_samples;
+            before_samples.rgba=before.front().sample_rgba;
+            after_samples.rgba=after.front().sample_rgba;
+            const auto sample_difference=Compare(before_samples,after_samples,
+                                                "c591/optimized physical MS samples (64x16 ROI)");
+            const std::string suffix=std::to_string(H)+"p-r"+std::to_string(int(TargetRadius))+
+                "-ms"+std::to_string(Samples)+(DepthLessEqual?"-lequal":"-less")+
+                (SceneVisible?"-visible":"-occluded");
+            WriteBmp(("coverage-before-"+suffix+".bmp").c_str(),before.front());
+            WriteBmp(("coverage-after-"+suffix+".bmp").c_str(),after.front());
+            const double old_ms=MedianTotal(before),new_ms=MedianTotal(after);
+            std::printf("Coverage total median %.3f -> %.3f ms; composite median ",old_ms,new_ms);
+            std::vector<double> old_composite,new_composite;
+            for (const auto& r:before) old_composite.push_back(r.ms.composite);
+            for (const auto& r:after) new_composite.push_back(r.ms.composite);
+            std::printf("%.3f -> %.3f ms; reduction %.2f%% total, %.2f%% composite\n",
+                Percentile(old_composite,.5),Percentile(new_composite,.5),
+                100*(old_ms-new_ms)/std::max(old_ms,1e-9),
+                100*(Percentile(old_composite,.5)-Percentile(new_composite,.5))/
+                    std::max(Percentile(old_composite,.5),1e-9));
+            Require(difference.maximum<=.003f && difference.rms<=.0003 &&
+                    difference.active_rms<=.0006 &&
+                    difference.rgb_energy_percent<=.15 && difference.alpha_energy_percent<=.15,
+                    "optimized blur-aware output changed beyond predeclared same-aperture tolerance");
+            Require(sample_difference.maximum<=.003f && sample_difference.rms<=.0003 &&
+                    sample_difference.active_rms<=.0006 &&
+                    sample_difference.rgb_energy_percent<=.15 &&
+                    sample_difference.alpha_energy_percent<=.15,
+                    "optimized blur-aware physical MS samples changed beyond tolerance");
+            std::puts("Coverage benchmark PASS; offscreen hardware timestamps are workload "
+                      "measurements, not gameplay FPS; GPU clocks and power state were not fixed.");
+            return 0;
         }
         // Declared before measurement. These variants use the same source/composite,
         // atlas placement, 64 disk taps and native blend. Only the filter implementation differs.

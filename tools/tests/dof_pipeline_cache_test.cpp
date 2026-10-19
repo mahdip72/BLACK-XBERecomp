@@ -236,6 +236,22 @@ void CheckDestructorDrains(ID3D12Device* device) {
     }
     std::puts("destructor drained 12 queued offscreen PSO jobs");
 }
+void CheckIntegerDepthRange(ID3D12Device* device) {
+    auto root=Root(device);
+    for (uint32_t samples : {1u,2u,4u,8u}) {
+        const auto source=gpu::DofParticleRangeSource(samples);
+        auto vs=gpu::LoadDofShaderBytecode(source,"vs","vs_5_0",kFlags);
+        auto ps=gpu::LoadDofShaderBytecode(source,"range_ps","ps_5_0",kFlags);
+        Check(vs && ps,"embedded integer depth-range shaders missing");
+        auto desc=ParticleDesc(root.Get(),vs.Get(),ps.Get(),nullptr);
+        desc.InputLayout={nullptr,0};
+        desc.RTVFormats[0]=DXGI_FORMAT_R32G32_UINT;
+        ComPtr<ID3D12PipelineState> pipeline;
+        Hr(device->CreateGraphicsPipelineState(&desc,IID_PPV_ARGS(&pipeline)),
+           "Create integer depth-range PSO");
+    }
+    std::puts("embedded integer D24 depth-range PSOs PASS (1/2/4/8 samples)");
+}
 } // namespace
 
 int main(int argc,char** argv) {
@@ -246,6 +262,7 @@ int main(int argc,char** argv) {
         auto device=SelectDevice(hardware);
         CheckAsyncLifetime(device.Get());
         CheckDestructorDrains(device.Get());
+        CheckIntegerDepthRange(device.Get());
         std::printf("embedded asynchronous DOF pipeline cache %s checks PASS\n",
                     hardware?"hardware":"WARP");
         return 0;

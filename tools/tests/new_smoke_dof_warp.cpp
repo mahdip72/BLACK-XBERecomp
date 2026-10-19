@@ -490,6 +490,10 @@ public:
                 std::to_string(samples) + "\n" + gpu::kParticleDofDepthRangeHlsl;
             Compile(range, "vs_5_0", "vs");
             Compile(range, "ps_5_0", "range_ps");
+            const std::string frozen_range = "#define PARTICLE_DOF_SAMPLES " +
+                std::to_string(samples) + "\n" +
+                smoke_v25::gpu::kParticleDofDepthRangeHlsl;
+            Compile(frozen_range, "ps_5_0", "range_ps");
         }
         Compile(reference_vs_, "vs_5_0");
         for (const auto& source : reference_ps_) Compile(source, "ps_5_0");
@@ -731,6 +735,7 @@ public:
                               std::vector<Pixel>* filter_pixels = nullptr,
                               bool interior_filter = false) {
         const bool aware = scene.geometry.globals.projection[2] > 0;
+        const bool float_range = reference || v25;
         const bool true_ms = aware || scene.native_msaa;
         const uint32_t target_samples = true_ms ? depth_samples : 1;
         Check(!aware || (atlas && wrapped),
@@ -783,7 +788,8 @@ public:
         ComPtr<ID3D12Resource> depth_range;
         if (depth_samples > 1)
             depth_range = NewTexture(scene.width, scene.height,
-                                     DXGI_FORMAT_R32G32_FLOAT,
+                                     float_range?DXGI_FORMAT_R32G32_FLOAT:
+                                                 DXGI_FORMAT_R32G32_UINT,
                                      D3D12_RESOURCE_STATE_RENDER_TARGET,
                                      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         ComPtr<ID3D12Resource> target = NewTexture(scene.width, scene.height,
@@ -955,7 +961,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
         cpu.ptr += increment;
         device_->CreateShaderResourceView(nullptr, &view, cpu);
         cpu.ptr += increment;
-        view.Format = DXGI_FORMAT_R32G32_FLOAT;
+        view.Format = float_range?DXGI_FORMAT_R32G32_FLOAT:
+                                   DXGI_FORMAT_R32G32_UINT;
         if (depth_samples > 1)
             device_->CreateShaderResourceView(depth_range.Get(), &view, cpu);
         else
@@ -985,7 +992,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target { return worldImage.Load(int3(po
                 v.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;
                 device_->CreateShaderResourceView(filter?nullptr:atlas_filtered.Get(),&v,slot);
                 slot.ptr+=increment;
-                v.Format=DXGI_FORMAT_R32G32_FLOAT;
+                v.Format=float_range?DXGI_FORMAT_R32G32_FLOAT:
+                                     DXGI_FORMAT_R32G32_UINT;
                 device_->CreateShaderResourceView(depth_samples>1?depth_range.Get():nullptr,&v,slot);
                 slot.ptr+=increment;
                 v.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -1194,10 +1202,13 @@ float4 coverage_probe(VOut i, bool front : SV_IsFrontFace,
         ComPtr<ID3D12PipelineState> range_pso;
         if (depth_samples > 1) {
             const std::string source = "#define PARTICLE_DOF_SAMPLES " +
-                std::to_string(depth_samples) + "\n" + gpu::kParticleDofDepthRangeHlsl;
+                std::to_string(depth_samples) + "\n" +
+                (float_range?smoke_v25::gpu::kParticleDofDepthRangeHlsl:
+                             gpu::kParticleDofDepthRangeHlsl);
             const auto range_vs = Compile(source, "vs_5_0", "vs");
             const auto range_ps = Compile(source, "ps_5_0", "range_ps");
-            range_pso = RangePipeline(range_vs.Get(), range_ps.Get());
+            range_pso = RangePipeline(range_vs.Get(), range_ps.Get(),
+                float_range?DXGI_FORMAT_R32G32_FLOAT:DXGI_FORMAT_R32G32_UINT);
             list->SetGraphicsRootSignature(root_.Get());
             ID3D12DescriptorHeap* range_heaps[] = {srvs.Get()};
             list->SetDescriptorHeaps(1, range_heaps);
