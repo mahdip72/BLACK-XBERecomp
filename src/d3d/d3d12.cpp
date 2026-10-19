@@ -1324,7 +1324,7 @@ private:
         bool visibility_active = false;
         float visibility_target[4] = {};
         std::vector<ParticleDofVisibilityMap> visibility_maps;
-        uint64_t visibility_pages = 0, visibility_quads = 0;
+        uint64_t visibility_pages = 0, visibility_chunks = 0, visibility_quads = 0;
         uint64_t atlas_batches = 0, atlas_pages = 0, atlas_quads = 0, atlas_fallback = 0;
         ComPtr<ID3D12Resource> shared[2]; // R8 2MSAA support, RG32F single-sample transmission
         D3D12_RESOURCE_STATES shared_states[2] = {};
@@ -5095,37 +5095,52 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     ID3D12PipelineState* visibility_source_pso = nullptr;
     ID3D12PipelineState* visibility_composite_pso = nullptr;
     std::vector<ParticleDofVisibilityPage> visibility_pages;
+    std::vector<ParticleDofVisibilityEpoch> visibility_epochs;
     const float largest_radius = p.globals.optics[1] * std::max(p.globals.optics[2], p.globals.optics[3]);
     if (reuse_coverage && particle_visibility_cache_ && sh.particle_samples == 2 && sh.particle_coverage &&
         native_key.fill != kFillWireframe && !native_key.zbias && !native_key.zslope &&
         std::isfinite(largest_radius) && largest_radius > 0 && largest_radius < 4096) {
         const uint32_t halo = uint32_t(std::ceil(largest_radius)) + 2;
         try {
-            visibility_pages = BuildParticleDofVisibilityPages(pages, p.quads, p.globals, extent, halo, p.visibility_maps);
+            visibility_pages = BuildParticleDofVisibilityPages(pages, p.quads, p.globals, extent, halo,
+                                                               p.visibility_maps, &visibility_epochs);
         } catch (const std::bad_alloc&) { visibility_pages.clear(); }
         if (std::any_of(visibility_pages.begin(), visibility_pages.end(),
             [](const auto& page) { return page.cached; }) && EnsureParticleDofVisibility(extent)) {
             visibility_source_pso = pipeline(visibility_source, true);
             visibility_composite_pso = pipeline(visibility_composite, false);
             if (visibility_source_pso && visibility_composite_pso) {
-                // Visibility packing only partitions native composites. Keep the
-                // original disjoint color cells together for one source/filter pair.
-                // Validate the complete partition before any destination draw.
-                size_t next = 0;
+                // Epochs reuse one cache generation across fallback spans. Validate
+                // both producer and composite partitions before any destination draw.
+                size_t next = 0, next_epoch = 0;
                 bool partitioned = true;
                 for (const auto& page : pages) {
                     uint32_t first = page.first_quad, end = first + page.quad_count;
                     while (first < end) {
-                        if (next >= visibility_pages.size() || visibility_pages[next].first_quad != first ||
-                            !visibility_pages[next].quad_count || visibility_pages[next].quad_count > end - first) {
+                        if (next_epoch >= visibility_epochs.size()) { partitioned = false; break; }
+                        const auto& epoch = visibility_epochs[next_epoch++];
+                        if (epoch.first_quad != first || !epoch.quad_count || epoch.quad_count > end - first ||
+                            epoch.first_chunk != next || !epoch.chunk_count ||
+                            epoch.chunk_count > visibility_pages.size() - next) {
                             partitioned = false;
                             break;
                         }
-                        first += visibility_pages[next++].quad_count;
+                        const uint32_t epoch_end = first + epoch.quad_count;
+                        bool cached = false;
+                        for (uint32_t i = 0; i < epoch.chunk_count; ++i) {
+                            const auto& chunk = visibility_pages[next++];
+                            if (chunk.first_quad != first || !chunk.quad_count || chunk.quad_count > epoch_end - first) {
+                                partitioned = false;
+                                break;
+                            }
+                            cached |= chunk.cached;
+                            first += chunk.quad_count;
+                        }
+                        if (!partitioned || first != epoch_end || cached != epoch.cached) { partitioned = false; break; }
                     }
                     if (!partitioned) break;
                 }
-                if (partitioned && next == visibility_pages.size()) {
+                if (partitioned && next == visibility_pages.size() && next_epoch == visibility_epochs.size()) {
                     p.visibility_active = true;
                     p.visibility_target[0] = p.visibility_target[1] = float(p.visibility_extent);
                     p.visibility_target[2] = float(halo); p.visibility_target[3] = 0;
@@ -5216,7 +5231,7 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
     GuestExtent size{};
     SurfaceSize(s.rt, size.w, size.h);
     p.globals.atlas_target[0] = p.globals.atlas_target[1] = float(extent);
-    size_t visibility_index = 0;
+    size_t visibility_index = 0, visibility_epoch_index = 0;
     for (size_t page_index = 0; page_index < pages.size(); ++page_index) {
         const auto& page = pages[page_index];
         const auto& shared = shared_pages[page_index];
@@ -5264,10 +5279,21 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
         // chunk consumes it. Only the smaller visibility cache is reused here.
         const uint32_t page_end = page.first_quad + page.quad_count;
         for (uint32_t chunk_first = page.first_quad; chunk_first < page_end;) {
+            const size_t chunk_index = visibility_index;
             const ParticleDofVisibilityPage chunk = p.visibility_active ? visibility_pages[visibility_index++] :
                 ParticleDofVisibilityPage{chunk_first, page_end - chunk_first, false};
             const bool use_visibility = p.visibility_active && chunk.cached;
-            if (use_visibility) {
+            const ParticleDofVisibilityEpoch* generation = nullptr;
+            if (p.visibility_active) {
+                ++p.visibility_chunks;
+                if (use_visibility) p.visibility_quads += chunk.quad_count;
+                if (visibility_epoch_index < visibility_epochs.size() &&
+                    chunk_index == visibility_epochs[visibility_epoch_index].first_chunk) {
+                    const auto& epoch = visibility_epochs[visibility_epoch_index++];
+                    if (epoch.cached) generation = &epoch;
+                }
+            }
+            if (generation) {
                 auto visibility_timing = dof_timing_.Measure(DofGpuTiming::Stage::ParticleTransmission, cl_.Get());
                 Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 SetBlitTarget(ParticleVisibilityView(), p.visibility_extent, p.visibility_extent);
@@ -5278,9 +5304,11 @@ bool D3D12Backend::DrawParticleDofAtlas(const State& s, const Assembled& a, cons
                 cl_->IASetIndexBuffer(&index_view);
                 cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 SetTextureViewsAndSamplers(s, stages, clamp);
-                cl_->DrawIndexedInstanced(chunk.quad_count * 6, 1, chunk.first_quad * 6, 0, 0);
+                // Invalid maps degenerate in pass6. Fill every mapped cell now,
+                // then retain it through the intervening fallback composites.
+                cl_->DrawIndexedInstanced(generation->quad_count * 6, 1, generation->first_quad * 6, 0, 0);
                 Transition(p.visibility.Get(), p.visibility_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                ++p.visibility_pages; p.visibility_quads += chunk.quad_count;
+                ++p.visibility_pages;
                 if (p.visibility_pages == 1)
                     LOGR("Particle DOF native visibility cache active: %ux%u R16F, unchanged aperture samples",
                          p.visibility_extent, p.visibility_extent);
@@ -6226,8 +6254,9 @@ void D3D12Backend::Present(const Surface& front) {
              (unsigned long long)shared[size_t(ParticleSharedReject::Depth)],
              (unsigned long long)shared[size_t(ParticleSharedReject::Bounds)],
              (unsigned long long)shared[size_t(ParticleSharedReject::Overlap)]);
-        LOGR("Particle DOF native visibility cache: %llu pages, %llu quads",
-             (unsigned long long)particle.visibility_pages, (unsigned long long)particle.visibility_quads);
+        LOGR("Particle DOF native visibility cache: %llu generations, %llu ordered chunks, %llu cached quads",
+             (unsigned long long)particle.visibility_pages, (unsigned long long)particle.visibility_chunks,
+             (unsigned long long)particle.visibility_quads);
     }
     particle.previous_world = particle.world_valid;
     particle.marker = particle.world_valid = false;

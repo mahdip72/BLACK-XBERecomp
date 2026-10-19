@@ -77,6 +77,8 @@ bool VisibilityBenchmark=false;
 bool GroupColorPages=false;
 bool MixedCacheEligibility=false;
 bool CompareColorBatching=false;
+bool CompareProducerEpochs=false;
+bool CompareCacheShader=false;
 bool MixedSamples=false,AdditiveBenchmark=false,WarpCorrectness=false;
 uint32_t Warmups=8,MeasuredPairs=16;
 void Require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
@@ -296,7 +298,12 @@ public:
                                (GatherBenchmark && mode==Mode::F793After);
         const bool shared=mode==Mode::F793After && Samples==2 && !SharedOff;
         const bool visibility=VisibilityBenchmark &&
-            (mode==Mode::F793After || (CompareColorBatching && mode==Mode::F793Before));
+            (mode==Mode::F793After ||
+             ((CompareColorBatching || CompareProducerEpochs || CompareCacheShader) &&
+              mode==Mode::F793Before));
+        const bool use_epochs=CompareCacheShader ||
+                              (CompareProducerEpochs && mode==Mode::F793After);
+        const auto visibility_cb=use_epochs?epoch_visibility_vcb_.Get():visibility_vcb_.Get();
         const uint32_t range_levels=1;
         Require(!capture_samples || coverage,"sample capture requires an MSAA coverage mode");
         // Resource creation, uploads and PSO creation are deliberately outside GPU timestamps.
@@ -473,7 +480,8 @@ public:
             const auto barrier = Barrier(resource, state, next);
             list->ResourceBarrier(1, &barrier); state = next;
         };
-        const bool group_color_pages=visibility && GroupColorPages && mode==Mode::F793After;
+        const bool group_color_pages=visibility && GroupColorPages &&
+            (mode==Mode::F793After || CompareProducerEpochs || CompareCacheShader);
         for (uint32_t batch = 0; batch < Batches; ++batch) {
             if (!UsesAtlas(mode)) {
                 timed(composites, [&] {
@@ -489,7 +497,7 @@ public:
                 visibility_page_dcbs_:page_dcbs_;
             const size_t page_count=visibility && !group_color_pages?
                 visibility_pages_.size():pages_.size();
-            size_t next_visibility_chunk=0;
+            size_t next_visibility_chunk=0, next_visibility_epoch=0;
             for (size_t page_index = 0; page_index < page_count; ++page_index) {
                 const auto page=visibility && !group_color_pages?
                     gpu::ParticleDofAtlasPage{visibility_pages_[page_index].first_quad,
@@ -596,7 +604,24 @@ public:
                     const auto draw_cb=group_color_pages?
                         visibility_page_dcbs_[chunk_index]->GetGPUVirtualAddress():page_cb;
                     const bool cached=visibility && visibility_pages_[chunk_index].cached;
-                    if (cached) {
+                    bool produce=cached;
+                    auto producer_page=draw_page;
+                    auto producer_cb=draw_cb;
+                    if (use_epochs) {
+                        produce=false;
+                        if (next_visibility_epoch<visibility_epochs_.size() &&
+                            visibility_epochs_[next_visibility_epoch].first_chunk==chunk_index) {
+                            const auto& epoch=visibility_epochs_[next_visibility_epoch++];
+                            Require(epoch.first_quad==draw_page.first_quad &&
+                                    epoch.chunk_count>0 &&
+                                    epoch.first_chunk+epoch.chunk_count<=visibility_pages_.size(),
+                                    "producer epoch did not start at its first native chunk");
+                            produce=epoch.cached;
+                            producer_page={epoch.first_quad,epoch.quad_count};
+                            producer_cb=page_cb;
+                        }
+                    }
+                    if (produce) {
                         timed(transmissions,[&] {
                             transition(visibility_atlas.Get(),visibility_state,
                                        D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -604,13 +629,13 @@ public:
                             list->RSSetScissorRects(1,&atlas_scissor);
                             list->SetGraphicsRootDescriptorTable(0,descriptors.native_srv);
                             list->SetGraphicsRootConstantBufferView(1,
-                                visibility_vcb_->GetGPUVirtualAddress());
-                            list->SetGraphicsRootConstantBufferView(2,draw_cb);
+                                visibility_cb->GetGPUVirtualAddress());
+                            list->SetGraphicsRootConstantBufferView(2,producer_cb);
                             list->IASetVertexBuffers(0,1,&native_vbv);
                             list->SetPipelineState(visibility_source_pso_.Get());
                             list->OMSetRenderTargets(1,&descriptors.visibility_rtv,FALSE,nullptr);
-                            list->DrawIndexedInstanced(draw_page.quad_count*6,1,
-                                                       draw_page.first_quad*6,0,0);
+                            list->DrawIndexedInstanced(producer_page.quad_count*6,1,
+                                                       producer_page.first_quad*6,0,0);
                             list->IASetVertexBuffers(0,1,&vbv);
                             transition(visibility_atlas.Get(),visibility_state,
                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -623,11 +648,14 @@ public:
                             cached?descriptors.visibility_composite_srv:
                             shared?descriptors.shared_composite_srv:descriptors.composite_srv);
                         list->SetGraphicsRootConstantBufferView(1,
-                            visibility?visibility_vcb_->GetGPUVirtualAddress():
+                            visibility?visibility_cb->GetGPUVirtualAddress():
                                        vcb_->GetGPUVirtualAddress());
                         list->SetGraphicsRootConstantBufferView(2, draw_cb);
                         list->SetPipelineState(visibility?
-                            (cached?visibility_composite_pso_.Get():coverage_after_pso_.Get()):
+                            (cached?(CompareCacheShader && mode==Mode::F793Before?
+                                     visibility_composite_old_pso_.Get():
+                                     visibility_composite_pso_.Get()):
+                                    coverage_after_pso_.Get()):
                             mode==Mode::CoverageBefore?coverage_before_pso_.Get():
                             mode==Mode::CoverageAfter?coverage_after_pso_.Get():
                             mode==Mode::F793Before?f793_composite_pso_.Get():
@@ -644,6 +672,9 @@ public:
             if (group_color_pages)
                 Require(next_visibility_chunk==visibility_pages_.size(),
                         "grouped color pages left visibility chunks undrawn");
+            if (use_epochs)
+                Require(next_visibility_epoch==visibility_epochs_.size(),
+                        "producer epochs did not cover every original color page");
         }
         const UINT all_end = ticks; stamp();
         list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP,0,ticks,
@@ -1095,6 +1126,20 @@ private:
                                             DXGI_FORMAT_R16_FLOAT,false,true);
             visibility_composite_pso_=Pipeline(consumer_vs.Get(),consumer_ps.Get(),
                 DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,2,true,AdditiveBenchmark);
+            if (CompareCacheShader) {
+                const std::string old_source=
+                    "#define PARTICLE_DOF_CACHE_APERTURE_FAST 0\n"+
+                    gpu::DofParticlePixelSource(2,blend,0,false,7,true);
+                const auto old_ps=Compile(old_source,"main","ps_5_0",
+                                          D3DCOMPILE_OPTIMIZATION_LEVEL1,true);
+                Require(old_ps->GetBufferSize()!=consumer_ps->GetBufferSize() ||
+                        std::memcmp(old_ps->GetBufferPointer(),consumer_ps->GetBufferPointer(),
+                                    old_ps->GetBufferSize())!=0,
+                        "consumer macro did not produce distinct cached-aperture bytecode");
+                visibility_composite_old_pso_=Pipeline(consumer_vs.Get(),old_ps.Get(),
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,true,true,2,true,AdditiveBenchmark);
+                ReportParticlePixelBytecode("visibility-consumer-original-pass7",old_ps.Get());
+            }
             ReportParticlePixelBytecode("visibility-producer-pass6",producer_ps.Get());
             ReportParticlePixelBytecode("visibility-consumer-pass7",consumer_ps.Get());
         }
@@ -1161,6 +1206,46 @@ private:
             visibility_halo_=uint32_t(std::ceil(largest))+2;
             visibility_pages_=gpu::BuildParticleDofVisibilityPages(
                 pages_,metadata_,p.globals,AtlasExtent,visibility_halo_,visibility_maps_);
+            if (CompareProducerEpochs || CompareCacheShader) {
+                epoch_visibility_pages_=gpu::BuildParticleDofVisibilityPages(
+                    pages_,metadata_,p.globals,AtlasExtent,visibility_halo_,
+                    epoch_visibility_maps_,&visibility_epochs_);
+                Require(epoch_visibility_pages_.size()==visibility_pages_.size(),
+                        "epoch planner changed the native composite chunk count");
+                for (size_t c=0;c<visibility_pages_.size();++c) {
+                    const auto& old=visibility_pages_[c];
+                    const auto& next=epoch_visibility_pages_[c];
+                    Require(old.first_quad==next.first_quad &&
+                            old.quad_count==next.quad_count && old.cached==next.cached,
+                            "epoch planner changed native composite order or eligibility");
+                }
+                size_t next_chunk=0;
+                for (const auto& epoch:visibility_epochs_) {
+                    Require(epoch.first_chunk==next_chunk && epoch.chunk_count>0 &&
+                            epoch.first_chunk+epoch.chunk_count<=visibility_pages_.size(),
+                            "epoch planner omitted or duplicated a composite chunk");
+                    Require(epoch.first_quad==visibility_pages_[next_chunk].first_quad,
+                            "epoch producer begins at the wrong native quad");
+                    next_chunk+=epoch.chunk_count;
+                    const auto& last=visibility_pages_[next_chunk-1];
+                    Require(last.first_quad+last.quad_count==
+                            epoch.first_quad+epoch.quad_count,
+                            "epoch producer omits a native fallback span");
+                }
+                Require(next_chunk==visibility_pages_.size(),
+                        "epoch planner failed to cover the final composite chunk");
+                if (MixedCacheEligibility) {
+                    Require(std::any_of(visibility_epochs_.begin(),visibility_epochs_.end(),
+                        [](const auto& epoch) { return epoch.cached && epoch.chunk_count>1; }),
+                        "fixture did not exercise one producer across cached/fallback chunks");
+                    if (WarpCorrectness && Quads>=16)
+                        Require(visibility_epochs_.size()>pages_.size(),
+                                "WARP epoch fixture did not cross an actual cache overflow");
+                }
+                std::printf("Epoch planner: %zu producers across %zu ordered chunks and "
+                            "%zu original color pages\n",visibility_epochs_.size(),
+                            visibility_pages_.size(),pages_.size());
+            }
             Require(!visibility_pages_.empty() &&
                     std::any_of(visibility_pages_.begin(),visibility_pages_.end(),
                         [](const auto& page) { return page.cached; }),
@@ -1210,6 +1295,12 @@ private:
                         sizeof(gpu::ParticleDofVisibilityMap));
             static_assert(sizeof(vc)==3072 && sizeof(gpu::ParticleDofVisibilityMap)==8);
             visibility_vcb_=Upload(constants.data(),constants.size());
+            if (CompareProducerEpochs || CompareCacheShader) {
+                std::memcpy(constants.data()+sizeof(vc)+sizeof(cache_target),
+                            epoch_visibility_maps_.data(),epoch_visibility_maps_.size()*
+                            sizeof(gpu::ParticleDofVisibilityMap));
+                epoch_visibility_vcb_=Upload(constants.data(),constants.size());
+            }
         }
         gpu::DrawConstants dc{};
         dc.surf[0]=float(W);dc.surf[1]=float(H);dc.surf[2]=1;
@@ -1477,9 +1568,11 @@ private:
                                  coverage_before_source_pso_,float_range_pso_,sample_pso_,
                                  f793_source_pso_,f793_composite_pso_,
                                  support_pso_,transmission_pso_,shared_composite_pso_;
-    ComPtr<ID3D12PipelineState> visibility_source_pso_,visibility_composite_pso_;
+    ComPtr<ID3D12PipelineState> visibility_source_pso_,visibility_composite_pso_,
+                                visibility_composite_old_pso_;
     ComPtr<ID3D12PipelineState> mixed_sample0_pso_,mixed_sample1_pso_;
-    ComPtr<ID3D12Resource> native_vb_,vb_,ib_,vcb_,visibility_vcb_,old_dcb_,radii_cb_,texture_;
+    ComPtr<ID3D12Resource> native_vb_,vb_,ib_,vcb_,visibility_vcb_,
+                          epoch_visibility_vcb_,old_dcb_,radii_cb_,texture_;
     std::vector<ComPtr<ID3D12Resource>> page_dcbs_;
     std::vector<ComPtr<ID3D12Resource>> visibility_page_dcbs_;
     std::vector<ComPtr<ID3D12Resource>> legacy_page_dcbs_;
@@ -1488,6 +1581,9 @@ private:
     std::vector<gpu::ParticleDofAtlasPage> pages_;
     std::vector<gpu::ParticleDofVisibilityPage> visibility_pages_;
     std::vector<gpu::ParticleDofVisibilityMap> visibility_maps_;
+    std::vector<gpu::ParticleDofVisibilityPage> epoch_visibility_pages_;
+    std::vector<gpu::ParticleDofVisibilityMap> epoch_visibility_maps_;
+    std::vector<gpu::ParticleDofVisibilityEpoch> visibility_epochs_;
     uint32_t visibility_halo_=0;
     std::vector<std::vector<D3D12_RECT>> page_rects_;
     std::vector<std::vector<D3D12_RECT>> visibility_rects_;
@@ -1651,6 +1747,10 @@ int main(int argc,char** argv) {
                 MixedCacheEligibility=true;
             } else if (std::strcmp(argv[arg],"--compare-color-batching")==0) {
                 CompareColorBatching=true;
+            } else if (std::strcmp(argv[arg],"--compare-producer-epochs")==0) {
+                CompareProducerEpochs=true;
+            } else if (std::strcmp(argv[arg],"--compare-cache-shader")==0) {
+                CompareCacheShader=true;
             } else if (std::strcmp(argv[arg],"--mixed-samples")==0) {
                 MixedSamples=true;
             } else if (std::strcmp(argv[arg],"--additive")==0) {
@@ -1742,6 +1842,8 @@ int main(int argc,char** argv) {
                     "[--group-color-pages requires --visibility-cache] "
                     "[--mixed-cache-eligibility requires --visibility-cache] "
                     "[--compare-color-batching requires --visibility-cache --group-color-pages] "
+                    "[--compare-producer-epochs requires --visibility-cache --group-color-pages] "
+                    "[--compare-cache-shader requires --visibility-cache --group-color-pages] "
                     "[--height 720|2160; --warp also 64..2160] "
                     "[--width 64..4096] [--radius px] "
                     "[--focus worldZ] [--near scale] [--far scale] "
@@ -1778,6 +1880,12 @@ int main(int argc,char** argv) {
                 "--mixed-cache-eligibility requires --visibility-cache");
         Require(!CompareColorBatching || (VisibilityBenchmark && GroupColorPages),
                 "--compare-color-batching requires --visibility-cache --group-color-pages");
+        Require(!CompareProducerEpochs || (VisibilityBenchmark && GroupColorPages &&
+                !CompareColorBatching && !CompareCacheShader),
+                "--compare-producer-epochs requires grouped Vq color pages without another comparison mode");
+        Require(!CompareCacheShader || (VisibilityBenchmark && GroupColorPages &&
+                !CompareColorBatching && !CompareProducerEpochs),
+                "--compare-cache-shader requires grouped Vq color pages without another comparison mode");
         Require(!VisibilityBenchmark || CandidateOptimization==D3DCOMPILE_OPTIMIZATION_LEVEL1,
                 "--visibility-cache compares both particle shaders at O1");
         Require(!CoverageBenchmark || F793Benchmark ||
@@ -1790,6 +1898,8 @@ int main(int argc,char** argv) {
                         "radius %.3f px, %u quads x %u layers, quad scale %.2f, %s scene, native %s, "
                         "candidate %s/%s; "
                         "%u warmups and %u measured runs/variant in ABBA order\n",
+                         CompareCacheShader?"original versus guarded cached-aperture shader":
+                         CompareProducerEpochs?"old versus epoch Vq producer schedule":
                          CompareColorBatching?"split versus grouped Vq color pages":
                          VisibilityBenchmark?"bc30216 versus Vq visibility cache":
                          GatherBenchmark?"production UINT versus FLOAT gather":
@@ -1817,6 +1927,14 @@ int main(int argc,char** argv) {
             if (CompareColorBatching)
                 std::puts("Color batching parity: before uses split Vq color pages and after "
                           "uses grouped parent color pages; shaders and cache maps are identical.");
+            if (CompareProducerEpochs)
+                std::puts("Producer epoch parity: both modes filter each original color page once; "
+                          "before resets Vq packing after fallback, after keeps disjoint cells "
+                          "and runs one producer across each cached epoch. Ordered composites "
+                          "and all shader bytecode remain identical.");
+            if (CompareCacheShader)
+                std::puts("Cached-aperture parity: both modes use identical producer epochs "
+                          "and maps; only PASS7's proven-interior gather shortcut changes.");
             if (MixedCacheEligibility)
                 std::puts("Mixed cache eligibility: alternating native quads are 16x16 px "
                           "and must use direct fallback without losing color filtering.");
@@ -1854,7 +1972,7 @@ int main(int argc,char** argv) {
                 }
             Require(before.size()==MeasuredPairs && after.size()==MeasuredPairs,
                     "coverage ABBA pairing lost a measurement");
-            if (!CompareColorBatching) {
+            if (!CompareColorBatching && !CompareProducerEpochs && !CompareCacheShader) {
                 Print(VisibilityBenchmark?"bc30216 FLOAT direct pass2":
                       GatherBenchmark?"production UINT bounds/direct pass2":
                       F793Benchmark?"f793e2d baseline":"c591162 blur-aware pass2",before);
@@ -1863,6 +1981,8 @@ int main(int argc,char** argv) {
                       F793Benchmark?"shared coverage candidate":"quantized blur-aware pass2",after);
             }
             const auto difference=Compare(before.front(),after.front(),
+                CompareCacheShader?"old/new cached-aperture shader resolved":
+                CompareProducerEpochs?"old/epoch Vq producer resolved":
                 CompareColorBatching?"split/grouped Vq resolved":
                 VisibilityBenchmark?"bc30216/Vq resolved":
                 GatherBenchmark?"production UINT/FLOAT gather resolved":
@@ -1872,6 +1992,8 @@ int main(int argc,char** argv) {
             before_samples.rgba=before.front().sample_rgba;
             after_samples.rgba=after.front().sample_rgba;
             const auto sample_difference=Compare(before_samples,after_samples,
+                CompareCacheShader?"old/new cached-aperture shader physical MS samples (64x16 ROI)":
+                CompareProducerEpochs?"old/epoch Vq physical MS samples (64x16 ROI)":
                 CompareColorBatching?"split/grouped Vq physical MS samples (64x16 ROI)":
                 VisibilityBenchmark?"bc30216/Vq physical MS samples (64x16 ROI)":
                 GatherBenchmark?"production UINT/FLOAT gather physical MS samples (64x16 ROI)":
@@ -1886,6 +2008,8 @@ int main(int argc,char** argv) {
                                 "-c591-quantized")+
                 (GroupColorPages?"-grouped-color-pages":"")+
                 (MixedCacheEligibility?"-mixed-cache-eligibility":"")+
+                (CompareProducerEpochs?"-old-vs-epochs":"")+
+                (CompareCacheShader?"-old-vs-cache-shader":"")+
                 (CompareColorBatching?"-split-vs-grouped":"")+
                 (VisibilityBenchmark?"-wallz"+std::to_string(int(WallZ)):
                                      std::string{})+
@@ -1893,7 +2017,7 @@ int main(int argc,char** argv) {
                 (AdditiveBenchmark?"-additive":"");
             WriteBmp(("coverage-before-"+suffix+".bmp").c_str(),before.front());
             WriteBmp(("coverage-after-"+suffix+".bmp").c_str(),after.front());
-            if (!CompareColorBatching) {
+            if (!CompareColorBatching && !CompareProducerEpochs && !CompareCacheShader) {
                 const double old_ms=MedianTotal(before),new_ms=MedianTotal(after);
                 std::printf("Coverage total median %.3f -> %.3f ms; composite median ",old_ms,new_ms);
                 std::vector<double> old_composite,new_composite;
@@ -1912,6 +2036,12 @@ int main(int argc,char** argv) {
             if (CompareColorBatching) {
                 Require(difference.maximum==0 && sample_difference.maximum==0,
                         "grouping color cells changed resolved or physical-MS output");
+            } else if (CompareProducerEpochs) {
+                Require(difference.maximum==0 && sample_difference.maximum==0,
+                        "producer epoch packing changed resolved or physical-MS output");
+            } else if (CompareCacheShader) {
+                Require(difference.maximum==0 && sample_difference.maximum==0,
+                        "cached-aperture shader changed resolved or physical-MS output");
             } else if (VisibilityBenchmark) {
                 Require(difference.maximum<=1e-5f && sample_difference.maximum<=1e-5f,
                         "Vq cache changed resolved or physical-MS output");
@@ -1927,6 +2057,10 @@ int main(int argc,char** argv) {
                     "optimized blur-aware physical MS samples changed beyond tolerance");
             if (CompareColorBatching)
                 std::puts("Color batching parity PASS: resolved and physical-MS output matched exactly.");
+            else if (CompareProducerEpochs)
+                std::puts("Producer epoch parity PASS: resolved and physical-MS output matched exactly.");
+            else if (CompareCacheShader)
+                std::puts("Cached-aperture shader parity PASS: resolved and physical-MS output matched exactly.");
             else
                 std::puts("Coverage benchmark PASS; offscreen hardware timestamps are workload "
                           "measurements, not gameplay FPS; GPU clocks and power state were not fixed.");

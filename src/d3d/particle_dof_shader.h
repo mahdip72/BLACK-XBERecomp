@@ -152,6 +152,9 @@ inline constexpr char kParticleDofHlsl[] = R"(
 #ifndef PARTICLE_DOF_BLEND
 #define PARTICLE_DOF_BLEND 0
 #endif
+#ifndef PARTICLE_DOF_CACHE_APERTURE_FAST
+#define PARTICLE_DOF_CACHE_APERTURE_FAST 1
+#endif
 #if PARTICLE_DOF_SAMPLES > 1
 Texture2DMS<float> particleSceneDepth : register(t3);
 #if PARTICLE_DOF_PASS != 4
@@ -351,6 +354,39 @@ float ParticleBilinearVisibility(int2 center, float2 offset, uint incomingCode,
                 lerp(ParticleVisibleCode(float2(p + int2(0, 1)) + .5, incomingCode, low, high, lessEqual),
                      ParticleVisibleCode(float2(p + 1) + .5, incomingCode, low, high, lessEqual), f.x), f.y);
 }
+#if PARTICLE_DOF_PASS == 7 && PARTICLE_DOF_CACHE_APERTURE_FAST
+float ParticleCachedApertureSum(int2 pixel, float radius, uint incomingCode,
+                                float2 low, float2 high, bool lessEqual) {
+    // Prove that every bilinear corner of this aperture is in this particle's
+    // cache cell once. The clipped viewport/target edges retain the original path.
+    int reach = (int)ceil(radius) + 1;
+    [branch] if (all(pixel - reach >= particleCacheFirst) && all(pixel + reach < particleCacheLast)) {
+        int2 cacheCenter = particleCacheAtlas + pixel - particleCacheFirst;
+        precise float sum = 0;
+        [loop] for (int tap = 0; tap < 32; ++tap) {
+            // Match the original compiled product order and three MAD lerps.
+            // Keep the final accumulation separate from the last interpolation.
+            precise float2 scaled = particleDisk[tap] * radius;
+            precise float2 offset = scaled * 1.41421356237;
+            int2 cached = cacheCenter + int2(floor(offset));
+            float2 f = frac(offset);
+            float2 uv = (float2(cached) + 1) / particleVisibilityTarget.xy;
+            float4 visible = particleVisibilityCache.GatherRed(smp0, uv);
+            precise float bottom = mad(visible.z - visible.w, f.x, visible.w);
+            precise float top = mad(visible.y - visible.x, f.x, visible.x);
+            precise float value = mad(top - bottom, f.y, bottom);
+            sum += value;
+        }
+        return sum;
+    }
+    float sum = 0;
+    [loop] for (int tap = 0; tap < 32; ++tap) {
+        float2 disk = particleDisk[tap] * 1.41421356237;
+        sum += ParticleBilinearVisibility(pixel, disk * radius, incomingCode, low, high, lessEqual);
+    }
+    return sum;
+}
+#endif
 float2 ParticleOccluderTransmission(int2 pixel, float opaque, uint incomingCode, float particleRadius,
                                     float2 low, float2 high, bool lessEqual, float particleVisibility) {
     if (ParticleDepthPassCode(incomingCode, opaque, lessEqual)) return float2(1, particleVisibility);
@@ -369,22 +405,30 @@ float2 ParticleOccluderTransmission(int2 pixel, float opaque, uint incomingCode,
     // A previously evaluated empty denominator cannot transmit. Keep this after
     // the native-visible/focused/broader-aperture gates, whose results are independent.
     if (particleVisibility >= 0 && particleVisibility <= 1e-6) return float2(0, particleVisibility);
+#if PARTICLE_DOF_PASS == 7 && PARTICLE_DOF_CACHE_APERTURE_FAST
+    float opaqueVisibility = ParticleCachedApertureSum(pixel, opaqueRadius, incomingCode, low, high, lessEqual);
+#else
     float opaqueVisibility = 0;
     [loop] for (int tap = 0; tap < 32; ++tap) {
         // First 32 equal-area positions of the 64 disk, normalized to unit radius.
         float2 disk = particleDisk[tap] * 1.41421356237;
         opaqueVisibility += ParticleBilinearVisibility(pixel, disk * opaqueRadius, incomingCode, low, high, lessEqual);
     }
+#endif
     // Zero numerator is exactly blocked regardless of the denominator. Leave an
     // unevaluated denominator negative so another MSAA depth may still request it.
     if (opaqueVisibility == 0) return float2(0, particleVisibility);
     if (particleVisibility < 0) {
+#if PARTICLE_DOF_PASS == 7 && PARTICLE_DOF_CACHE_APERTURE_FAST
+        particleVisibility = ParticleCachedApertureSum(pixel, particleRadius, incomingCode, low, high, lessEqual);
+#else
         float particleSum = 0;
         [loop] for (int tap = 0; tap < 32; ++tap) {
             float2 disk = particleDisk[tap] * 1.41421356237;
             particleSum += ParticleBilinearVisibility(pixel, disk * particleRadius, incomingCode, low, high, lessEqual);
         }
         particleVisibility = particleSum;
+#endif
     }
     // Both sums have the same 32-tap denominator. No amplification or invented
     // energy when the sampled source visibility is empty/invalid.

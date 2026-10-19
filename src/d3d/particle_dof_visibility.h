@@ -21,17 +21,30 @@ struct ParticleDofVisibilityPage {
     bool cached = false;
 };
 
+// A producer epoch owns disjoint cache cells until all its ordered composite
+// chunks finish. Fallback chunks may lie between mapped quads in this range.
+struct ParticleDofVisibilityEpoch {
+    uint32_t first_quad = 0, quad_count = 0;
+    uint32_t first_chunk = 0, chunk_count = 0;
+    bool cached = false;
+};
+
 static_assert(sizeof(ParticleDofVisibilityMap) == 8);
 
 // Color pages must describe ordered, nonoverlapping ranges. Each remains a separate
 // packing domain; malformed ranges are clipped to available quads and use fallback.
 // Maps hold uint16 x/y pairs. Visibility cells include the full native-pixel halo,
 // independently of material alpha; an unmapped quad keeps the existing composite.
+// Omitting epochs retains the original per-cached-span packing for comparisons.
+// With epochs, fallback spans do not reset packing; only overflow/color-page end
+// closes a producer range. Composite chunks retain their original quad order.
 inline std::vector<ParticleDofVisibilityPage> BuildParticleDofVisibilityPages(
     std::span<const ParticleDofAtlasPage> color_pages, std::span<const ParticleDofQuad> quads,
     const ParticleDofGlobals& globals, uint32_t cache_extent, uint32_t halo,
-    std::vector<ParticleDofVisibilityMap>& maps) {
+    std::vector<ParticleDofVisibilityMap>& maps,
+    std::vector<ParticleDofVisibilityEpoch>* epochs = nullptr) {
     maps.assign(quads.size(), ParticleDofVisibilityMap{});
+    if (epochs) epochs->clear();
     std::vector<ParticleDofVisibilityPage> pages;
     bool usable = cache_extent > 0 && cache_extent <= 65535;
     for (float x : globals.optics) usable &= std::isfinite(x);
@@ -53,10 +66,21 @@ inline std::vector<ParticleDofVisibilityPage> BuildParticleDofVisibilityPages(
         const size_t count = std::min(size_t(color_page.quad_count), quads.size() - first);
         if (!count) continue;
         if (!usable || first != color_page.first_quad || count != color_page.quad_count) {
+            if (epochs) epochs->push_back({uint32_t(first), uint32_t(count), uint32_t(pages.size()), 1, false});
             pages.push_back({uint32_t(first), uint32_t(count), false});
             continue;
         }
         const size_t page_begin = pages.size();
+        size_t epoch_first = first, epoch_chunk = page_begin;
+        bool epoch_cached = false;
+        const auto close_epoch = [&](size_t end) {
+            if (epochs && end > epoch_first)
+                epochs->push_back({uint32_t(epoch_first), uint32_t(end - epoch_first),
+                    uint32_t(epoch_chunk), uint32_t(pages.size() - epoch_chunk), epoch_cached});
+            epoch_first = end;
+            epoch_chunk = pages.size();
+            epoch_cached = false;
+        };
         uint32_t cursor_x = 0, cursor_y = 0, row_height = 0;
         for (size_t q = first; q < first + count; ++q) {
             const auto& quad = quads[q];
@@ -88,7 +112,7 @@ inline std::vector<ParticleDofVisibilityPage> BuildParticleDofVisibilityPages(
                 if (pages.size() == page_begin || pages.back().cached)
                     pages.push_back({uint32_t(q), 1, false});
                 else ++pages.back().quad_count;
-                cursor_x = cursor_y = row_height = 0;
+                if (!epochs) cursor_x = cursor_y = row_height = 0;
                 continue;
             }
 
@@ -99,15 +123,20 @@ inline std::vector<ParticleDofVisibilityPage> BuildParticleDofVisibilityPages(
                 height = 0;
             }
             const bool overflow = y + cell[1] > cache_extent;
-            if (overflow) x = y = height = 0;
+            if (overflow) {
+                close_epoch(q);
+                x = y = height = 0;
+            }
             if (pages.size() == page_begin || !pages.back().cached || overflow)
                 pages.push_back({uint32_t(q), 1, true});
             else ++pages.back().quad_count;
             maps[q] = {x | (y << 16), cache_first[0] | (cache_first[1] << 16)};
+            epoch_cached = true;
             cursor_x = x + cell[0];
             cursor_y = y;
             row_height = std::max(height, cell[1]);
         }
+        close_epoch(first + count);
     }
     return pages;
 }

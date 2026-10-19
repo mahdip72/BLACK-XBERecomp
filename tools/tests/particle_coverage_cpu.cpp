@@ -284,6 +284,72 @@ void TestVisibilityPages() {
     for (const auto& page : fallback) Check(!page.cached, "stale cached page survived replanning");
 }
 
+void TestVisibilityEpochs() {
+    VisibilityFixture f(12);
+    f.extent = 184; // Four 92x92 halo cells; the fifth forces an actual atlas overflow.
+    f.color_pages = {{0, 8}, {8, 2}, {10, 2}};
+    for (uint32_t q : {5u, 6u, 9u, 10u}) f.quads[q].atlas_scale = 0;
+    const auto old_chunks = f.Plan();
+    const auto old_maps = f.maps;
+    std::vector<gpu::ParticleDofVisibilityEpoch> epochs;
+    const auto chunks = gpu::BuildParticleDofVisibilityPages(
+        f.color_pages, f.quads, f.globals, f.extent, f.halo, f.maps, &epochs);
+    CheckVisibilityPartition(f, chunks);
+    Check(chunks.size() == old_chunks.size(), "epoch planner changed native composite chunk count");
+    for (size_t i = 0; i < chunks.size(); ++i)
+        Check(chunks[i].first_quad == old_chunks[i].first_quad &&
+              chunks[i].quad_count == old_chunks[i].quad_count &&
+              chunks[i].cached == old_chunks[i].cached,
+              "epoch planner changed native composite order or fallback choice");
+    const std::array<gpu::ParticleDofVisibilityEpoch, 4> expected{{
+        {0, 4, 0, 1, true}, {4, 4, 1, 3, true},
+        {8, 2, 4, 2, true}, {10, 2, 6, 2, true}
+    }};
+    Check(epochs.size() == expected.size(), "producer epoch count missed overflow or color-page end");
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const auto& e = epochs[i];
+        const auto& want = expected[i];
+        Check(e.first_quad == want.first_quad && e.quad_count == want.quad_count &&
+              e.first_chunk == want.first_chunk && e.chunk_count == want.chunk_count &&
+              e.cached == want.cached, "producer epoch extent or chunk range mismatch");
+        Check(chunks[e.first_chunk].first_quad == e.first_quad &&
+              chunks[e.first_chunk + e.chunk_count - 1].first_quad +
+                  chunks[e.first_chunk + e.chunk_count - 1].quad_count ==
+                  e.first_quad + e.quad_count,
+              "producer epoch does not cover its ordered composite chunks");
+        for (uint32_t q = e.first_quad; q < e.first_quad + e.quad_count; ++q) {
+            if (f.maps[q].atlas_xy == kInvalid) continue;
+            const uint32_t x = f.maps[q].atlas_xy & 0xffffu;
+            const uint32_t y = f.maps[q].atlas_xy >> 16;
+            Check(x + 92 <= f.extent && y + 92 <= f.extent,
+                  "epoch halo cell exceeds visibility atlas");
+            for (uint32_t other = e.first_quad; other < q; ++other) {
+                if (f.maps[other].atlas_xy == kInvalid) continue;
+                const uint32_t ox = f.maps[other].atlas_xy & 0xffffu;
+                const uint32_t oy = f.maps[other].atlas_xy >> 16;
+                Check(x + 92 <= ox || ox + 92 <= x || y + 92 <= oy || oy + 92 <= y,
+                      "epoch reused a live visibility cell across a fallback span");
+            }
+        }
+    }
+    Check(old_maps[7].atlas_xy == 0 && f.maps[7].atlas_xy == 92,
+          "epoch did not retain shelf packing across two fallback quads");
+    Check(f.maps[4].atlas_xy == 0 && f.maps[8].atlas_xy == 0,
+          "true overflow or original color-page boundary failed to reset packing");
+    for (uint32_t q : {5u, 6u, 9u, 10u})
+        Check(f.maps[q].atlas_xy == kInvalid && f.maps[q].screen_xy == 0,
+              "fallback quad acquired a stale producer cell");
+
+    for (auto& quad : f.quads) quad.atlas_scale = 0;
+    const auto fallback = gpu::BuildParticleDofVisibilityPages(
+        f.color_pages, f.quads, f.globals, f.extent, f.halo, f.maps, &epochs);
+    Check(fallback.size() == f.color_pages.size() && epochs.size() == f.color_pages.size(),
+          "all-fallback epochs crossed an original color-page boundary");
+    for (const auto& epoch : epochs)
+        Check(!epoch.cached && epoch.chunk_count == 1,
+              "all-fallback page attempted a visibility producer");
+}
+
 template<class Change> void RejectVisibility(Change change, const char* message) {
     VisibilityFixture f;
     change(f);
@@ -346,7 +412,8 @@ void TestVisibilityMalformedPages() {
 int main() {
     try {
         TestTwoSamples(); TestAdmission(); TestRejections();
-        TestVisibilityCells(); TestVisibilityPages(); TestVisibilityRejections(); TestVisibilityMalformedPages();
+        TestVisibilityCells(); TestVisibilityPages(); TestVisibilityEpochs();
+        TestVisibilityRejections(); TestVisibilityMalformedPages();
         std::puts("particle coverage CPU PASS: mixed2 equality/invalid; shared admission; visibility order, halos, packing, fallback");
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "particle coverage CPU FAIL: %s\n", error.what()); return 1; }
