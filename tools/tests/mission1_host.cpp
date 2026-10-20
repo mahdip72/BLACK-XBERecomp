@@ -47,6 +47,7 @@ enum class RunStage : uint8_t { WaitingForScene, Warmup, Epoch, Drain, Stopped }
 
 struct Row {
     Frame frame{};
+    int64_t host_utc_ms = 0;
     bool scene_ready = false;
     uint32_t scene_frame = 0;
     uint64_t camera_signature = 0;
@@ -73,6 +74,7 @@ Clock::time_point g_scene_started{};
 RunStage g_stage = RunStage::WaitingForScene;
 uint64_t g_stage_frames = 0;
 uint32_t g_epoch = 0;
+uint64_t g_proof_success_present = 0;
 bool g_have_previous_counters = false;
 Frame g_previous{};
 
@@ -110,7 +112,7 @@ void FlushCsv() {
            "reuse,preview,world,batches_total,batches_delta,atlas_pages_total,atlas_pages_delta,"
            "atlas_quads_total,atlas_quads_delta,cached_pages_total,cached_pages_delta,"
            "cached_quads_total,cached_quads_delta,direct_quads_total,direct_quads_delta,"
-           "width,height,samples,present_hresult,present_ms,frame_ms,window_visible,foreground_owned,proof_capture\n";
+           "width,height,samples,present_hresult,present_ms,frame_ms,window_visible,foreground_owned,proof_capture,host_utc_ms\n";
     out << std::setprecision(9);
     for (const Row& row : rows) {
         const Frame& f = row.frame;
@@ -125,7 +127,7 @@ void FlushCsv() {
             << f.direct_quads << ',' << row.direct_quad_delta << ','
             << f.width << ',' << f.height << ',' << f.samples << ',' << f.present_result << ','
             << f.present_ms << ',' << f.frame_ms << ',' << row.window_visible << ','
-            << row.foreground_owned << ',' << int(f.proof_capture) << '\n';
+            << row.foreground_owned << ',' << int(f.proof_capture) << ',' << row.host_utc_ms << '\n';
     }
     out.flush();
     if (!out) LOGE("Mission 1 benchmark: CSV write failed");
@@ -258,6 +260,28 @@ void Stop(const char* reason) {
     RequestClose();
 }
 
+bool ProofCaptureRequested() {
+    if (!Enabled() || g_stop_requested.load(std::memory_order_acquire)) return false;
+    std::lock_guard lock(g_rows_mutex);
+    return g_stage == RunStage::Warmup && !g_proof_success_present &&
+        g_stage_frames >= kWarmupFrames &&
+        Clock::now() - g_scene_started >= std::chrono::seconds(25);
+}
+
+void ProofCaptureCompleted(uint64_t present_id, bool succeeded) {
+    if (!Enabled() || g_stop_requested.load(std::memory_order_acquire)) return;
+    bool admitted = false;
+    {
+        std::lock_guard lock(g_rows_mutex);
+        admitted = g_stage == RunStage::Warmup && !g_proof_success_present && present_id != 0;
+        if (admitted && succeeded) g_proof_success_present = present_id;
+    }
+    if (!admitted) Stop("opening-view proof capture outside excluded warmup");
+    else if (!succeeded) Stop("opening-view proof capture failed");
+    else LOGR("Mission 1 benchmark: opening-view proof saved during excluded warmup at present %llu",
+              (unsigned long long)present_id);
+}
+
 void Present(const Frame& frame) {
     if (!Enabled() || g_stop_requested.load(std::memory_order_acquire)) return;
     const bool ready = SceneReady();
@@ -270,6 +294,9 @@ void Present(const Frame& frame) {
     bool should_stop_complete = false;
     Row row;
     row.frame = frame;
+    // Host Present snapshot for approximate telemetry alignment, not a GPU execution timestamp.
+    row.host_utc_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     row.scene_ready = ready;
     row.scene_frame = scene_frame;
     row.camera_signature = camera;
@@ -296,7 +323,8 @@ void Present(const Frame& frame) {
                 // The mission begins rendering behind its scripted title/fade.
                 // Do not mistake that opening presentation for settled gameplay.
                 if (row.phase_frame >= kWarmupFrames && frame.world &&
-                    Clock::now() - g_scene_started >= std::chrono::seconds(25)) {
+                    Clock::now() - g_scene_started >= std::chrono::seconds(25) &&
+                    g_proof_success_present != 0 && frame.id > g_proof_success_present + 3) {
                     g_stage = RunStage::Epoch;
                     g_epoch = 0;
                     g_stage_frames = 0;

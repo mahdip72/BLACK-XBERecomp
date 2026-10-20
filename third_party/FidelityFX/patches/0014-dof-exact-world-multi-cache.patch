@@ -1,0 +1,662 @@
+diff --git a/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt b/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt
+index 9b272d7..2dcc31f 100644
+--- a/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt
++++ b/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt
+@@ -49,7 +49,8 @@ file(GLOB DOF_REUSE_SHADERS
+     "shaders/dof/ffx_dof_compare_history_pass.${DOF_SHADER_EXT}"
+     "shaders/dof/ffx_dof_reduce_dirty_pass.${DOF_SHADER_EXT}"
+     "shaders/dof/ffx_dof_blur_reuse_pass.${DOF_SHADER_EXT}"
+-    "shaders/dof/ffx_dof_world_compare_pass.${DOF_SHADER_EXT}")
++    "shaders/dof/ffx_dof_world_compare_pass.${DOF_SHADER_EXT}"
++    "shaders/dof/ffx_dof_world_multi_pass.${DOF_SHADER_EXT}")
+ list(APPEND DOF_SHADERS ${DOF_REUSE_SHADERS})
+ 
+ compile_shaders_with_depfile(
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h
+index dd6a329..adc4204 100644
+--- a/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h
+@@ -66,7 +66,21 @@
+ #define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_DEPTH                          35
+ #define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_PREVIOUS_UNSAFE                        36
+ #define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DIRTY                                  37
+-#define FFX_DOF_RESOURCE_IDENTIFIER_COUNT                                         38
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR1                                    38
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR2                                    39
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH1                                    40
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH2                                    41
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT0                                   42
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT1                                   43
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT2                                   44
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT0                                      45
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT1                                      46
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT2                                      47
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE0                                    48
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE1                                    49
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE2                                    50
++#define FFX_DOF_RESOURCE_IDENTIFIER_WORLD_CONTROL                                   51
++#define FFX_DOF_RESOURCE_IDENTIFIER_COUNT                                         52
+ #define FFX_DOF_REUSE_MAX_HIERARCHY_MIPS                                          15
+ 
+ #define FFX_DOF_CONSTANTBUFFER_IDENTIFIER_DOF                                     0
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_world_multi.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_world_multi.h
+new file mode 100644
+index 0000000..6893542
+--- /dev/null
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_world_multi.h
+@@ -0,0 +1,144 @@
++// GPU-owned three-entry exact world cache. No history writes during comparison.
++#ifndef FFX_DOF_WORLD_MULTI_H
++#define FFX_DOF_WORLD_MULTI_H
++#include "ffx_core.h"
++
++Texture2D<FfxFloat32x4> r_world_color0 : register(t2);
++Texture2D<FfxFloat32x4> r_world_color1 : register(t3);
++Texture2D<FfxFloat32x4> r_world_color2 : register(t4);
++Texture2D<FfxUInt32> r_world_depth0 : register(t5);
++Texture2D<FfxUInt32> r_world_depth1 : register(t6);
++Texture2D<FfxUInt32> r_world_depth2 : register(t7);
++RWStructuredBuffer<FfxUInt32> rw_world_dirty : register(u0);
++RWStructuredBuffer<FfxUInt32> rw_world_hit0 : register(u1);
++RWStructuredBuffer<FfxUInt32> rw_world_hit1 : register(u2);
++RWStructuredBuffer<FfxUInt32> rw_world_hit2 : register(u3);
++RWStructuredBuffer<FfxUInt32> rw_world_store0 : register(u4);
++RWStructuredBuffer<FfxUInt32> rw_world_store1 : register(u5);
++RWStructuredBuffer<FfxUInt32> rw_world_store2 : register(u6);
++RWStructuredBuffer<FfxUInt32> rw_world_control : register(u7);
++
++// control: valid[0..2], next FIFO[3], dirty[4..6], unsafe[7], hit[8], victim[9].
++// All seven predicates occupy distinct eight-byte resources. They are written
++// only by initialize/select, then remain immutable until every copy/dispatch ends.
++groupshared FfxUInt32 worldChanged[3];
++groupshared FfxUInt32 worldUnsafe;
++
++FfxBoolean FfxDofWorldMultiColorUnsafe(FfxFloat32 value)
++{
++    FfxUInt32 bits = asuint(value);
++    FfxUInt32 magnitude = bits & 0x7fffffffu;
++    return bits == 0x80000000u || magnitude >= 0x7f800000u ||
++        (magnitude != 0u && magnitude < 0x38800000u);
++}
++
++FfxBoolean FfxDofWorldMultiDepthUnsafe(FfxUInt32 bits)
++{
++    FfxUInt32 magnitude = bits & 0x7fffffffu;
++    return bits == 0x80000000u || magnitude >= 0x7f800000u ||
++        (magnitude != 0u && magnitude < 0x00800000u);
++}
++
++FfxFloat32x4 FfxDofWorldMultiLoadColor(FfxUInt32 slot, FfxUInt32x2 pixel)
++{
++    if (slot == 0u) return r_world_color0.Load(int3(pixel, 0));
++    if (slot == 1u) return r_world_color1.Load(int3(pixel, 0));
++    return r_world_color2.Load(int3(pixel, 0));
++}
++
++FfxUInt32 FfxDofWorldMultiLoadDepth(FfxUInt32 slot, FfxUInt32x2 pixel)
++{
++    if (slot == 0u) return r_world_depth0.Load(int3(pixel, 0));
++    if (slot == 1u) return r_world_depth1.Load(int3(pixel, 0));
++    return r_world_depth2.Load(int3(pixel, 0));
++}
++
++void FfxDofWorldMultiInitialize()
++{
++    if ((reuse.x & 1u) == 0u) {
++        rw_world_control[0] = rw_world_control[1] = rw_world_control[2] = 0u;
++        rw_world_control[3] = 0u;
++    }
++    [unroll] for (FfxUInt32 slot = 0u; slot < 3u; ++slot)
++        rw_world_control[4u + slot] = rw_world_control[slot] != 0u ? 0u : 1u;
++    rw_world_control[7] = 0u;
++    rw_world_control[8] = rw_world_control[9] = 3u;
++    [unroll] for (FfxUInt32 word = 0u; word < 2u; ++word) {
++        rw_world_dirty[word] = 0u;
++        rw_world_hit0[word] = rw_world_hit1[word] = rw_world_hit2[word] = 0u;
++        rw_world_store0[word] = rw_world_store1[word] = rw_world_store2[word] = 0u;
++    }
++}
++
++void FfxDofWorldMultiCompare(FfxUInt32x2 pixel, FfxUInt32 index)
++{
++    if (index == 0u) {
++        worldChanged[0] = worldChanged[1] = worldChanged[2] = 0u;
++        worldUnsafe = 0u;
++    }
++    GroupMemoryBarrierWithGroupSync();
++    FfxUInt32 width, height;
++    r_input_color.GetDimensions(width, height);
++    if (all(pixel < uint2(width, height))) {
++        FfxFloat32x4 color = r_input_color.Load(int3(pixel, 0));
++        FfxUInt32 depth = asuint(r_input_depth.Load(int3(pixel, 0)));
++        FfxUInt32 unsafe = FfxDofWorldMultiColorUnsafe(color.x) || FfxDofWorldMultiColorUnsafe(color.y) ||
++            FfxDofWorldMultiColorUnsafe(color.z) || FfxDofWorldMultiColorUnsafe(color.w) ||
++            FfxDofWorldMultiDepthUnsafe(depth);
++        FfxUInt32 ignored;
++        InterlockedOr(worldUnsafe, unsafe, ignored);
++        [unroll] for (FfxUInt32 slot = 0u; slot < 3u; ++slot) {
++            // Only previously committed safe entries may be read.
++            [branch] if (rw_world_control[slot] != 0u) {
++                FfxUInt32 changed = any(asuint(color) != asuint(FfxDofWorldMultiLoadColor(slot, pixel))) ||
++                    depth != FfxDofWorldMultiLoadDepth(slot, pixel);
++                InterlockedOr(worldChanged[slot], changed, ignored);
++            }
++        }
++    }
++    GroupMemoryBarrierWithGroupSync();
++    if (index == 0u) {
++        FfxUInt32 ignored;
++        [unroll] for (FfxUInt32 slot = 0u; slot < 3u; ++slot)
++            if (worldChanged[slot] != 0u) InterlockedOr(rw_world_control[4u + slot], 1u, ignored);
++        if (worldUnsafe != 0u) InterlockedOr(rw_world_control[7], 1u, ignored);
++    }
++}
++
++void FfxDofWorldMultiSelect()
++{
++    FfxUInt32 hit = 3u;
++    if (rw_world_control[7] == 0u) {
++        [unroll] for (FfxUInt32 slot = 0u; slot < 3u; ++slot)
++            if (hit == 3u && rw_world_control[4u + slot] == 0u) hit = slot;
++    }
++    rw_world_control[8] = hit;
++    rw_world_dirty[0] = hit == 3u ? 1u : 0u;
++    if (hit != 3u) {
++        if (hit == 0u) rw_world_hit0[0] = 1u;
++        else if (hit == 1u) rw_world_hit1[0] = 1u;
++        else rw_world_hit2[0] = 1u;
++    } else if (rw_world_control[7] == 0u) {
++        FfxUInt32 victim = 3u;
++        [unroll] for (FfxUInt32 slot = 0u; slot < 3u; ++slot)
++            if (victim == 3u && rw_world_control[slot] == 0u) victim = slot;
++        if (victim == 3u) victim = rw_world_control[3];
++        rw_world_control[9] = victim;
++        if (victim == 0u) rw_world_store0[0] = 1u;
++        else if (victim == 1u) rw_world_store1[0] = 1u;
++        else rw_world_store2[0] = 1u;
++        // Commit publishes this victim after all three copies are recorded.
++        rw_world_control[victim] = 0u;
++    }
++}
++
++void FfxDofWorldMultiCommit()
++{
++    FfxUInt32 victim = rw_world_control[9];
++    if (victim < 3u && rw_world_control[7] == 0u) {
++        rw_world_control[victim] = 1u;
++        rw_world_control[3] = (victim + 1u) % 3u;
++    }
++}
++
++#endif
+diff --git a/sdk/include/FidelityFX/host/ffx_dof.h b/sdk/include/FidelityFX/host/ffx_dof.h
+index ed5277d..a9ac6e9 100644
+--- a/sdk/include/FidelityFX/host/ffx_dof.h
++++ b/sdk/include/FidelityFX/host/ffx_dof.h
+@@ -56,6 +56,7 @@
+ #define FFX_DOF_CONTEXT_COUNT   1
+ #define FFX_DOF_EXACT_REUSE_VERSION 1
+ #define FFX_DOF_WORLD_CACHE_VERSION 1
++#define FFX_DOF_WORLD_MULTI_CACHE_VERSION 1
+ 
+ /// The size of the context specified in 32bit values.
+ ///
+@@ -86,6 +87,7 @@ typedef enum FfxDofPass {
+     FFX_DOF_PASS_REDUCE_DIRTY = 6,    ///< Optional conservative dirty hierarchy reduction
+     FFX_DOF_PASS_BLUR_REUSE = 7,      ///< Instrumented blur, selected only by explicit reuse context flags
+     FFX_DOF_PASS_WORLD_COMPARE = 8, ///< Exact native input comparison for whole-world predication.
++    FFX_DOF_PASS_WORLD_MULTI = 9, ///< Fixed three-entry exact whole-world result cache.
+     FFX_DOF_PASS_COUNT              ///< The number of passes in DOF
+ } FfxDofPass;
+ 
+@@ -103,6 +105,7 @@ typedef enum FfxDofInitializationFlagBits {
+     FFX_DOF_SINGLE_GLOBAL_RESET = (1 << 5), ///< HLSL: one blur invocation resets the global tile radius after dilation has consumed it.
+     FFX_DOF_EXACT_REUSE_DIAGNOSTICS = (1 << 6), ///< Allocate/compare/certify, always compute original blur outputs.
+     FFX_DOF_EXACT_REUSE_SKIP = (1 << 7), ///< Opt-in exact whole-group skip; requires supported pinned FP16 configuration.
++    FFX_DOF_WORLD_CACHE_MULTI_ENTRY = (1 << 9), ///< Requires WORLD_CACHE; fixed three slots, GPU FIFO on safe misses.
+     FFX_DOF_WORLD_CACHE = (1 << 8), ///< Opt-in exact whole-world cache; requires virtual input/native output; excludes exact group reuse.
+ } FfxDofInitializationFlagBits;
+ 
+@@ -136,10 +139,13 @@ typedef struct FfxDofDispatchDescription {
+     // requires an external fence/serialization plus explicit history invalidation before dispatch.
+ } FfxDofDispatchDescription;
+ 
++/// WORLD_CACHE_MULTI_ENTRY invalidates every slot on effective constants, continuity,
++/// output identity/generation/preservation or ordered queue identity changes. Unsafe
++/// input frames compute normally without admission or eviction. No CPU readback is used.
+ /// WORLD_CACHE dispatches require native predication disabled on entry, so clear/history comparison execute unconditionally.
+ /// Must not throw, submit, wait, reenter the SDK, or alter descriptor/root bindings.
+ /// enable=true: transition predicate from UAV to native predication state and suppress
+-/// dispatches when the 64-bit value at byte offset zero is zero. enable=false: clear
++/// dispatches and copies when the 64-bit value at byte offset zero is zero. enable=false: clear
+ /// native predication and restore UAV state, including when begin/end returns an error.
+ /// End is attempted after every begin attempt. Resource is borrowed; caller owns no lifetime.
+ typedef FfxErrorCode (*FfxDofWorldCachePredicateCallback)(FfxCommandList commandList, FfxResource predicate, bool enable, void* userData);
+@@ -223,7 +229,7 @@ typedef struct FfxDofWorldCacheDiagnostics {
+     FfxResource predicate;
+     FfxResource historyColor;
+     FfxResource historyDepth;
+-    FfxResource previousUnsafe;
++    FfxResource previousUnsafe; ///< Empty for MULTI_ENTRY; unsafe input frames are never admitted.
+     bool historyValid;
+     uint64_t outputContentGeneration;
+     uint64_t orderedQueueIdentity;
+diff --git a/sdk/src/backends/dx12/shaders/dof/ffx_dof_world_multi_pass.hlsl b/sdk/src/backends/dx12/shaders/dof/ffx_dof_world_multi_pass.hlsl
+new file mode 100644
+index 0000000..3cdb13b
+--- /dev/null
++++ b/sdk/src/backends/dx12/shaders/dof/ffx_dof_world_multi_pass.hlsl
+@@ -0,0 +1,18 @@
++// Fixed three-entry whole-world cache. The five original DOF shaders are unchanged.
++#define FFX_DOF_BIND_CB_DOF 0
++#define FFX_DOF_BIND_SRV_INPUT_COLOR 0
++#define FFX_DOF_BIND_SRV_INPUT_DEPTH 1
++#include "dof/ffx_dof_callbacks_hlsl.h"
++#include "dof/ffx_dof_world_multi.h"
++
++[numthreads(8, 8, 1)]
++void CS(uint3 dtID : SV_DispatchThreadID, uint gix : SV_GroupIndex)
++{
++    if (reuse.y == 1u) {
++        FfxDofWorldMultiCompare(dtID.xy, gix);
++    } else if (all(dtID == 0u)) {
++        if (reuse.y == 0u) FfxDofWorldMultiInitialize();
++        else if (reuse.y == 2u) FfxDofWorldMultiSelect();
++        else if (reuse.y == 3u) FfxDofWorldMultiCommit();
++    }
++}
+diff --git a/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp b/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp
+index b9981f1..a1bac6d 100644
+--- a/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp
++++ b/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp
+@@ -33,6 +33,7 @@
+ #include <ffx_dof_reduce_dirty_pass_permutations.h>
+ #include <ffx_dof_blur_reuse_pass_permutations.h>
+ #include <ffx_dof_world_compare_pass_permutations.h>
++#include <ffx_dof_world_multi_pass_permutations.h>
+ 
+ 
+ #include <ffx_dof_downsample_depth_pass_wave64_permutations.h>
+@@ -44,6 +45,7 @@
+ #include <ffx_dof_reduce_dirty_pass_wave64_permutations.h>
+ #include <ffx_dof_blur_reuse_pass_wave64_permutations.h>
+ #include <ffx_dof_world_compare_pass_wave64_permutations.h>
++#include <ffx_dof_world_multi_pass_wave64_permutations.h>
+ 
+ 
+ #include <ffx_dof_downsample_depth_pass_16bit_permutations.h>
+@@ -55,6 +57,7 @@
+ #include <ffx_dof_reduce_dirty_pass_16bit_permutations.h>
+ #include <ffx_dof_blur_reuse_pass_16bit_permutations.h>
+ #include <ffx_dof_world_compare_pass_16bit_permutations.h>
++#include <ffx_dof_world_multi_pass_16bit_permutations.h>
+ 
+ 
+ #include <ffx_dof_downsample_depth_pass_wave64_16bit_permutations.h>
+@@ -66,6 +69,7 @@
+ #include <ffx_dof_reduce_dirty_pass_wave64_16bit_permutations.h>
+ #include <ffx_dof_blur_reuse_pass_wave64_16bit_permutations.h>
+ #include <ffx_dof_world_compare_pass_wave64_16bit_permutations.h>
++#include <ffx_dof_world_multi_pass_wave64_16bit_permutations.h>
+ 
+ 
+ #include <cstring>  // for memset
+@@ -344,6 +348,39 @@ static FfxShaderBlob dofGetWorldComparePassPermutationBlobByIndex(uint32_t permu
+     }
+ }
+ 
++static FfxShaderBlob dofGetWorldMultiPassPermutationBlobByIndex(uint32_t permutationOptions, bool isWave64, bool is16bit)
++{
++    ffx_dof_world_multi_pass_PermutationKey key;
++    POPULATE_PERMUTATION_KEY(permutationOptions, key);
++
++    if (isWave64)
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_world_multi_pass_wave64_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_world_multi_pass_wave64_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_world_multi_pass_wave64_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_world_multi_pass_wave64_PermutationInfo, tableIndex);
++        }
++    }
++    else
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_world_multi_pass_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_world_multi_pass_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_world_multi_pass_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_world_multi_pass_PermutationInfo, tableIndex);
++        }
++    }
++}
++
+ static FfxShaderBlob dofGetCompositePassPermutationBlobByIndex(uint32_t permutationOptions, bool isWave64, bool is16bit)
+ {
+     ffx_dof_composite_pass_PermutationKey key;
+@@ -386,7 +423,8 @@ static const FpPassHandler g_pass_getter_map[FFX_DOF_PASS_COUNT] = {dofGetDsDept
+                                                                     dofGetCompareHistoryPassPermutationBlobByIndex,
+                                                                     dofGetReduceDirtyPassPermutationBlobByIndex,
+                                                                     dofGetBlurReusePassPermutationBlobByIndex,
+-                                                                    dofGetWorldComparePassPermutationBlobByIndex};
++                                                                    dofGetWorldComparePassPermutationBlobByIndex,
++                                                                    dofGetWorldMultiPassPermutationBlobByIndex};
+ 
+ FfxErrorCode dofGetPermutationBlobByIndex(FfxDofPass passId, uint32_t permutationOptions, FfxShaderBlob* outBlob)
+ {
+diff --git a/sdk/src/components/dof/ffx_dof.cpp b/sdk/src/components/dof/ffx_dof.cpp
+index 405d5d7..3aaea51 100644
+--- a/sdk/src/components/dof/ffx_dof.cpp
++++ b/sdk/src/components/dof/ffx_dof.cpp
+@@ -46,6 +46,12 @@ static const ResourceBinding srvTextureBindingTable[] =
+     {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_BILAT_COLOR,         L"r_internal_bilat_color"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_DILATED_RADIUS,      L"r_internal_dilated_radius"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY,              L"r_dirty_hierarchy"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_COLOR, L"r_world_color0"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR1, L"r_world_color1"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR2, L"r_world_color2"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_DEPTH, L"r_world_depth0"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH1, L"r_world_depth1"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH2, L"r_world_depth2"},
+ };
+ 
+ static const ResourceBinding uavTextureBindingTable[] =
+@@ -65,6 +71,13 @@ static const ResourceBinding uavTextureBindingTable[] =
+     {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_DEPTH,          L"rw_world_history_depth"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_PREVIOUS_UNSAFE,        L"rw_world_previous_unsafe"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DIRTY,                  L"rw_world_dirty"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT0, L"rw_world_hit0"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT1, L"rw_world_hit1"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT2, L"rw_world_hit2"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE0, L"rw_world_store0"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE1, L"rw_world_store1"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE2, L"rw_world_store2"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_CONTROL, L"rw_world_control"},
+ };
+ 
+ static const ResourceBinding cbResourceBindingTable[] =
+@@ -216,7 +229,7 @@ static FfxErrorCode createPipelineStates(FfxDofContext_Private* context)
+     if (context->worldCacheEnabled) {
+         wcscpy_s(pipelineDescription.name, L"DOF-WORLD-COMPARE");
+         FFX_VALIDATE(context->contextDescription.backendInterface.fpCreatePipeline(&context->contextDescription.backendInterface,
+-            FFX_EFFECT_DOF, FFX_DOF_PASS_WORLD_COMPARE,
++            FFX_EFFECT_DOF, context->worldMultiCacheEnabled ? FFX_DOF_PASS_WORLD_MULTI : FFX_DOF_PASS_WORLD_COMPARE,
+             getPipelinePermutationFlags(contextFlags, FFX_DOF_PASS_WORLD_COMPARE, supportedFP16, false),
+             &pipelineDescription, context->effectContextId, &context->pipelineWorldCompare));
+         FFX_VALIDATE(patchResourceBindings(&context->pipelineWorldCompare));
+@@ -303,6 +316,39 @@ static FfxErrorCode scheduleDispatch(FfxDofContext_Private* context, const FfxDo
+     return context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &dispatchJob);
+ }
+ 
++// Fixed slots keep descriptor and memory costs bounded. Slot 0 is also the
++// legacy diagnostics history; validity is exclusively GPU-owned in multi mode.
++static const uint32_t worldColorIds[3] = {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_COLOR,
++    FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR1, FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR2};
++static const uint32_t worldDepthIds[3] = {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_DEPTH,
++    FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH1, FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH2};
++static const uint32_t worldResultIds[3] = {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT0,
++    FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT1, FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT2};
++static const uint32_t worldHitIds[3] = {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT0,
++    FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT1, FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT2};
++static const uint32_t worldStoreIds[3] = {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE0,
++    FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE1, FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE2};
++
++static FfxErrorCode scheduleWorldCopy(FfxDofContext_Private* context, uint32_t source, uint32_t destination)
++{
++    // DX12's full texture CopyTextureRegion preserves the source bits, including
++    // compatible R32_FLOAT -> R32_UINT depth and identical RGBA32F result formats.
++    FfxGpuJobDescription job = {FFX_GPU_JOB_COPY, L"DOF-WORLD-COPY"};
++    job.copyJobDescriptor.src = context->srvResources[source];
++    job.copyJobDescriptor.dst = context->srvResources[destination];
++    return context->contextDescription.backendInterface.fpScheduleGpuJob(
++        &context->contextDescription.backendInterface, &job);
++}
++
++static FfxErrorCode scheduleWorldMultiStage(FfxDofContext_Private* context, const FfxDofDispatchDescription* params,
++    DofConstants constants, uint32_t stage, uint32_t dispatchX, uint32_t dispatchY)
++{
++    constants.reuse[1] = stage; // 0=initialize, 1=compare, 2=select, 3=commit
++    FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
++        &context->contextDescription.backendInterface, &constants, sizeof(constants), &context->constantBuffer));
++    return scheduleDispatch(context, params, &context->pipelineWorldCompare, dispatchX, dispatchY);
++}
++
+ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDispatchDescription* params)
+ {
+     // take a short cut to the command list
+@@ -337,6 +383,19 @@ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDisp
+     DofConstants pendingHistoryConstants{};
+     bool predicateAttempted = false;
+     FfxResource predicateResource = {};
++    auto beginPredicate = [&](uint32_t id) -> FfxErrorCode {
++        predicateResource = context->contextDescription.backendInterface.fpGetResource(
++            &context->contextDescription.backendInterface, context->srvResources[id]);
++        FFX_RETURN_ON_ERROR(predicateResource.resource, FFX_ERROR_INVALID_POINTER);
++        predicateAttempted = true;
++        return context->worldPredicateCallback(commandList, predicateResource, true, context->worldPredicateUserData);
++    };
++    auto endPredicate = [&]() -> FfxErrorCode {
++        const FfxErrorCode result = context->worldPredicateCallback(
++            commandList, predicateResource, false, context->worldPredicateUserData);
++        if (result == FFX_OK) predicateAttempted = false;
++        return result;
++    };
+     // Always restore dynamically registered external resource states, including on callback failures.
+     const FfxErrorCode workResult = [&]() -> FfxErrorCode {
+         // Register resources for frame
+@@ -344,9 +403,17 @@ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDisp
+         FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->depth, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH]));
+         FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->output, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR]));
+ 
+-        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->color, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR]));
+-        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->depth, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH]));
+-        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->output, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR]));
++        if (context->worldMultiCacheEnabled) {
++            // Each native external texture must have one state tracker across
++            // shader and copy jobs. Registering it twice creates stale trackers.
++            for (uint32_t id : {FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR,
++                FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH, FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR})
++                context->uavResources[id] = context->srvResources[id];
++        } else {
++            FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->color, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR]));
++            FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->depth, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH]));
++            FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->output, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR]));
++        }
+ 
+ 
+         // dispatch sizes
+@@ -394,29 +461,42 @@ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDisp
+                 memcmp(&context->worldPreviousConstants, &cbuffer, sizeof(DofConstants)) == 0;
+             DofConstants compareConstants = cbuffer;
+             compareConstants.reuse[0] = worldValid ? 1u : 0u;
+-            // Structured buffers cannot use ClearUnorderedAccessViewUint. The
+-            // same PSO clears both predicate DWORDs in one unconditional group.
+-            DofConstants clearConstants = compareConstants;
+-            clearConstants.reuse[1] = 1u;
+-            FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+-                &context->contextDescription.backendInterface, &clearConstants, sizeof(DofConstants), &context->constantBuffer));
+-            FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineWorldCompare, 1, 1));
+-            // Each job retains its own staged allocation until backend execution.
+-            compareConstants.reuse[1] = 0u;
+-            FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+-                &context->contextDescription.backendInterface, &compareConstants, sizeof(DofConstants), &context->constantBuffer));
+-            FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineWorldCompare, tilesX, tilesY));
++            if (context->worldMultiCacheEnabled) {
++                // No history writes occur before all entry comparisons finish.
++                FFX_VALIDATE(scheduleWorldMultiStage(context, params, compareConstants, 0, 1, 1));
++                FFX_VALIDATE(scheduleWorldMultiStage(context, params, compareConstants, 1, tilesX, tilesY));
++                FFX_VALIDATE(scheduleWorldMultiStage(context, params, compareConstants, 2, 1, 1));
++            } else {
++                // Structured buffers cannot use ClearUnorderedAccessViewUint. The
++                // same PSO clears both predicate DWORDs in one unconditional group.
++                DofConstants clearConstants = compareConstants;
++                clearConstants.reuse[1] = 1u;
++                FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
++                    &context->contextDescription.backendInterface, &clearConstants, sizeof(DofConstants), &context->constantBuffer));
++                FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineWorldCompare, 1, 1));
++                // Each job retains its own staged allocation until backend execution.
++                compareConstants.reuse[1] = 0u;
++                FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
++                    &context->contextDescription.backendInterface, &compareConstants, sizeof(DofConstants), &context->constantBuffer));
++                FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineWorldCompare, tilesX, tilesY));
++            }
+             FFX_VALIDATE(context->contextDescription.backendInterface.fpExecuteGpuJobs(
+                 &context->contextDescription.backendInterface, commandList, context->effectContextId));
+         }
++        if (context->worldMultiCacheEnabled) {
++            for (uint32_t slot = 0; slot < 3; ++slot) {
++                FFX_VALIDATE(beginPredicate(worldHitIds[slot]));
++                FFX_VALIDATE(scheduleWorldCopy(context, worldResultIds[slot], FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR));
++                // Execute drains the timing wrapper too, before any predicate switch.
++                FFX_VALIDATE(context->contextDescription.backendInterface.fpExecuteGpuJobs(
++                    &context->contextDescription.backendInterface, commandList, context->effectContextId));
++                FFX_VALIDATE(endPredicate());
++            }
++        }
+         // Clear and comparison execute unconditionally. Every original job, including the first depth pass,
+         // is scheduled/executed while the caller's native predicate is active.
+         if (context->worldCacheEnabled) {
+-            predicateResource = context->contextDescription.backendInterface.fpGetResource(
+-                &context->contextDescription.backendInterface, context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DIRTY]);
+-            FFX_RETURN_ON_ERROR(predicateResource.resource, FFX_ERROR_INVALID_POINTER);
+-            predicateAttempted = true;
+-            FFX_VALIDATE(context->worldPredicateCallback(commandList, predicateResource, true, context->worldPredicateUserData));
++            FFX_VALIDATE(beginPredicate(FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DIRTY));
+         }
+         FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+             &context->contextDescription.backendInterface, &cbuffer, sizeof(DofConstants), &context->constantBuffer));
+@@ -444,6 +524,25 @@ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDisp
+         // The backend orders UAV writes and SRV transitions across comparison/reduction/blur jobs.
+         FFX_VALIDATE(context->contextDescription.backendInterface.fpExecuteGpuJobs(
+             &context->contextDescription.backendInterface, commandList, context->effectContextId));
++        if (context->worldMultiCacheEnabled) {
++            FFX_VALIDATE(endPredicate());
++            for (uint32_t slot = 0; slot < 3; ++slot) {
++                FFX_VALIDATE(beginPredicate(worldStoreIds[slot]));
++                FFX_VALIDATE(scheduleWorldCopy(context, FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR, worldColorIds[slot]));
++                FFX_VALIDATE(scheduleWorldCopy(context, FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH, worldDepthIds[slot]));
++                FFX_VALIDATE(scheduleWorldCopy(context, FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR, worldResultIds[slot]));
++                FFX_VALIDATE(context->contextDescription.backendInterface.fpExecuteGpuJobs(
++                    &context->contextDescription.backendInterface, commandList, context->effectContextId));
++                FFX_VALIDATE(endPredicate());
++            }
++            // All native copies are recorded before this unconditional metadata job.
++            // History transitions order comparison data. A later result hit uses
++            // COPY_DEST -> COPY_SRC to order consumption of the cached output;
++            // the validity store does not promise physical GPU copy completion.
++            FFX_VALIDATE(scheduleWorldMultiStage(context, params, cbuffer, 3, 1, 1));
++            FFX_VALIDATE(context->contextDescription.backendInterface.fpExecuteGpuJobs(
++                &context->contextDescription.backendInterface, commandList, context->effectContextId));
++        }
+         if (context->reuseEnabled || context->worldCacheEnabled) {
+             memset(cbuffer.reuse, 0, sizeof(cbuffer.reuse));
+             pendingHistoryConstants = cbuffer;
+@@ -511,6 +610,8 @@ static FfxErrorCode dofCreate(FfxDofContext_Private* context, const FfxDofContex
+     context->reuseEnabled = (contextDescription->flags &
+         (FFX_DOF_EXACT_REUSE_DIAGNOSTICS | FFX_DOF_EXACT_REUSE_SKIP)) != 0;
+     context->worldCacheEnabled = (contextDescription->flags & FFX_DOF_WORLD_CACHE) != 0;
++    context->worldMultiCacheEnabled = (contextDescription->flags & FFX_DOF_WORLD_CACHE_MULTI_ENTRY) != 0;
++    FFX_RETURN_ON_ERROR(!context->worldMultiCacheEnabled || context->worldCacheEnabled, FFX_ERROR_INVALID_ARGUMENT);
+     if (context->worldCacheEnabled) {
+         FFX_RETURN_ON_ERROR(!context->reuseEnabled && is16bit &&
+             (contextDescription->flags & FFX_DOF_VIRTUAL_INPUT_2X) &&
+@@ -659,6 +760,60 @@ static FfxErrorCode dofCreate(FfxDofContext_Private* context, const FfxDofContex
+                 &context->srvResources[d.id]));
+         }
+     }
++    if (context->worldMultiCacheEnabled) {
++        const FfxInternalResourceDescription descriptions[] = {
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR1, L"DOF_WorldCOLOR1", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, halfWidth, halfHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH1, L"DOF_WorldDEPTH1", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, halfWidth, halfHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR2, L"DOF_WorldCOLOR2", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, halfWidth, halfHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DEPTH2, L"DOF_WorldDEPTH2", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, halfWidth, halfHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT0, L"DOF_WorldResult0", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT, halfWidth, halfHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT1, L"DOF_WorldResult1", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT, halfWidth, halfHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_RESULT2, L"DOF_WorldResult2", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT, halfWidth, halfHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT0, L"DOF_WorldHIT0", FFX_RESOURCE_TYPE_BUFFER,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, 8, 4, 0,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT1, L"DOF_WorldHIT1", FFX_RESOURCE_TYPE_BUFFER,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, 8, 4, 0,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HIT2, L"DOF_WorldHIT2", FFX_RESOURCE_TYPE_BUFFER,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, 8, 4, 0,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE0, L"DOF_WorldSTORE0", FFX_RESOURCE_TYPE_BUFFER,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, 8, 4, 0,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE1, L"DOF_WorldSTORE1", FFX_RESOURCE_TYPE_BUFFER,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, 8, 4, 0,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_STORE2, L"DOF_WorldSTORE2", FFX_RESOURCE_TYPE_BUFFER,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, 8, 4, 0,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_WORLD_CONTROL, L"DOF_WorldControl", FFX_RESOURCE_TYPE_BUFFER,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, 40, 4, 0,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}}
++        };
++        for (const auto& d : descriptions) {
++            const FfxResourceDescription description = {d.type, d.format, d.width, d.height,
++                d.type == FFX_RESOURCE_TYPE_BUFFER ? 0u : 1u, d.mipCount, d.flags, d.usage};
++            const FfxCreateResourceDescription create = {FFX_HEAP_TYPE_DEFAULT, description,
++                FFX_RESOURCE_STATE_UNORDERED_ACCESS, d.name, d.id, d.initData};
++            FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateResource(
++                &context->contextDescription.backendInterface, &create, context->effectContextId, &context->srvResources[d.id]));
++        }
++    }
+     // globals buffer
+     {
+         const FfxResourceDescription resourceDescription = { FFX_RESOURCE_TYPE_BUFFER, FFX_SURFACE_FORMAT_UNKNOWN,
+@@ -718,6 +873,9 @@ static FfxErrorCode dofRelease(FfxDofContext_Private* context)
+         ffxSafeReleaseResource(&context->contextDescription.backendInterface, context->srvResources[id], context->effectContextId);
+     }
+ 
++    for (uint32_t id = FFX_DOF_RESOURCE_IDENTIFIER_WORLD_COLOR1; id < FFX_DOF_RESOURCE_IDENTIFIER_COUNT; ++id)
++        ffxSafeReleaseResource(&context->contextDescription.backendInterface, context->srvResources[id], context->effectContextId);
++
+     // Destroy the context
+     context->contextDescription.backendInterface.fpDestroyBackendContext(&context->contextDescription.backendInterface, context->effectContextId);
+ 
+@@ -817,7 +975,8 @@ FfxErrorCode ffxDofContextGetWorldCacheDiagnostics(FfxDofContext* context, FfxDo
+     diagnostics->predicate = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_WORLD_DIRTY]);
+     diagnostics->historyColor = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_COLOR]);
+     diagnostics->historyDepth = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_WORLD_HISTORY_DEPTH]);
+-    diagnostics->previousUnsafe = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_WORLD_PREVIOUS_UNSAFE]);
++    diagnostics->previousUnsafe = impl->worldMultiCacheEnabled ? FfxResource{} :
++        backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_WORLD_PREVIOUS_UNSAFE]);
+     diagnostics->historyValid = impl->worldHistoryValid;
+     diagnostics->outputContentGeneration = impl->worldPreviousOutputGeneration;
+     diagnostics->orderedQueueIdentity = impl->worldPreviousQueueIdentity;
+diff --git a/sdk/src/components/dof/ffx_dof_private.h b/sdk/src/components/dof/ffx_dof_private.h
+index 2b9d771..123eefa 100644
+--- a/sdk/src/components/dof/ffx_dof_private.h
++++ b/sdk/src/components/dof/ffx_dof_private.h
+@@ -87,6 +87,7 @@ typedef struct FfxDofContext_Private {
+     uint32_t reuseHierarchyMipCount;
+     DofConstants reusePreviousConstants;
+     bool worldCacheEnabled;
++    bool worldMultiCacheEnabled;
+     bool worldHistoryValid;
+     bool worldRecordingFailed;
+     DofConstants worldPreviousConstants;

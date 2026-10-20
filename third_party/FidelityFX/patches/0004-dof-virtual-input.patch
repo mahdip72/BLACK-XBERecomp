@@ -1,0 +1,138 @@
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h
+index 4e3dd94..6ca918a 100644
+--- a/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h
+@@ -57,7 +57,9 @@
+         FfxFloat32x2 inputSizeHalfRcp;
+         FfxFloat32   cocLimit;
+         FfxUInt32    maxRings;
+-    #define FFX_DOF_CONSTANT_BUFFER_1_SIZE 10  // Number of 32-bit values. This must be kept in sync with the cbDOF size.
++        FfxUInt32    inputOutputFlags;
++        FfxUInt32    reserved;
++    #define FFX_DOF_CONSTANT_BUFFER_1_SIZE 12  // Number of 32-bit values. This must be kept in sync with the cbDOF size.
+     };
+ #else
+ #define cocScale 0
+@@ -67,6 +69,7 @@
+ #define inputSizeHalfRcp 0
+ #define cocLimit 0
+ #define maxRings 0
++#define inputOutputFlags 0
+ #endif
+ 
+ #define FFX_DOF_ROOTSIG_STRINGIFY(p) FFX_DOF_ROOTSIG_STR(p)
+@@ -128,6 +131,23 @@ FfxUInt32 MaxRings()
+     return maxRings;
+ }
+ 
++// Keep these bits synchronized with FfxDofInitializationFlagBits. The runtime
++// modes share the existing shader permutations and leave virtual sizes intact.
++FfxBoolean FfxDofVirtualInput2x()
++{
++    return (inputOutputFlags & (1u << 3)) != 0;
++}
++
++FfxBoolean FfxDofNativeOutput2x()
++{
++    return (inputOutputFlags & (1u << 4)) != 0;
++}
++
++FfxBoolean FfxDofSingleGlobalReset()
++{
++    return (inputOutputFlags & (1u << 5)) != 0;
++}
++
+ SamplerState LinearSampler : register(s0);
+ SamplerState PointSampler : register(s1);
+ 
+@@ -172,6 +187,10 @@ SamplerState PointSampler : register(s1);
+ #if defined(FFX_DOF_BIND_SRV_INPUT_COLOR)
+ FfxHalfOpt4 FfxDofLoadSource(FfxInt32x2 tex)
+ {
++    // Signed shift preserves out-of-bounds zero loads on both edges. Do not
++    // clamp: only the depth Gather below has sampler-clamped edge semantics.
++    if (FfxDofVirtualInput2x())
++        tex >>= 1;
+     return FfxHalfOpt4(r_input_color[tex]);
+ }
+ #endif // #if defined(FFX_DOF_BIND_SRV_INPUT_COLOR)
+@@ -227,6 +246,12 @@ FfxHalfOpt4 FfxDofSampleInput(FfxFloat32x2 coord, FfxUInt32 mip)
+ #if defined(FFX_DOF_BIND_SRV_INPUT_DEPTH)
+ FfxFloat32x4 FfxDofGatherDepth(FfxFloat32x2 coord)
+ {
++    // The pinned DownsampleDepth is the only caller: coordInt is 8*tile plus
++    // {0,2,4,6} on each axis, normalized by the virtual input size. At these even
++    // boundaries, replicated virtual corners 2*k-1/2*k map to native k-1/k.
++    // The same normalized Gather preserves corner order and sampler clamping,
++    // including the full five-native-texel footprint per tile axis. This is
++    // specific to that caller, not a generic arbitrary-coordinate emulation.
+     return r_input_depth.GatherRed(LinearSampler, coord);
+ }
+ #endif // #if defined(FFX_DOF_BIND_SRV_INPUT_DEPTH)
+@@ -234,6 +259,8 @@ FfxFloat32x4 FfxDofGatherDepth(FfxFloat32x2 coord)
+ #if defined(FFX_DOF_BIND_SRV_INPUT_DEPTH)
+ FfxFloat32 FfxDofLoadFullDepth(FfxUInt32x2 coord)
+ {
++    if (FfxDofVirtualInput2x())
++        coord >>= 1;
+     return r_input_depth[coord];
+ }
+ #endif // #if defined(FFX_DOF_BIND_SRV_INPUT_DEPTH)
+@@ -305,6 +332,8 @@ FfxFloat32x2 FfxDofLoadTileRadius(FfxUInt32x2 tile)
+ FfxFloat32x4 FfxDofLoadFullInput(FfxUInt32x2 coord)
+ {
+ #if defined(FFX_DOF_BIND_SRV_INPUT_COLOR)
++    if (FfxDofVirtualInput2x())
++        coord >>= 1;
+     return r_input_color[coord];
+ #elif (defined(FFX_DOF_BIND_UAV_OUTPUT_COLOR)) && FFX_DOF_OPTION_COMBINE_IN_PLACE
+     return rw_output_color[coord];
+diff --git a/sdk/include/FidelityFX/host/ffx_dof.h b/sdk/include/FidelityFX/host/ffx_dof.h
+index 58ac2f4..1590b37 100644
+--- a/sdk/include/FidelityFX/host/ffx_dof.h
++++ b/sdk/include/FidelityFX/host/ffx_dof.h
+@@ -92,6 +92,9 @@ typedef enum FfxDofInitializationFlagBits {
+     FFX_DOF_REVERSE_DEPTH      = (1 << 0), ///< A bit indicating whether input depth is reversed (1 is closest)
+     FFX_DOF_OUTPUT_PRE_INIT    = (1 << 1), ///< A bit indicating whether the output is pre-initialized with the input color (e.g. it is the same texture)
+     FFX_DOF_DISABLE_RING_MERGE = (1 << 2), ///< A bit indicating whether to disable merging kernel rings
++    FFX_DOF_VIRTUAL_INPUT_2X   = (1 << 3), ///< HLSL: native inputs represent exact 2x2 replication at the even virtual resolution. Incompatible with OUTPUT_PRE_INIT.
++    FFX_DOF_NATIVE_OUTPUT_2X   = (1 << 4), ///< HLSL: combine the four virtual RGBA16F results into one native RGBA32F mean. Requires VIRTUAL_INPUT_2X.
++    FFX_DOF_SINGLE_GLOBAL_RESET = (1 << 5), ///< HLSL: one blur invocation resets the global tile radius after dilation has consumed it.
+ } FfxDofInitializationFlagBits;
+ 
+ /// A structure encapsulating the parameters required to initialize FidelityFX
+@@ -101,7 +103,7 @@ typedef enum FfxDofInitializationFlagBits {
+ typedef struct FfxDofContextDescription {
+     uint32_t                    flags;                              ///< A collection of @ref FfxDofInitializationFlagBits
+     uint32_t                    quality;                            ///< The number of rings to be used in the DoF blur kernel
+-    FfxDimensions2D             resolution;                         ///< Resolution of the input and output textures
++    FfxDimensions2D             resolution;                         ///< Virtual processing resolution; flagged native input/output resources have exactly half this width and height.
+     FfxInterface                backendInterface;                   ///< A set of pointers to the backend implementation for FidelityFX
+     float                       cocLimitFactor;                     ///< The limit to apply to circle of confusion size as a factor for resolution height
+ } FfxDofContextDescription;
+diff --git a/sdk/src/components/dof/ffx_dof_private.h b/sdk/src/components/dof/ffx_dof_private.h
+index 1e008ea..702ad55 100644
+--- a/sdk/src/components/dof/ffx_dof_private.h
++++ b/sdk/src/components/dof/ffx_dof_private.h
+@@ -50,6 +50,8 @@ typedef struct DofConstants
+     float       inputSizeHalfRcp[2];
+     float       cocLimit;
+     uint32_t    maxRings;
++    uint32_t    inputOutputFlags;
++    uint32_t    reserved;
+ } DofConstants;
+ 
+ struct FfxDofContextDescription;
+diff --git a/sdk/src/components/dof/ffx_dof.cpp b/sdk/src/components/dof/ffx_dof.cpp
+index 604d3ff..a06cdb4 100644
+--- a/sdk/src/components/dof/ffx_dof.cpp
++++ b/sdk/src/components/dof/ffx_dof.cpp
+@@ -307,6 +307,8 @@ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDisp
+     // calculate actual coc limit. Limit in the shader is half res, so * 0.5 this.
+     cbuffer.cocLimit = 0.5f * context->contextDescription.cocLimitFactor * context->contextDescription.resolution.height;
+     cbuffer.maxRings = context->contextDescription.quality;
++    cbuffer.inputOutputFlags = context->contextDescription.flags &
++        (FFX_DOF_VIRTUAL_INPUT_2X | FFX_DOF_NATIVE_OUTPUT_2X | FFX_DOF_SINGLE_GLOBAL_RESET);
+ 
+     context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(&context->contextDescription.backendInterface, 
+                                                                                &cbuffer, 

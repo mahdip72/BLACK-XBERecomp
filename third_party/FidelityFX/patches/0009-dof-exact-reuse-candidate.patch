@@ -1,0 +1,1069 @@
+diff --git a/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt b/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt
+index 4ab2f1c..b1f4b95 100644
+--- a/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt
++++ b/sdk/include/FidelityFX/gpu/dof/CMakeCompileDOFShaders.txt
+@@ -43,6 +43,14 @@ file(GLOB DOF_SHADERS
+     "shaders/dof/ffx_dof_blur_pass.${DOF_SHADER_EXT}"
+     "shaders/dof/ffx_dof_composite_pass.${DOF_SHADER_EXT}")
+ 
++# Only the DX12 tree contains these experimental passes. GLOB also handles the
++# default wildcard extension without adding nonexistent GLSL shader paths.
++file(GLOB DOF_REUSE_SHADERS
++    "shaders/dof/ffx_dof_compare_history_pass.${DOF_SHADER_EXT}"
++    "shaders/dof/ffx_dof_reduce_dirty_pass.${DOF_SHADER_EXT}"
++    "shaders/dof/ffx_dof_blur_reuse_pass.${DOF_SHADER_EXT}")
++list(APPEND DOF_SHADERS ${DOF_REUSE_SHADERS})
++
+ compile_shaders_with_depfile(
+     "${FFX_SC_EXECUTABLE}"
+     "${DOF_BASE_ARGS}" "${DOF_API_BASE_ARGS}" "${DOF_PERMUTATION_ARGS}" "${DOF_INCLUDE_ARGS}"
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h
+index 10832c3..0460b89 100644
+--- a/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h
+@@ -46,6 +46,9 @@ struct FfxDofSample
+ struct FfxDofInputState
+ {
+ 	FfxUInt32x2 imageSize; // input pixel size (half res)
++#if defined(FFX_DOF_REUSE_BLUR)
++    FfxUInt32x2 reuseGroup;
++#endif
+ 	FfxFloat32x2 pxCoord; // pixel coordinates of the kernel center
+ 	FfxFloat32 tileCoc; // coc value bilinearly interpolated from the tile map
+ 	FfxFloat32 centerCoc; // signed coc value at the kernel center
+@@ -195,6 +198,9 @@ FfxDofSample FfxDofFetchSample(FfxDofInputState ins, inout SampleStreamState str
+ {
+ 	FfxFloat32x2 samplePos = FfxDofAdvanceSampleStream(streamState);
+ 	FfxUInt32 mipLevel = ins.mipLevel + mipBias;
++#if defined(FFX_DOF_REUSE_BLUR)
++    FfxDofReuseCertifySample(ins.reuseGroup, samplePos, mipLevel);
++#endif
+ 	FfxFloat32x4 texval = FfxDofSampleInput(samplePos, mipLevel);
+ 	FfxDofSample result;
+ 	result.coc = texval.a;
+@@ -640,9 +646,17 @@ void FfxDofBlur(FfxUInt32x2 pixel, FfxUInt32x2 halfImageSize)
+ 	FfxDofResetMaxTileRadius();
+ #endif
+ 
++#if defined(FFX_DOF_REUSE_BLUR)
++    // Preserve the mandatory original global reset above on cache hits.
++    FfxDofReuseCertifyFixedInputs(pixel);
++    if (FfxDofReuseCanSkip(pixel >> 3)) return;
++#endif
+ 	FfxDofInputState ins;
+ 	FfxDofTileClass tileClass = FfxDofPrepareTile(pixel, ins);
+ 	ins.imageSize = halfImageSize;
++#if defined(FFX_DOF_REUSE_BLUR)
++    ins.reuseGroup = pixel >> 3;
++#endif
+ 
+ 	// initialize accumulators
+ 	FfxDofAccumulators acc;
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h
+index 7131f6b..e5c45a2 100644
+--- a/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_callbacks_hlsl.h
+@@ -59,7 +59,8 @@
+         FfxUInt32    maxRings;
+         FfxUInt32    inputOutputFlags;
+         FfxUInt32    reserved;
+-    #define FFX_DOF_CONSTANT_BUFFER_1_SIZE 12  // Number of 32-bit values. This must be kept in sync with the cbDOF size.
++        FfxUInt32x4  reuse; // flags, reduction source mip, hierarchy base width, reserved
++    #define FFX_DOF_CONSTANT_BUFFER_1_SIZE 16  // Number of 32-bit values. This must be kept in sync with the cbDOF size.
+     };
+ #else
+ #define cocScale 0
+@@ -159,13 +160,33 @@ SamplerState PointSampler : register(s1);
+     Texture2D<FfxFloat32x4>   r_input_color                 : FFX_DOF_DECLARE_SRV(FFX_DOF_BIND_SRV_INPUT_COLOR);
+ #endif
+ #if defined(FFX_DOF_BIND_SRV_INTERNAL_BILAT_COLOR)
+-    Texture2D<FfxHalfOpt4>   r_internal_bilat_color        : FFX_DOF_DECLARE_SRV(FFX_DOF_BIND_SRV_INTERNAL_BILAT_COLOR);
++#if defined(FFX_DOF_REUSE_COMPARE)
++    Texture2D<FfxFloat32x4>  r_internal_bilat_color        : FFX_DOF_DECLARE_SRV(FFX_DOF_BIND_SRV_INTERNAL_BILAT_COLOR);
++#else
++    Texture2D<FfxHalfOpt4>   r_internal_bilat_color : FFX_DOF_DECLARE_SRV(FFX_DOF_BIND_SRV_INTERNAL_BILAT_COLOR);
++#endif
+ #endif
+ #if defined(FFX_DOF_BIND_SRV_INTERNAL_DILATED_RADIUS)
+     Texture2D<FfxFloat32x2>   r_internal_dilated_radius     : FFX_DOF_DECLARE_SRV(FFX_DOF_BIND_SRV_INTERNAL_DILATED_RADIUS);
+ #endif
+ 
++#if defined(FFX_DOF_BIND_SRV_DIRTY_HIERARCHY)
++    Texture2D<FfxUInt32> r_dirty_hierarchy : FFX_DOF_DECLARE_SRV(FFX_DOF_BIND_SRV_DIRTY_HIERARCHY);
++#endif
++
+ // UAVs
++#if defined(FFX_DOF_BIND_UAV_HISTORY_BILAT_COLOR)
++    RWTexture2D<FfxFloat32x4> rw_history_bilat_color[4] : FFX_DOF_DECLARE_UAV(FFX_DOF_BIND_UAV_HISTORY_BILAT_COLOR);
++#endif
++#if defined(FFX_DOF_BIND_UAV_HISTORY_DILATED_RADIUS)
++    RWTexture2D<FfxFloat32x2> rw_history_dilated_radius : FFX_DOF_DECLARE_UAV(FFX_DOF_BIND_UAV_HISTORY_DILATED_RADIUS);
++#endif
++#if defined(FFX_DOF_BIND_UAV_DIRTY_HIERARCHY)
++    RWTexture2D<FfxUInt32> rw_dirty_hierarchy[FFX_DOF_REUSE_MAX_HIERARCHY_MIPS] : FFX_DOF_DECLARE_UAV(FFX_DOF_BIND_UAV_DIRTY_HIERARCHY);
++#endif
++#if defined(FFX_DOF_BIND_UAV_REUSE_CERTIFICATE)
++    RWTexture2D<FfxUInt32> rw_reuse_certificate : FFX_DOF_DECLARE_UAV(FFX_DOF_BIND_UAV_REUSE_CERTIFICATE);
++#endif
+ #if defined(FFX_DOF_BIND_UAV_INTERNAL_BILAT_COLOR)
+     RWTexture2D<FfxHalfOpt4>  rw_internal_bilat_color[4]    : FFX_DOF_DECLARE_UAV(FFX_DOF_BIND_UAV_INTERNAL_BILAT_COLOR);
+ #endif
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h
+index c4d7521..e6df3eb 100644
+--- a/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_resources.h
+@@ -39,7 +39,31 @@
+ #define FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR                                  11
+ #define FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_GLOBALS                              12
+ 
+-#define FFX_DOF_RESOURCE_IDENTIFIER_COUNT                                         13
++#define FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR                          13
++#define FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR_MIP0                     13
++#define FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR_MIP1                     14
++#define FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR_MIP2                     15
++#define FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR_MIP3                     16
++#define FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_DILATED_RADIUS                       17
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY                              18
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP0 18
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP1 19
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP2 20
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP3 21
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP4 22
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP5 23
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP6 24
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP7 25
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP8 26
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP9 27
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP10 28
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP11 29
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP12 30
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP13 31
++#define FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY_MIP14 32
++#define FFX_DOF_RESOURCE_IDENTIFIER_REUSE_CERTIFICATE                            33
++#define FFX_DOF_RESOURCE_IDENTIFIER_COUNT                                         34
++#define FFX_DOF_REUSE_MAX_HIERARCHY_MIPS                                          15
+ 
+ #define FFX_DOF_CONSTANTBUFFER_IDENTIFIER_DOF                                     0
+ 
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_reuse.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_reuse.h
+new file mode 100644
+index 0000000..f0f295c
+--- /dev/null
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_reuse.h
+@@ -0,0 +1,180 @@
++// Scratch exact-world-reuse experiment. Default blur never includes this header.
++#ifndef FFX_DOF_REUSE_H
++#define FFX_DOF_REUSE_H
++
++FfxBoolean FfxDofReuseHistoryValid() { return (reuse.x & 1u) != 0; }
++FfxBoolean FfxDofReuseSkipEnabled() { return (reuse.x & 2u) != 0; }
++FfxUInt32 FfxDofReuseReduceLevel() { return reuse.y; }
++FfxUInt32 FfxDofReuseHierarchyWidth() { return reuse.z; }
++
++#if defined(FFX_DOF_REUSE_COMPARE)
++groupshared FfxUInt32 ffxDofReuseChanged;
++
++// Typed FP16 history round trips are accepted only for positive zero and normal
++// finite half values. Reject -0, half subnormals, and nonfinite representations.
++// The previous unsafe marker also rejects the first unsafe-to-safe transition.
++FfxBoolean FfxDofReuseUnsafe(FfxFloat32 value)
++{
++    FfxUInt32 bits = asuint(value);
++    FfxUInt32 magnitude = bits & 0x7fffffffu;
++    return bits == 0x80000000u || magnitude >= 0x7f800000u ||
++        (magnitude != 0u && magnitude < 0x38800000u);
++}
++
++void FfxDofCompareHistory(FfxUInt32x2 group, FfxUInt32x2 local)
++{
++    FfxBoolean leader = all(local == 0);
++    // Host requires both native-half dimensions to be multiples of eight.
++    if (any(group >= (InputSizeHalf() >> 3)))
++    {
++        if (leader)
++        {
++            rw_dirty_hierarchy[0][group] = 0;
++            rw_reuse_certificate[group] = 0;
++        }
++        return;
++    }
++    if (leader)
++    {
++        ffxDofReuseChanged = FfxDofReuseHistoryValid() ? 0u : 1u;
++        // Invalid history must not read either old hierarchy flags or certs.
++        if (FfxDofReuseHistoryValid())
++        {
++            if ((rw_dirty_hierarchy[0][group] & 0x80000000u) != 0 ||
++                rw_reuse_certificate[group] != 0)
++                ffxDofReuseChanged = 1u;
++        }
++        // Consume the prior certificate before initializing this dispatch's one.
++        rw_reuse_certificate[group] = 0;
++    }
++    GroupMemoryBarrierWithGroupSync();
++    FfxUInt32 changed = 0;
++    [unroll] for (FfxUInt32 mip = 0; mip < 4; ++mip)
++    {
++        FfxUInt32 side = 8u >> mip;
++        if (all(local < side))
++        {
++            FfxUInt32x2 texel = group * side + local;
++            FfxFloat32x4 value = r_internal_bilat_color.Load(int3(texel, mip));
++            FfxBoolean unsafe = FfxDofReuseUnsafe(value.x) || FfxDofReuseUnsafe(value.y) ||
++                FfxDofReuseUnsafe(value.z) || FfxDofReuseUnsafe(value.w);
++            if (unsafe) changed |= 0x80000001u;
++            if (FfxDofReuseHistoryValid())
++            {
++                FfxFloat32x4 previous = rw_history_bilat_color[mip][texel];
++                if (any(asuint(value) != asuint(previous))) changed |= 1u;
++            }
++            // Each history texel has exactly one writer, and no neighbor reader.
++            rw_history_bilat_color[mip][texel] = value;
++        }
++    }
++    if (all(local < 2u))
++    {
++        FfxUInt32x2 texel = group * 2u + local;
++        FfxFloat32x2 value = r_internal_dilated_radius.Load(int3(texel, 0));
++        if (FfxDofReuseUnsafe(value.x) || FfxDofReuseUnsafe(value.y)) changed |= 0x80000001u;
++        if (FfxDofReuseHistoryValid())
++        {
++            FfxFloat32x2 previous = rw_history_dilated_radius[texel];
++            if (any(asuint(value) != asuint(previous))) changed |= 1u;
++        }
++        rw_history_dilated_radius[texel] = value;
++    }
++    FfxUInt32 ignored;
++    InterlockedOr(ffxDofReuseChanged, changed, ignored);
++    GroupMemoryBarrierWithGroupSync();
++    if (leader) rw_dirty_hierarchy[0][group] = ffxDofReuseChanged;
++}
++#endif
++
++#if defined(FFX_DOF_REUSE_REDUCE)
++void FfxDofReduceDirty(FfxUInt32x2 texel)
++{
++    FfxUInt32 source = FfxDofReuseReduceLevel();
++    FfxUInt32 side = FfxDofReuseHierarchyWidth() >> (source + 1u);
++    if (any(texel >= side)) return;
++    FfxUInt32x2 p = texel * 2u;
++    rw_dirty_hierarchy[source + 1u][texel] =
++        rw_dirty_hierarchy[source][p] | rw_dirty_hierarchy[source][p + uint2(1, 0)] |
++        rw_dirty_hierarchy[source][p + uint2(0, 1)] | rw_dirty_hierarchy[source][p + uint2(1, 1)];
++}
++#endif
++
++#if defined(FFX_DOF_REUSE_BLUR)
++// The radius128 rectangle is an eligibility choice, not a recurrence bound.
++// Each actual sampled address is certified against it during full recomputation.
++void FfxDofReuseBox(FfxUInt32x2 group, out FfxInt32x2 lo, out FfxInt32x2 hi)
++{
++    lo = max(int2(group) - 16, 0);
++    hi = min(int2(group) + 16, int2(InputSizeHalf() >> 3) - 1);
++}
++
++void FfxDofReuseReject(FfxUInt32x2 group)
++{
++    FfxUInt32 ignored;
++    InterlockedOr(rw_reuse_certificate[group], 1u, ignored);
++}
++
++void FfxDofReuseCertifyBlocks(FfxUInt32x2 group, FfxInt32x2 first, FfxInt32x2 last)
++{
++    FfxInt32x2 lo, hi;
++    FfxDofReuseBox(group, lo, hi);
++    if (any(first < lo) || any(last > hi)) FfxDofReuseReject(group);
++}
++
++// D3D11.3 functional spec7.18.7 and7.18.16.1: normalized coordinate
++// scaling is followed by >=8-fraction-bit fixed-point rounding then floor.
++// With finite UV[-2,3], certificate-only saturate keeps scaled values<=16384.
++// Independent multiply error and fixed rounding are enclosed by floor(p) +/-2.
++// Clamp both ends before converting to blocks; use the actual SRV mip size.
++void FfxDofReuseCertifySample(FfxUInt32x2 group, FfxFloat32x2 uv, FfxUInt32 mip)
++{
++    if (mip > 3u || any(!isfinite(uv)) || any(uv < -2.0) || any(uv > 3.0))
++    {
++        FfxDofReuseReject(group);
++        return;
++    }
++    // Reject an out-of-contract LOD above; leave the original sampler call intact.
++    FfxUInt32 width, height, levels;
++    r_internal_bilat_color.GetDimensions(mip, width, height, levels);
++    FfxInt32x2 size = int2(width, height);
++    FfxInt32x2 center = int2(floor(saturate(uv) * float2(size)));
++    FfxInt32x2 first = clamp(center - 2, 0, size - 1);
++    FfxInt32x2 last = clamp(center + 2, 0, size - 1);
++    FfxDofReuseCertifyBlocks(group, (first << mip) >> 3, (last << mip) >> 3);
++}
++
++void FfxDofReuseCertifyFixedInputs(FfxUInt32x2 pixel)
++{
++    FfxUInt32x2 group = pixel >> 3;
++    // Integer mip0 center loads belong to the original native 8x8 block.
++    FfxDofReuseCertifyBlocks(group, int2(group), int2(group));
++    FfxUInt32 width, height;
++    r_internal_dilated_radius.GetDimensions(width, height);
++    // Exactly the same UV expression as FfxDofSampleDilatedRadius.
++    FfxFloat32x2 uv = float2(pixel) * InputSizeHalfRcp();
++    FfxInt32x2 size = int2(width, height);
++    // Linear addressing uses texel-center offset -0.5. +/-2 encloses both
++    // contributors after multiply/fixed-point error. One block owns2x2 tiles.
++    FfxInt32x2 center = int2(floor(saturate(uv) * float2(size) - 0.5));
++    FfxInt32x2 first = clamp(center - 2, 0, size - 1);
++    FfxInt32x2 last = clamp(center + 3, 0, size - 1);
++    FfxDofReuseCertifyBlocks(group, first >> 1, last >> 1);
++}
++
++FfxBoolean FfxDofReuseCanSkip(FfxUInt32x2 group)
++{
++    if (!FfxDofReuseHistoryValid() || !FfxDofReuseSkipEnabled()) return false;
++    FfxInt32x2 lo, hi;
++    FfxDofReuseBox(group, lo, hi);
++    FfxUInt32 span = max(hi.x - lo.x + 1, hi.y - lo.y + 1);
++    FfxUInt32 level = span > 1u ? FfxUInt32(firstbithigh(span - 1u)) + 1u : 0u;
++    FfxInt32x2 a = lo >> level, b = hi >> level;
++    FfxUInt32 dirty = r_dirty_hierarchy.Load(int3(a, level)) |
++        r_dirty_hierarchy.Load(int3(int2(b.x, a.y), level)) |
++        r_dirty_hierarchy.Load(int3(int2(a.x, b.y), level)) |
++        r_dirty_hierarchy.Load(int3(b, level));
++    return (dirty & 1u) == 0;
++}
++#endif
++#endif
+diff --git a/sdk/include/FidelityFX/host/ffx_dof.h b/sdk/include/FidelityFX/host/ffx_dof.h
+index d606c5e..1e0c7e7 100644
+--- a/sdk/include/FidelityFX/host/ffx_dof.h
++++ b/sdk/include/FidelityFX/host/ffx_dof.h
+@@ -54,11 +54,12 @@
+ ///
+ /// @ingroup ffxDof
+ #define FFX_DOF_CONTEXT_COUNT   1
++#define FFX_DOF_EXACT_REUSE_VERSION 1
+ 
+ /// The size of the context specified in 32bit values.
+ ///
+ /// @ingroup ffxDof
+-#define FFX_DOF_CONTEXT_SIZE  (45674)
++#define FFX_DOF_CONTEXT_SIZE  (73000) // Includes optional exact-reuse pipelines/resources; guarded by static assert.
+ 
+ #if defined(__cplusplus)
+ extern "C" {
+@@ -80,6 +81,9 @@ typedef enum FfxDofPass {
+     FFX_DOF_PASS_DILATE = 2,            ///< A pass which dilates the depth tile buffer
+     FFX_DOF_PASS_BLUR = 3,              ///< A pass which performs the depth of field blur
+     FFX_DOF_PASS_COMPOSITE = 4,         ///< A pass which combines the blurred images with the sharp input
++    FFX_DOF_PASS_COMPARE_HISTORY = 5, ///< Optional actual-input history comparison
++    FFX_DOF_PASS_REDUCE_DIRTY = 6,    ///< Optional conservative dirty hierarchy reduction
++    FFX_DOF_PASS_BLUR_REUSE = 7,      ///< Instrumented blur, selected only by explicit reuse context flags
+     FFX_DOF_PASS_COUNT              ///< The number of passes in DOF
+ } FfxDofPass;
+ 
+@@ -95,6 +99,8 @@ typedef enum FfxDofInitializationFlagBits {
+     FFX_DOF_VIRTUAL_INPUT_2X   = (1 << 3), ///< HLSL: native inputs represent exact 2x2 replication at the even virtual resolution. Incompatible with OUTPUT_PRE_INIT.
+     FFX_DOF_NATIVE_OUTPUT_2X   = (1 << 4), ///< HLSL: combine the four virtual RGBA16F results into one native RGBA32F mean. Requires VIRTUAL_INPUT_2X.
+     FFX_DOF_SINGLE_GLOBAL_RESET = (1 << 5), ///< HLSL: one blur invocation resets the global tile radius after dilation has consumed it.
++    FFX_DOF_EXACT_REUSE_DIAGNOSTICS = (1 << 6), ///< Allocate/compare/certify, always compute original blur outputs.
++    FFX_DOF_EXACT_REUSE_SKIP = (1 << 7), ///< Opt-in exact whole-group skip; requires supported pinned FP16 configuration.
+ } FfxDofInitializationFlagBits;
+ 
+ /// A structure encapsulating the parameters required to initialize FidelityFX
+@@ -186,6 +192,25 @@ FFX_API FfxErrorCode ffxDofContextCreate(FfxDofContext* pContext, const FfxDofCo
+ /// @ingroup ffxDof
+ FFX_API FfxErrorCode ffxDofContextDispatch(FfxDofContext* pContext, const FfxDofDispatchDescription* pDispatchDescription);
+ 
++/// Invalidates exact-reuse scene history. Call after loading-screen priming or switching invocation domains.
++/// The next successful ordered dispatch fully initializes history and recomputes every group.
++FFX_API FfxErrorCode ffxDofContextInvalidateReuseHistory(FfxDofContext* pContext);
++
++/// Borrowed resources for isolated validation. Caller must restore each reported resource state
++/// after any diagnostic copy and before the next SDK job. No ownership or lifetime is transferred.
++typedef struct FfxDofReuseDiagnostics {
++    FfxResource dirtyHierarchy;
++    FfxResource certificate;
++    FfxResource nearColor;
++    FfxResource farColor;
++    uint32_t groupWidth;
++    uint32_t groupHeight;
++    uint32_t hierarchyMipCount;
++    bool historyValid;
++} FfxDofReuseDiagnostics;
++FFX_API FfxErrorCode ffxDofContextGetReuseDiagnostics(FfxDofContext* pContext, FfxDofReuseDiagnostics* pDiagnostics);
++
++
+ /// Destroy the FidelityFX DoF context.
+ ///
+ /// @param [out] pContext                A pointer to a <c><i>FfxDofContext</i></c> structure to destroy.
+diff --git a/sdk/src/backends/dx12/shaders/dof/ffx_dof_blur_reuse_pass.hlsl b/sdk/src/backends/dx12/shaders/dof/ffx_dof_blur_reuse_pass.hlsl
+new file mode 100644
+index 0000000..83c5127
+--- /dev/null
++++ b/sdk/src/backends/dx12/shaders/dof/ffx_dof_blur_reuse_pass.hlsl
+@@ -0,0 +1,56 @@
++// This file is part of the FidelityFX SDK.
++//
++// Copyright (C) 2024 Advanced Micro Devices, Inc.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files(the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions :
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++#define FFX_DOF_REUSE_BLUR 1
++#define FFX_DOF_BIND_CB_DOF 0
++#define FFX_DOF_BIND_SRV_INTERNAL_BILAT_COLOR       0
++#define FFX_DOF_BIND_SRV_INTERNAL_DILATED_RADIUS    1
++#define FFX_DOF_BIND_UAV_INTERNAL_NEAR              0
++#define FFX_DOF_BIND_UAV_INTERNAL_FAR               1
++#define FFX_DOF_BIND_UAV_INTERNAL_GLOBALS           2
++#define FFX_DOF_BIND_SRV_DIRTY_HIERARCHY            2
++#define FFX_DOF_BIND_UAV_REUSE_CERTIFICATE          3
++
++#include "dof/ffx_dof_callbacks_hlsl.h"
++#include "dof/ffx_dof_reuse.h"
++#include "dof/ffx_dof_blur.h"
++
++#ifndef FFX_DOF_THREAD_GROUP_WIDTH
++#define FFX_DOF_THREAD_GROUP_WIDTH 8
++#endif // #ifndef FFX_DOF_THREAD_GROUP_WIDTH
++#ifndef FFX_DOF_THREAD_GROUP_HEIGHT
++#define FFX_DOF_THREAD_GROUP_HEIGHT 8
++#endif // FFX_DOF_THREAD_GROUP_HEIGHT
++#ifndef FFX_DOF_THREAD_GROUP_DEPTH
++#define FFX_DOF_THREAD_GROUP_DEPTH 1
++#endif // #ifndef FFX_DOF_THREAD_GROUP_DEPTH
++#ifndef FFX_DOF_NUM_THREADS
++#define FFX_DOF_NUM_THREADS [numthreads(FFX_DOF_THREAD_GROUP_WIDTH, FFX_DOF_THREAD_GROUP_HEIGHT, FFX_DOF_THREAD_GROUP_DEPTH)]
++#endif // #ifndef FFX_DOF_NUM_THREADS
++
++FFX_PREFER_WAVE64
++FFX_DOF_NUM_THREADS
++FFX_DOF_EMBED_ROOTSIG_CONTENT
++void CS(uint3 dtID : SV_DispatchThreadID)
++{
++    FfxDofBlur(dtID.xy, InputSizeHalf());
++}
+diff --git a/sdk/src/backends/dx12/shaders/dof/ffx_dof_compare_history_pass.hlsl b/sdk/src/backends/dx12/shaders/dof/ffx_dof_compare_history_pass.hlsl
+new file mode 100644
+index 0000000..42b4cc9
+--- /dev/null
++++ b/sdk/src/backends/dx12/shaders/dof/ffx_dof_compare_history_pass.hlsl
+@@ -0,0 +1,18 @@
++// Scratch exact-world-reuse:8x8 threads own one native8x8 history block.
++#define FFX_DOF_REUSE_COMPARE 1
++#define FFX_DOF_BIND_CB_DOF 0
++#define FFX_DOF_BIND_SRV_INTERNAL_BILAT_COLOR 0
++#define FFX_DOF_BIND_SRV_INTERNAL_DILATED_RADIUS 1
++#define FFX_DOF_BIND_UAV_HISTORY_BILAT_COLOR 0
++#define FFX_DOF_BIND_UAV_HISTORY_DILATED_RADIUS 4
++#define FFX_DOF_BIND_UAV_DIRTY_HIERARCHY 5
++#define FFX_DOF_BIND_UAV_REUSE_CERTIFICATE 20
++#include "dof/ffx_dof_callbacks_hlsl.h"
++#include "dof/ffx_dof_reuse.h"
++FFX_PREFER_WAVE64
++[numthreads(8, 8, 1)]
++FFX_DOF_EMBED_ROOTSIG_CONTENT
++void CS(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID)
++{
++    FfxDofCompareHistory(group.xy, local.xy);
++}
+diff --git a/sdk/src/backends/dx12/shaders/dof/ffx_dof_reduce_dirty_pass.hlsl b/sdk/src/backends/dx12/shaders/dof/ffx_dof_reduce_dirty_pass.hlsl
+new file mode 100644
+index 0000000..c3441f2
+--- /dev/null
++++ b/sdk/src/backends/dx12/shaders/dof/ffx_dof_reduce_dirty_pass.hlsl
+@@ -0,0 +1,13 @@
++// Every reduction dispatch needs an ordered whole-resource UAV barrier.
++#define FFX_DOF_REUSE_REDUCE 1
++#define FFX_DOF_BIND_CB_DOF 0
++#define FFX_DOF_BIND_UAV_DIRTY_HIERARCHY 0
++#include "dof/ffx_dof_callbacks_hlsl.h"
++#include "dof/ffx_dof_reuse.h"
++FFX_PREFER_WAVE64
++[numthreads(8, 8, 1)]
++FFX_DOF_EMBED_ROOTSIG_CONTENT
++void CS(uint3 texel : SV_DispatchThreadID)
++{
++    FfxDofReduceDirty(texel.xy);
++}
+diff --git a/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp b/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp
+index f55deae..2f79c0a 100644
+--- a/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp
++++ b/sdk/src/backends/shared/blob_accessors/ffx_dof_shaderblobs.cpp
+@@ -29,24 +29,40 @@
+ #include <ffx_dof_dilate_pass_permutations.h>
+ #include <ffx_dof_blur_pass_permutations.h>
+ #include <ffx_dof_composite_pass_permutations.h>
++#include <ffx_dof_compare_history_pass_permutations.h>
++#include <ffx_dof_reduce_dirty_pass_permutations.h>
++#include <ffx_dof_blur_reuse_pass_permutations.h>
++
+ 
+ #include <ffx_dof_downsample_depth_pass_wave64_permutations.h>
+ #include <ffx_dof_downsample_color_pass_wave64_permutations.h>
+ #include <ffx_dof_dilate_pass_wave64_permutations.h>
+ #include <ffx_dof_blur_pass_wave64_permutations.h>
+ #include <ffx_dof_composite_pass_wave64_permutations.h>
++#include <ffx_dof_compare_history_pass_wave64_permutations.h>
++#include <ffx_dof_reduce_dirty_pass_wave64_permutations.h>
++#include <ffx_dof_blur_reuse_pass_wave64_permutations.h>
++
+ 
+ #include <ffx_dof_downsample_depth_pass_16bit_permutations.h>
+ #include <ffx_dof_downsample_color_pass_16bit_permutations.h>
+ #include <ffx_dof_dilate_pass_16bit_permutations.h>
+ #include <ffx_dof_blur_pass_16bit_permutations.h>
+ #include <ffx_dof_composite_pass_16bit_permutations.h>
++#include <ffx_dof_compare_history_pass_16bit_permutations.h>
++#include <ffx_dof_reduce_dirty_pass_16bit_permutations.h>
++#include <ffx_dof_blur_reuse_pass_16bit_permutations.h>
++
+ 
+ #include <ffx_dof_downsample_depth_pass_wave64_16bit_permutations.h>
+ #include <ffx_dof_downsample_color_pass_wave64_16bit_permutations.h>
+ #include <ffx_dof_dilate_pass_wave64_16bit_permutations.h>
+ #include <ffx_dof_blur_pass_wave64_16bit_permutations.h>
+ #include <ffx_dof_composite_pass_wave64_16bit_permutations.h>
++#include <ffx_dof_compare_history_pass_wave64_16bit_permutations.h>
++#include <ffx_dof_reduce_dirty_pass_wave64_16bit_permutations.h>
++#include <ffx_dof_blur_reuse_pass_wave64_16bit_permutations.h>
++
+ 
+ #include <cstring>  // for memset
+ #include <array>
+@@ -192,6 +208,105 @@ static FfxShaderBlob dofGetBlurPassPermutationBlobByIndex(uint32_t permutationOp
+     }
+ }
+ 
++static FfxShaderBlob dofGetCompareHistoryPassPermutationBlobByIndex(uint32_t permutationOptions, bool isWave64, bool is16bit)
++{
++    ffx_dof_compare_history_pass_PermutationKey key;
++    POPULATE_PERMUTATION_KEY(permutationOptions, key);
++
++    if (isWave64)
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_compare_history_pass_wave64_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_compare_history_pass_wave64_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_compare_history_pass_wave64_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_compare_history_pass_wave64_PermutationInfo, tableIndex);
++        }
++    }
++    else
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_compare_history_pass_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_compare_history_pass_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_compare_history_pass_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_compare_history_pass_PermutationInfo, tableIndex);
++        }
++    }
++}
++
++static FfxShaderBlob dofGetReduceDirtyPassPermutationBlobByIndex(uint32_t permutationOptions, bool isWave64, bool is16bit)
++{
++    ffx_dof_reduce_dirty_pass_PermutationKey key;
++    POPULATE_PERMUTATION_KEY(permutationOptions, key);
++
++    if (isWave64)
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_reduce_dirty_pass_wave64_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_reduce_dirty_pass_wave64_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_reduce_dirty_pass_wave64_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_reduce_dirty_pass_wave64_PermutationInfo, tableIndex);
++        }
++    }
++    else
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_reduce_dirty_pass_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_reduce_dirty_pass_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_reduce_dirty_pass_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_reduce_dirty_pass_PermutationInfo, tableIndex);
++        }
++    }
++}
++
++static FfxShaderBlob dofGetBlurReusePassPermutationBlobByIndex(uint32_t permutationOptions, bool isWave64, bool is16bit)
++{
++    ffx_dof_blur_reuse_pass_PermutationKey key;
++    POPULATE_PERMUTATION_KEY(permutationOptions, key);
++
++    if (isWave64)
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_blur_reuse_pass_wave64_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_blur_reuse_pass_wave64_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_blur_reuse_pass_wave64_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_blur_reuse_pass_wave64_PermutationInfo, tableIndex);
++        }
++    }
++    else
++    {
++        if (is16bit)
++        {
++            const int32_t tableIndex = g_ffx_dof_blur_reuse_pass_16bit_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_blur_reuse_pass_16bit_PermutationInfo, tableIndex);
++        }
++        else
++        {
++            const int32_t tableIndex = g_ffx_dof_blur_reuse_pass_IndirectionTable[key.index];
++            return POPULATE_SHADER_BLOB_FFX(g_ffx_dof_blur_reuse_pass_PermutationInfo, tableIndex);
++        }
++    }
++}
++
+ static FfxShaderBlob dofGetCompositePassPermutationBlobByIndex(uint32_t permutationOptions, bool isWave64, bool is16bit)
+ {
+     ffx_dof_composite_pass_PermutationKey key;
+@@ -230,7 +345,10 @@ static const FpPassHandler g_pass_getter_map[FFX_DOF_PASS_COUNT] = {dofGetDsDept
+                                                                     dofGetDsColorPassPermutationBlobByIndex,
+                                                                     dofGetDilatePassPermutationBlobByIndex,
+                                                                     dofGetBlurPassPermutationBlobByIndex,
+-                                                                    dofGetCompositePassPermutationBlobByIndex};
++                                                                    dofGetCompositePassPermutationBlobByIndex,
++                                                                    dofGetCompareHistoryPassPermutationBlobByIndex,
++                                                                    dofGetReduceDirtyPassPermutationBlobByIndex,
++                                                                    dofGetBlurReusePassPermutationBlobByIndex};
+ 
+ FfxErrorCode dofGetPermutationBlobByIndex(FfxDofPass passId, uint32_t permutationOptions, FfxShaderBlob* outBlob)
+ {
+diff --git a/sdk/src/components/dof/ffx_dof.cpp b/sdk/src/components/dof/ffx_dof.cpp
+index 2949502..2c8f126 100644
+--- a/sdk/src/components/dof/ffx_dof.cpp
++++ b/sdk/src/components/dof/ffx_dof.cpp
+@@ -45,6 +45,7 @@ static const ResourceBinding srvTextureBindingTable[] =
+     {FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR,                  L"r_input_color"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_BILAT_COLOR,         L"r_internal_bilat_color"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_DILATED_RADIUS,      L"r_internal_dilated_radius"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY,              L"r_dirty_hierarchy"},
+ };
+ 
+ static const ResourceBinding uavTextureBindingTable[] =
+@@ -56,6 +57,10 @@ static const ResourceBinding uavTextureBindingTable[] =
+     {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_FAR,                 L"rw_internal_far"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR,                 L"rw_output_color"},
+     {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_GLOBALS,             L"rw_internal_globals"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR,          L"rw_history_bilat_color"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_DILATED_RADIUS,       L"rw_history_dilated_radius"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY,              L"rw_dirty_hierarchy"},
++    {FFX_DOF_RESOURCE_IDENTIFIER_REUSE_CERTIFICATE,            L"rw_reuse_certificate"},
+ };
+ 
+ static const ResourceBinding cbResourceBindingTable[] =
+@@ -180,8 +185,8 @@ static FfxErrorCode createPipelineStates(FfxDofContext_Private* context)
+     FFX_VALIDATE(context->contextDescription.backendInterface.fpCreatePipeline(&context->contextDescription.backendInterface, FFX_EFFECT_DOF, FFX_DOF_PASS_DILATE,
+         getPipelinePermutationFlags(contextFlags, FFX_DOF_PASS_DILATE, supportedFP16, canForceWave64),
+         &pipelineDescription, context->effectContextId, &context->pipelineDilate));
+-    wcscpy_s(pipelineDescription.name, L"DOF-BLUR");
+-    FFX_VALIDATE(context->contextDescription.backendInterface.fpCreatePipeline(&context->contextDescription.backendInterface, FFX_EFFECT_DOF, FFX_DOF_PASS_BLUR,
++    wcscpy_s(pipelineDescription.name, context->reuseEnabled ? L"DOF-BLUR-REUSE" : L"DOF-BLUR");
++    FFX_VALIDATE(context->contextDescription.backendInterface.fpCreatePipeline(&context->contextDescription.backendInterface, FFX_EFFECT_DOF, context->reuseEnabled ? FFX_DOF_PASS_BLUR_REUSE : FFX_DOF_PASS_BLUR,
+         getPipelinePermutationFlags(contextFlags, FFX_DOF_PASS_BLUR, supportedFP16, canForceWave64),
+         &pipelineDescription, context->effectContextId, &context->pipelineBlur));
+     wcscpy_s(pipelineDescription.name, L"DOF-COMPOSITE");
+@@ -189,6 +194,21 @@ static FfxErrorCode createPipelineStates(FfxDofContext_Private* context)
+         getPipelinePermutationFlags(contextFlags, FFX_DOF_PASS_COMPOSITE, supportedFP16, false),
+         &pipelineDescription, context->effectContextId, &context->pipelineComposite));
+ 
++    if (context->reuseEnabled) {
++        wcscpy_s(pipelineDescription.name, L"DOF-COMPARE-HISTORY");
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpCreatePipeline(&context->contextDescription.backendInterface,
++            FFX_EFFECT_DOF, FFX_DOF_PASS_COMPARE_HISTORY,
++            getPipelinePermutationFlags(contextFlags, FFX_DOF_PASS_COMPARE_HISTORY, supportedFP16, false),
++            &pipelineDescription, context->effectContextId, &context->pipelineCompareHistory));
++        wcscpy_s(pipelineDescription.name, L"DOF-REDUCE-DIRTY");
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpCreatePipeline(&context->contextDescription.backendInterface,
++            FFX_EFFECT_DOF, FFX_DOF_PASS_REDUCE_DIRTY,
++            getPipelinePermutationFlags(contextFlags, FFX_DOF_PASS_REDUCE_DIRTY, supportedFP16, false),
++            &pipelineDescription, context->effectContextId, &context->pipelineReduceDirty));
++        FFX_VALIDATE(patchResourceBindings(&context->pipelineCompareHistory));
++        FFX_VALIDATE(patchResourceBindings(&context->pipelineReduceDirty));
++    }
++
+     // For each pipeline: re-route/fix-up IDs based on names
+     patchResourceBindings(&context->pipelineDsDepth);
+     patchResourceBindings(&context->pipelineDsColor);
+@@ -199,7 +219,7 @@ static FfxErrorCode createPipelineStates(FfxDofContext_Private* context)
+     return FFX_OK;
+ }
+ 
+-static void scheduleDispatch(FfxDofContext_Private* context, const FfxDofDispatchDescription* params, const FfxPipelineState* pipeline, uint32_t dispatchX, uint32_t dispatchY)
++static FfxErrorCode scheduleDispatch(FfxDofContext_Private* context, const FfxDofDispatchDescription* params, const FfxPipelineState* pipeline, uint32_t dispatchX, uint32_t dispatchY)
+ {
+     FfxGpuJobDescription dispatchJob = {FFX_GPU_JOB_COMPUTE};
+     wcscpy_s(dispatchJob.jobLabel, pipeline->name);
+@@ -224,10 +244,12 @@ static void scheduleDispatch(FfxDofContext_Private* context, const FfxDofDispatc
+ #ifdef FFX_DEBUG
+         wcscpy_s(dispatchJob.computeJobDescriptor.uavTextures[currentUnorderedAccessViewIndex].name, binding.name);
+ #endif
+-        if (currentResourceId == FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_BILAT_COLOR)
++        if (currentResourceId == FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_BILAT_COLOR ||
++            currentResourceId == FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR ||
++            currentResourceId == FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY)
+         {
+             // Need to map as many resources as we have binding indices
+-            const FfxResourceInternal currentResource = context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_BILAT_COLOR];
++            const FfxResourceInternal currentResource = context->uavResources[currentResourceId];
+             const uint32_t            bindEntry       = binding.arrayIndex;
+ 
+             // Don't over-subscribe mips (default to mip 0 once we've exhausted min mip)
+@@ -265,7 +287,7 @@ static void scheduleDispatch(FfxDofContext_Private* context, const FfxDofDispatc
+     dispatchJob.computeJobDescriptor.cbs[0] = context->constantBuffer;
+ 
+ 
+-    context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &dispatchJob);
++    return context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &dispatchJob);
+ }
+ 
+ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDispatchDescription* params)
+@@ -273,59 +295,98 @@ static FfxErrorCode dofDispatch(FfxDofContext_Private* context, const FfxDofDisp
+     // take a short cut to the command list
+     FfxCommandList commandList = params->commandList;
+ 
+-    // Register resources for frame
+-    context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->color, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR]);
+-    context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->depth, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH]);
+-    context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->output, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR]);
+-
+-    context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->color, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR]);
+-    context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->depth, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH]);
+-    context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->output, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR]);
+-
+-
+-    // dispatch sizes
+-    uint32_t width = context->contextDescription.resolution.width, height = context->contextDescription.resolution.height;
+-    uint32_t halfWidth = (width + 1) / 2, halfHeight = (height + 1) / 2;
+-
+-    uint32_t dsTilesX = (width + 63) / 64;
+-    uint32_t dsTilesY = (height + 63) / 64;
+-    uint32_t fullTilesX = (width + 7) / 8;
+-    uint32_t fullTilesY = (height + 7) / 8;
+-    uint32_t tilesX = (halfWidth + 7) / 8;
+-    uint32_t tilesY = (halfHeight + 7) / 8;
+-
+-    // Constant buffer
+-    DofConstants cbuffer = {};
+-    cbuffer.cocScale = params->cocScale;
+-    cbuffer.cocBias = params->cocBias;
+-    cbuffer.inputSize[0] = context->contextDescription.resolution.width;
+-    cbuffer.inputSize[1] = context->contextDescription.resolution.height;
+-    cbuffer.inputSizeHalf[0] = (cbuffer.inputSize[0] + 1) / 2;
+-    cbuffer.inputSizeHalf[1] = (cbuffer.inputSize[1] + 1) / 2;
+-    cbuffer.inputSizeHalfRcp[0] = 1.0f / cbuffer.inputSizeHalf[0];
+-    cbuffer.inputSizeHalfRcp[1] = 1.0f / cbuffer.inputSizeHalf[1];
+-    // calculate actual coc limit. Limit in the shader is half res, so * 0.5 this.
+-    cbuffer.cocLimit = 0.5f * context->contextDescription.cocLimitFactor * context->contextDescription.resolution.height;
+-    cbuffer.maxRings = context->contextDescription.quality;
+-    cbuffer.inputOutputFlags = context->contextDescription.flags &
+-        (FFX_DOF_VIRTUAL_INPUT_2X | FFX_DOF_NATIVE_OUTPUT_2X | FFX_DOF_SINGLE_GLOBAL_RESET);
+-
+-    context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(&context->contextDescription.backendInterface, 
+-                                                                               &cbuffer, 
+-                                                                               sizeof(DofConstants),
+-                                                                               &context->constantBuffer);
+-    scheduleDispatch(context, params, &context->pipelineDsDepth, (fullTilesX + 7) / 8, (fullTilesY + 7) / 8);
+-    scheduleDispatch(context, params, &context->pipelineDsColor, dsTilesX, dsTilesY);
+-    scheduleDispatch(context, params, &context->pipelineDilate, (fullTilesX + 7) / 8, (fullTilesY + 7) / 8);
+-    scheduleDispatch(context, params, &context->pipelineBlur, tilesX, tilesY);
+-    scheduleDispatch(context, params, &context->pipelineComposite, tilesX, tilesY);
+-
+-    // Execute all the work for the frame
+-    context->contextDescription.backendInterface.fpExecuteGpuJobs(&context->contextDescription.backendInterface, commandList, context->effectContextId);
+-
+-    // Release dynamic resources
+-    context->contextDescription.backendInterface.fpUnregisterResources(&context->contextDescription.backendInterface, commandList, context->effectContextId);
+-
++    const bool previousHistoryValid = context->reuseHistoryValid;
++    context->reuseHistoryValid = false;
++    DofConstants pendingHistoryConstants{};
++    // Always restore dynamically registered external resource states, including on callback failures.
++    const FfxErrorCode workResult = [&]() -> FfxErrorCode {
++        // Register resources for frame
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->color, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR]));
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->depth, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH]));
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->output, context->effectContextId, &context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR]));
++
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->color, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_COLOR]));
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->depth, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_INPUT_DEPTH]));
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface, &params->output, context->effectContextId, &context->uavResources[FFX_DOF_RESOURCE_IDENTIFIER_OUTPUT_COLOR]));
++
++
++        // dispatch sizes
++        uint32_t width = context->contextDescription.resolution.width, height = context->contextDescription.resolution.height;
++        uint32_t halfWidth = (width + 1) / 2, halfHeight = (height + 1) / 2;
++
++        uint32_t dsTilesX = (width + 63) / 64;
++        uint32_t dsTilesY = (height + 63) / 64;
++        uint32_t fullTilesX = (width + 7) / 8;
++        uint32_t fullTilesY = (height + 7) / 8;
++        uint32_t tilesX = (halfWidth + 7) / 8;
++        uint32_t tilesY = (halfHeight + 7) / 8;
++
++        // Constant buffer
++        DofConstants cbuffer = {};
++        cbuffer.cocScale = params->cocScale;
++        cbuffer.cocBias = params->cocBias;
++        cbuffer.inputSize[0] = context->contextDescription.resolution.width;
++        cbuffer.inputSize[1] = context->contextDescription.resolution.height;
++        cbuffer.inputSizeHalf[0] = (cbuffer.inputSize[0] + 1) / 2;
++        cbuffer.inputSizeHalf[1] = (cbuffer.inputSize[1] + 1) / 2;
++        cbuffer.inputSizeHalfRcp[0] = 1.0f / cbuffer.inputSizeHalf[0];
++        cbuffer.inputSizeHalfRcp[1] = 1.0f / cbuffer.inputSizeHalf[1];
++        // calculate actual coc limit. Limit in the shader is half res, so * 0.5 this.
++        cbuffer.cocLimit = 0.5f * context->contextDescription.cocLimitFactor * context->contextDescription.resolution.height;
++        cbuffer.maxRings = context->contextDescription.quality;
++        cbuffer.inputOutputFlags = context->contextDescription.flags &
++            (FFX_DOF_VIRTUAL_INPUT_2X | FFX_DOF_NATIVE_OUTPUT_2X | FFX_DOF_SINGLE_GLOBAL_RESET);
++
++        // Compare only effective SDK constants; reuse controls never enter the history signature.
++        const bool historyValid = context->reuseEnabled && previousHistoryValid &&
++            memcmp(&context->reusePreviousConstants, &cbuffer, sizeof(DofConstants)) == 0;
++        context->reuseHistoryValid = false; // A failure during staging/scheduling/execution cannot leave valid history.
++        if (context->reuseEnabled) {
++            cbuffer.reuse[0] = (historyValid ? 1u : 0u) |
++                ((context->contextDescription.flags & FFX_DOF_EXACT_REUSE_SKIP) ? 2u : 0u);
++            cbuffer.reuse[2] = context->reuseHierarchyWidth;
++        }
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
++            &context->contextDescription.backendInterface, &cbuffer, sizeof(DofConstants), &context->constantBuffer));
++        FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineDsDepth, (fullTilesX + 7) / 8, (fullTilesY + 7) / 8));
++        FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineDsColor, dsTilesX, dsTilesY));
++        FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineDilate, (fullTilesX + 7) / 8, (fullTilesY + 7) / 8));
++        if (context->reuseEnabled) {
++            FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineCompareHistory,
++                context->reuseHierarchyWidth, context->reuseHierarchyWidth));
++            for (uint32_t level = 0; level + 1 < context->reuseHierarchyMipCount; ++level) {
++                DofConstants reduceConstants = cbuffer;
++                reduceConstants.reuse[1] = level;
++                // Each job keeps its own staged allocation until backend execution.
++                FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
++                    &context->contextDescription.backendInterface, &reduceConstants, sizeof(DofConstants), &context->constantBuffer));
++                const uint32_t size = context->reuseHierarchyWidth >> (level + 1);
++                FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineReduceDirty, (size + 7) / 8, (size + 7) / 8));
++            }
++            FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
++                &context->contextDescription.backendInterface, &cbuffer, sizeof(DofConstants), &context->constantBuffer));
++        }
++        FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineBlur, tilesX, tilesY));
++        FFX_VALIDATE(scheduleDispatch(context, params, &context->pipelineComposite, tilesX, tilesY));
++
++        // The backend orders UAV writes and SRV transitions across comparison/reduction/blur jobs.
++        FFX_VALIDATE(context->contextDescription.backendInterface.fpExecuteGpuJobs(
++            &context->contextDescription.backendInterface, commandList, context->effectContextId));
++        if (context->reuseEnabled) {
++            memset(cbuffer.reuse, 0, sizeof(cbuffer.reuse));
++            pendingHistoryConstants = cbuffer;
++        }
++        return FFX_OK;
++    }();
++    const FfxErrorCode restoreResult = context->contextDescription.backendInterface.fpUnregisterResources(
++        &context->contextDescription.backendInterface, commandList, context->effectContextId);
++    // Preserve the original failure when restoration also fails.
++    if (workResult != FFX_OK) return workResult;
++    if (restoreResult != FFX_OK) return restoreResult;
++    if (context->reuseEnabled) {
++        context->reusePreviousConstants = pendingHistoryConstants;
++        context->reuseHistoryValid = true; // Ordered recording, not CPU completion.
++    }
+     return FFX_OK;
+ }
+ 
+@@ -360,6 +421,25 @@ static FfxErrorCode dofCreate(FfxDofContext_Private* context, const FfxDofContex
+     uint32_t tileWidth = (halfWidth + 3) / 4;
+     uint32_t tileHeight = (halfHeight + 3) / 4;
+     bool is16bit = context->deviceCapabilities.fp16Supported;
++    context->reuseEnabled = (contextDescription->flags &
++        (FFX_DOF_EXACT_REUSE_DIAGNOSTICS | FFX_DOF_EXACT_REUSE_SKIP)) != 0;
++    if (context->reuseEnabled) {
++        // This is the bounded M6/native-grid experiment, not a silent approximate fallback.
++        FFX_RETURN_ON_ERROR(is16bit && (contextDescription->flags & FFX_DOF_DISABLE_RING_MERGE) &&
++            (contextDescription->flags & FFX_DOF_VIRTUAL_INPUT_2X) &&
++            contextDescription->quality > 0 && contextDescription->quality <= 8 &&
++            halfWidth > 0 && halfHeight > 0 && ((halfWidth | halfHeight) & 7u) == 0,
++            FFX_ERROR_INVALID_ARGUMENT);
++        context->reuseHierarchyWidth = 1;
++        context->reuseHierarchyMipCount = 1;
++        const uint32_t groups = (halfWidth > halfHeight ? halfWidth : halfHeight) / 8;
++        while (context->reuseHierarchyWidth < groups) {
++            context->reuseHierarchyWidth <<= 1;
++            ++context->reuseHierarchyMipCount;
++        }
++        FFX_RETURN_ON_ERROR(context->reuseHierarchyMipCount <= 15, FFX_ERROR_INVALID_ARGUMENT);
++    }
++
+     FfxInternalResourceDescription internalSurfaceDesc[] = {
+         {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_BILAT_COLOR,
+          L"DOF_InternalBilatColor",
+@@ -399,7 +479,7 @@ static FfxErrorCode dofCreate(FfxDofContext_Private* context, const FfxDofContex
+          halfWidth,
+          halfHeight,
+          1,
+-         FFX_RESOURCE_FLAGS_ALIASABLE,
++         context->reuseEnabled ? FFX_RESOURCE_FLAGS_NONE : FFX_RESOURCE_FLAGS_ALIASABLE,
+          {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+         {FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_FAR,
+          L"DOF_InternalFar",
+@@ -409,7 +489,7 @@ static FfxErrorCode dofCreate(FfxDofContext_Private* context, const FfxDofContex
+          halfWidth,
+          halfHeight,
+          1,
+-         FFX_RESOURCE_FLAGS_ALIASABLE,
++         context->reuseEnabled ? FFX_RESOURCE_FLAGS_NONE : FFX_RESOURCE_FLAGS_ALIASABLE,
+          {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+     };
+ 
+@@ -430,6 +510,31 @@ static FfxErrorCode dofCreate(FfxDofContext_Private* context, const FfxDofContex
+ 
+         FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateResource(&context->contextDescription.backendInterface, &createResourceDescription, context->effectContextId, &context->srvResources[currentSurfaceDescription->id]));
+     }
++    if (context->reuseEnabled) {
++        const FfxInternalResourceDescription historyDescriptions[] = {
++            {FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR, L"DOF_HistoryBilatColor", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, halfWidth, halfHeight, 4,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_DILATED_RADIUS, L"DOF_HistoryDilatedRadius", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R16G16_FLOAT, tileWidth, tileHeight, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY, L"DOF_DirtyHierarchy", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, context->reuseHierarchyWidth, context->reuseHierarchyWidth,
++                context->reuseHierarchyMipCount, FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
++            {FFX_DOF_RESOURCE_IDENTIFIER_REUSE_CERTIFICATE, L"DOF_ReuseCertificate", FFX_RESOURCE_TYPE_TEXTURE2D,
++                FFX_RESOURCE_USAGE_UAV, FFX_SURFACE_FORMAT_R32_UINT, context->reuseHierarchyWidth, context->reuseHierarchyWidth, 1,
++                FFX_RESOURCE_FLAGS_NONE, {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}}
++        };
++        for (const auto& description : historyDescriptions) {
++            const FfxResourceDescription resourceDescription = {description.type, description.format,
++                description.width, description.height, 1, description.mipCount, description.flags, description.usage};
++            const FfxCreateResourceDescription createDescription = {FFX_HEAP_TYPE_DEFAULT, resourceDescription,
++                FFX_RESOURCE_STATE_UNORDERED_ACCESS, description.name, description.id, description.initData};
++            FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateResource(
++                &context->contextDescription.backendInterface, &createDescription, context->effectContextId,
++                &context->srvResources[description.id]));
++        }
++    }
+     // globals buffer
+     {
+         const FfxResourceDescription resourceDescription = { FFX_RESOURCE_TYPE_BUFFER, FFX_SURFACE_FORMAT_UNKNOWN,
+@@ -458,7 +563,8 @@ static FfxErrorCode dofRelease(FfxDofContext_Private* context)
+     FFX_ASSERT(context);
+     
+     // Release all pipelines
+-    for (FfxPipelineState* pipe : {&context->pipelineDsDepth, &context->pipelineDsColor, &context->pipelineDilate, &context->pipelineBlur, &context->pipelineComposite})
++    for (FfxPipelineState* pipe : {&context->pipelineDsDepth, &context->pipelineDsColor, &context->pipelineDilate, &context->pipelineBlur, &context->pipelineComposite,
++                                    &context->pipelineCompareHistory, &context->pipelineReduceDirty})
+     {
+         ffxSafeReleasePipeline(&context->contextDescription.backendInterface, pipe, context->effectContextId);
+     }
+@@ -477,6 +583,13 @@ static FfxErrorCode dofRelease(FfxDofContext_Private* context)
+     ffxSafeReleaseCopyResource(&context->contextDescription.backendInterface, context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_GLOBALS], context->effectContextId);
+     ffxSafeReleaseResource(&context->contextDescription.backendInterface, context->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_GLOBALS], context->effectContextId);
+ 
++    for (uint32_t id : {FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_BILAT_COLOR,
++                         FFX_DOF_RESOURCE_IDENTIFIER_HISTORY_DILATED_RADIUS,
++                         FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY,
++                         FFX_DOF_RESOURCE_IDENTIFIER_REUSE_CERTIFICATE}) {
++        ffxSafeReleaseResource(&context->contextDescription.backendInterface, context->srvResources[id], context->effectContextId);
++    }
++
+     // Destroy the context
+     context->contextDescription.backendInterface.fpDestroyBackendContext(&context->contextDescription.backendInterface, context->effectContextId);
+ 
+@@ -542,6 +655,34 @@ FfxErrorCode ffxDofContextDispatch(FfxDofContext* context, const FfxDofDispatchD
+     return dofDispatch(contextPrivate, dispatchDescription);
+ }
+ 
++FfxErrorCode ffxDofContextInvalidateReuseHistory(FfxDofContext* context)
++{
++    FFX_RETURN_ON_ERROR(context, FFX_ERROR_INVALID_POINTER);
++    auto* impl = reinterpret_cast<FfxDofContext_Private*>(context);
++    FFX_RETURN_ON_ERROR(impl->device, FFX_ERROR_NULL_DEVICE);
++    impl->reuseHistoryValid = false;
++    return FFX_OK;
++}
++
++FfxErrorCode ffxDofContextGetReuseDiagnostics(FfxDofContext* context, FfxDofReuseDiagnostics* diagnostics)
++{
++    FFX_RETURN_ON_ERROR(context && diagnostics, FFX_ERROR_INVALID_POINTER);
++    auto* impl = reinterpret_cast<FfxDofContext_Private*>(context);
++    FFX_RETURN_ON_ERROR(impl->device, FFX_ERROR_NULL_DEVICE);
++    FFX_RETURN_ON_ERROR(impl->reuseEnabled, FFX_ERROR_INVALID_ARGUMENT);
++    FFX_RETURN_ON_ERROR(impl->contextDescription.backendInterface.fpGetResource, FFX_ERROR_INCOMPLETE_INTERFACE);
++    auto* backend = &impl->contextDescription.backendInterface;
++    diagnostics->dirtyHierarchy = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_DIRTY_HIERARCHY]);
++    diagnostics->certificate = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_REUSE_CERTIFICATE]);
++    diagnostics->nearColor = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_NEAR]);
++    diagnostics->farColor = backend->fpGetResource(backend, impl->srvResources[FFX_DOF_RESOURCE_IDENTIFIER_INTERNAL_FAR]);
++    diagnostics->groupWidth = (impl->contextDescription.resolution.width / 2 + 7) / 8;
++    diagnostics->groupHeight = (impl->contextDescription.resolution.height / 2 + 7) / 8;
++    diagnostics->hierarchyMipCount = impl->reuseHierarchyMipCount;
++    diagnostics->historyValid = impl->reuseHistoryValid;
++    return FFX_OK;
++}
++
+ FFX_API FfxVersionNumber ffxDofGetEffectVersion()
+ {
+     return FFX_SDK_MAKE_VERSION(FFX_DOF_VERSION_MAJOR, FFX_DOF_VERSION_MINOR, FFX_DOF_VERSION_PATCH);
+diff --git a/sdk/src/components/dof/ffx_dof_private.h b/sdk/src/components/dof/ffx_dof_private.h
+index 702ad55..ee1e592 100644
+--- a/sdk/src/components/dof/ffx_dof_private.h
++++ b/sdk/src/components/dof/ffx_dof_private.h
+@@ -52,6 +52,7 @@ typedef struct DofConstants
+     uint32_t    maxRings;
+     uint32_t    inputOutputFlags;
+     uint32_t    reserved;
++    uint32_t    reuse[4]; // flags(valid=1, skip=2), reduction source mip, hierarchy width, reserved
+ } DofConstants;
+ 
+ struct FfxDofContextDescription;
+@@ -73,9 +74,16 @@ typedef struct FfxDofContext_Private {
+     FfxPipelineState           pipelineDilate;
+     FfxPipelineState           pipelineBlur;
+     FfxPipelineState           pipelineComposite;
++    FfxPipelineState           pipelineCompareHistory;
++    FfxPipelineState           pipelineReduceDirty;
+ 
+     FfxResourceInternal srvResources[FFX_DOF_RESOURCE_IDENTIFIER_COUNT];
+     FfxResourceInternal uavResources[FFX_DOF_RESOURCE_IDENTIFIER_COUNT];
+     FfxConstantBuffer   constantBuffer;
++    bool reuseEnabled;
++    bool reuseHistoryValid;
++    uint32_t reuseHierarchyWidth;
++    uint32_t reuseHierarchyMipCount;
++    DofConstants reusePreviousConstants;
+ 
+ } FfxDofContext_Private;

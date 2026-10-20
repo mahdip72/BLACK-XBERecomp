@@ -15,6 +15,10 @@ void Tick(X86Context& ctx);
 bool SceneReady();
 uint32_t SceneFrame();
 uint64_t CameraSignature();
+// Readback is admitted only after settled warmup; successful completion gates epochs.
+bool ProofCaptureRequested();
+// Renderer calls before Present with that upcoming present ID and actual file-save result.
+void ProofCaptureCompleted(uint64_t present_id, bool succeeded);
 void Stop(const char* reason);
 
 struct Frame {

@@ -1,0 +1,18 @@
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h
+--- a/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_blur.h
+@@ -633,7 +633,13 @@
+ void FfxDofBlur(FfxUInt32x2 pixel, FfxUInt32x2 halfImageSize)
+ {
+-	FfxDofResetMaxTileRadius();
++	// Blur never reads this global; one invocation can preserve its final zero.
++#if FFX_HLSL
++	if (!FfxDofSingleGlobalReset() || all(pixel == 0))
++		FfxDofResetMaxTileRadius();
++#else
++	FfxDofResetMaxTileRadius();
++#endif
+ 
+ 	FfxDofInputState ins;
+ 	FfxDofTileClass tileClass = FfxDofPrepareTile(pixel, ins);
+ 	ins.imageSize = halfImageSize;

@@ -42,6 +42,9 @@ public:
 #if defined(BLACK_MISSION_BENCHMARK)
         FrameGpu,
 #endif
+        SdkCompareHistory,
+        SdkReduceDirty,
+        SdkWorldCompare,
         Count
     };
 
@@ -62,7 +65,8 @@ public:
     }
 
     static constexpr bool IsSdkSubpass(Stage stage) {
-        return stage >= Stage::SdkDownsampleDepth && stage <= Stage::SdkComposite;
+        return (stage >= Stage::SdkDownsampleDepth && stage <= Stage::SdkComposite) ||
+               stage == Stage::SdkCompareHistory || stage == Stage::SdkReduceDirty || stage == Stage::SdkWorldCompare;
     }
 
     // Valid, final-fence-completed native frame. Ticks retain queue-frequency
@@ -385,6 +389,7 @@ public:
 #if defined(BLACK_MISSION_BENCHMARK)
             , "GPU frame"
 #endif
+            , "SDK history compare", "SDK dirty reduction", "SDK world compare"
         };
         static_assert(sizeof(names) / sizeof(names[0]) == kStageCount);
         const uint32_t index = uint32_t(stage);

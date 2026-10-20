@@ -10,6 +10,7 @@
 #include <cmath>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <vector>
 
@@ -22,13 +23,47 @@
 
 namespace gpu {
 
+FidelityFxDofMode FidelityFxDofConfiguredMode() {
+    static const FidelityFxDofMode mode = [] {
+        char value[8]{};
+        if (GetEnvironmentVariableA("BLACK_DOF_WORLD_MODE", value, sizeof(value)) == 1) {
+            if (value[0] == '0') return FidelityFxDofMode::Materialized;
+            if (value[0] == '1') return FidelityFxDofMode::VirtualInput;
+            if (value[0] == '2') return FidelityFxDofMode::VirtualInputAndOutput;
+        }
+        return FidelityFxDofMode::VirtualInputAndOutput;
+    }();
+    return mode;
+}
+
+FidelityFxDofReuseMode FidelityFxDofConfiguredReuseMode() {
+    static const FidelityFxDofReuseMode mode = [] {
+        char value[8]{};
+        if (GetEnvironmentVariableA("BLACK_DOF_WORLD_REUSE", value, sizeof(value)) == 1) {
+            if (value[0] == '0') return FidelityFxDofReuseMode::Disabled;
+            if (value[0] == '1') return FidelityFxDofReuseMode::CompareOnly;
+            if (value[0] == '2') return FidelityFxDofReuseMode::Guarded;
+            if (value[0] == '3') return FidelityFxDofReuseMode::WholeWorld;
+            if (value[0] == '4') return FidelityFxDofReuseMode::WholeWorldMulti;
+        }
+        return FidelityFxDofConfiguredMode() == FidelityFxDofMode::VirtualInputAndOutput ?
+            FidelityFxDofReuseMode::WholeWorldMulti : FidelityFxDofReuseMode::Disabled;
+    }();
+    return mode;
+}
+
 struct FidelityFxDof::Impl {
     bool active = false;
     ID3D12Device* device = nullptr;
     uint32_t width = 0, height = 0;
     uint32_t rings = 4;
     bool disable_ring_merge = false;
+    FidelityFxDofMode mode = FidelityFxDofMode::Materialized;
+    bool single_global_reset = false;
+    FidelityFxDofReuseMode reuse = FidelityFxDofReuseMode::Disabled;
+    FidelityFxDofReuseMode requested_reuse = FidelityFxDofReuseMode::Disabled;
     char failure[160] = {};
+    char cache_fallback_reason[160] = {};
 #if BLACK_FIDELITYFX_DOF
     FfxDofContext context{};
     std::vector<uint8_t> scratch;
@@ -37,11 +72,46 @@ struct FidelityFxDof::Impl {
     bool backend_created = false;
     bool poisoned = false;
     const FidelityFxDofTiming* timing = nullptr;
-    // The pinned DoF component schedules exactly five jobs. Keep copies until Execute supplies its command list;
+    // Five original jobs plus compare and at most fourteen hierarchy reductions. Keep copies until Execute;
     // staged constant data remains SDK-owned, with the same lifetime as the original backend's shallow job copies.
-    std::array<FfxGpuJobDescription, 5> timed_jobs{};
+    std::array<FfxGpuJobDescription, 24> timed_jobs{};
     size_t timed_job_count = 0;
     bool timing_overflow = false;
+#if defined(FFX_DOF_WORLD_CACHE_VERSION)
+    ID3D12Resource* predicate_resource = nullptr;
+    bool predication_active = false;
+    static FfxErrorCode WorldPredicate(FfxCommandList list, FfxResource predicate, bool enable, void* data) {
+        auto& self = *static_cast<Impl*>(data);
+        auto* commands = reinterpret_cast<ID3D12GraphicsCommandList*>(list);
+        if (!commands) return FFX_ERROR_INVALID_POINTER;
+        if (enable) {
+            auto* resource = static_cast<ID3D12Resource*>(predicate.resource);
+            if (self.predication_active || !resource || predicate.state != FFX_RESOURCE_STATE_UNORDERED_ACCESS ||
+                resource->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || resource->GetDesc().Width < 8)
+                return FFX_ERROR_INVALID_ARGUMENT;
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PREDICATION};
+            commands->ResourceBarrier(1, &barrier);
+            commands->SetPredication(resource, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            self.predicate_resource = resource;
+            self.predication_active = true;
+        } else {
+            commands->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            if (self.predication_active) {
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition = {self.predicate_resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+                commands->ResourceBarrier(1, &barrier);
+                self.predication_active = false;
+                self.predicate_resource = nullptr;
+            }
+        }
+        return FFX_OK;
+    }
+#endif
     // The SDK copies FfxInterface and owns scratchBuffer. A scoped thread-local association preserves that ABI
     // while monitoring callbacks; separate render/test threads do not share error state.
     static inline thread_local Impl* calling = nullptr;
@@ -105,7 +175,12 @@ struct FidelityFxDof::Impl {
     static bool TimedPass(const FfxGpuJobDescription& job, FidelityFxDofPass& pass) {
         if (job.jobType != FFX_GPU_JOB_COMPUTE) return false;
         constexpr const wchar_t* labels[] = {L"DOF-DOWNSAMPLE-DEPTH", L"DOF-DOWNSAMPLE-COLOR",
-            L"DOF-DILATE", L"DOF-BLUR", L"DOF-COMPOSITE"};
+            L"DOF-DILATE", L"DOF-BLUR", L"DOF-COMPOSITE", L"DOF-COMPARE-HISTORY", L"DOF-REDUCE-DIRTY",
+            L"DOF-WORLD-COMPARE"};
+        if (std::wcscmp(job.jobLabel, L"DOF-BLUR-REUSE") == 0) {
+            pass = FidelityFxDofPass::Blur;
+            return true;
+        }
         for (size_t n = 0; n < std::size(labels); ++n) {
             if (std::wcscmp(job.jobLabel, labels[n]) == 0) {
                 pass = static_cast<FidelityFxDofPass>(n);
@@ -170,11 +245,93 @@ FidelityFxDof::FidelityFxDof() : impl_(std::make_unique<Impl>()) {}
 void FidelityFxDof::Swap(FidelityFxDof& other) noexcept { impl_.swap(other.impl_); }
 FidelityFxDof::~FidelityFxDof() { Reset(); }
 bool FidelityFxDof::Ready() const { return impl_->active; }
-bool FidelityFxDof::Matches(uint32_t width, uint32_t height, uint32_t rings, bool disable_ring_merge) const {
+FidelityFxDofReuseMode FidelityFxDof::EffectiveReuseMode() const { return impl_->reuse; }
+const char* FidelityFxDof::CacheFallbackReason() const { return impl_->cache_fallback_reason; }
+bool FidelityFxDof::Matches(uint32_t width, uint32_t height, uint32_t rings, bool disable_ring_merge,
+                           FidelityFxDofMode mode, bool single_global_reset, FidelityFxDofReuseMode reuse) const {
     return Ready() && impl_->width == width && impl_->height == height && impl_->rings == rings &&
-        impl_->disable_ring_merge == disable_ring_merge;
+        impl_->disable_ring_merge == disable_ring_merge && impl_->mode == mode &&
+        impl_->single_global_reset == single_global_reset && impl_->requested_reuse == reuse;
 }
 const char* FidelityFxDof::Failure() const { return impl_->failure; }
+
+void FidelityFxDof::InvalidateReuseHistory() {
+#if BLACK_FIDELITYFX_DOF && defined(FFX_DOF_EXACT_REUSE_VERSION)
+    if (Ready() && impl_->reuse != FidelityFxDofReuseMode::Disabled) {
+        Impl::Scope scope(impl_.get());
+        ffxDofContextInvalidateReuseHistory(&impl_->context);
+    }
+#endif
+}
+
+bool FidelityFxDof::GetWorldCacheDiagnostics(FidelityFxDofWorldCacheDiagnostics& diagnostics) const {
+    diagnostics = {};
+#if BLACK_FIDELITYFX_DOF && defined(FFX_DOF_WORLD_CACHE_VERSION)
+    if (!Ready() || impl_->poisoned || !FidelityFxDofUsesWorldCache(impl_->reuse)) return false;
+    Impl::Scope scope(impl_.get());
+    FfxDofWorldCacheDiagnostics source{};
+    if (ffxDofContextGetWorldCacheDiagnostics(&impl_->context, &source) != FFX_OK) return false;
+    const auto translate = [](const FfxResource& input, FidelityFxDofDiagnosticResource& output) {
+        if (!input.resource) return false;
+        output.resource = static_cast<ID3D12Resource*>(input.resource);
+        if (input.state == FFX_RESOURCE_STATE_UNORDERED_ACCESS)
+            output.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        else if (input.state == FFX_RESOURCE_STATE_COMPUTE_READ)
+            output.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        else return false;
+        return true;
+    };
+    FidelityFxDofWorldCacheDiagnostics result{};
+    if (!translate(source.predicate, result.predicate)) return false;
+    if (impl_->reuse != FidelityFxDofReuseMode::WholeWorldMulti &&
+        (!translate(source.historyColor, result.historyColor) || !translate(source.historyDepth, result.historyDepth) ||
+         !translate(source.previousUnsafe, result.previousUnsafe))) return false;
+    result.historyValid = source.historyValid;
+    result.generation = source.outputContentGeneration;
+    result.queueId = source.orderedQueueIdentity;
+    diagnostics = result;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FidelityFxDof::GetReuseDiagnostics(FidelityFxDofReuseDiagnostics& diagnostics) const {
+    diagnostics = {};
+#if BLACK_FIDELITYFX_DOF && defined(FFX_DOF_EXACT_REUSE_VERSION)
+    if (!Ready() || impl_->poisoned || (impl_->reuse != FidelityFxDofReuseMode::CompareOnly &&
+        impl_->reuse != FidelityFxDofReuseMode::Guarded)) return false;
+    Impl::Scope scope(impl_.get());
+    FfxDofReuseDiagnostics source{};
+    if (ffxDofContextGetReuseDiagnostics(&impl_->context, &source) != FFX_OK) return false;
+    auto translate = [](const FfxResource& resource, FidelityFxDofDiagnosticResource& target) {
+        if (!resource.resource) return false;
+        target.resource = static_cast<ID3D12Resource*>(resource.resource);
+        switch (resource.state) {
+        case FFX_RESOURCE_STATE_COMPUTE_READ:
+            target.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            return true;
+        case FFX_RESOURCE_STATE_UNORDERED_ACCESS:
+            target.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            return true;
+        default:
+            return false;
+        }
+    };
+    FidelityFxDofReuseDiagnostics result{};
+    if (!translate(source.dirtyHierarchy, result.dirtyHierarchy) ||
+        !translate(source.certificate, result.certificate) ||
+        !translate(source.nearColor, result.nearColor) || !translate(source.farColor, result.farColor)) return false;
+    result.groupWidth = source.groupWidth;
+    result.groupHeight = source.groupHeight;
+    result.hierarchyMipCount = source.hierarchyMipCount;
+    result.historyValid = source.historyValid;
+    diagnostics = result;
+    return true;
+#else
+    return false;
+#endif
+}
 
 void FidelityFxDof::Reset() {
 #if BLACK_FIDELITYFX_DOF
@@ -184,29 +341,97 @@ void FidelityFxDof::Reset() {
     impl_->scratch.clear();
     impl_->backend_created = impl_->poisoned = false;
     impl_->callback_error = FFX_OK;
+#if defined(FFX_DOF_WORLD_CACHE_VERSION)
+    impl_->predication_active = false;
+    impl_->predicate_resource = nullptr;
+#endif
 #endif
     impl_->active = false;
     impl_->device = nullptr;
     impl_->width = impl_->height = 0;
     impl_->rings = 4;
     impl_->disable_ring_merge = false;
+    impl_->mode = FidelityFxDofMode::Materialized;
+    impl_->single_global_reset = false;
+    impl_->reuse = FidelityFxDofReuseMode::Disabled;
+    impl_->requested_reuse = FidelityFxDofReuseMode::Disabled;
+    impl_->cache_fallback_reason[0] = 0;
 }
 
-bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t rings, bool disable_ring_merge) {
-    if (Matches(width, height, rings, disable_ring_merge) && impl_->device == device) return true;
+bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t rings, bool disable_ring_merge,
+                          FidelityFxDofMode mode, bool single_global_reset, FidelityFxDofReuseMode reuse) {
+    if (Matches(width, height, rings, disable_ring_merge, mode, single_global_reset, reuse) && impl_->device == device) return true;
+    if (CreateInternal(device, width, height, rings, disable_ring_merge, mode, single_global_reset, reuse)) return true;
+    if (!FidelityFxDofUsesWorldCache(reuse)) return false;
+    // Cache allocation/features are optional. Retry in the existing preparation worker,
+    // preserving the selected FidelityFX kernel, quality and storage layout.
+    std::array<char, sizeof(impl_->failure)> cache_failure{};
+    std::memcpy(cache_failure.data(), impl_->failure, cache_failure.size());
+    if (!CreateInternal(device, width, height, rings, disable_ring_merge, mode, single_global_reset,
+                        FidelityFxDofReuseMode::Disabled)) return false;
+    impl_->requested_reuse = reuse;
+    std::memcpy(impl_->cache_fallback_reason, cache_failure.data(), cache_failure.size());
+    return true;
+}
+
+bool FidelityFxDof::CreateInternal(ID3D12Device* device, uint32_t width, uint32_t height, uint32_t rings,
+                                  bool disable_ring_merge, FidelityFxDofMode mode, bool single_global_reset,
+                                  FidelityFxDofReuseMode reuse) {
     Reset();
-    if (!device || !width || !height || !rings || rings > 16) return impl_->Fail("invalid device, extent or ring count");
+    if (!device || !width || !height || !rings || rings > 16 ||
+        uint32_t(mode) > uint32_t(FidelityFxDofMode::VirtualInputAndOutput) ||
+        uint32_t(reuse) > uint32_t(FidelityFxDofReuseMode::WholeWorldMulti) ||
+        (mode != FidelityFxDofMode::Materialized && ((width | height) & 1u)))
+        return impl_->Fail("invalid device, extent, ring count or storage mode");
 #if BLACK_FIDELITYFX_DOF
+#if !defined(FFX_DOF_EXACT_REUSE_VERSION)
+    if (reuse != FidelityFxDofReuseMode::Disabled)
+        return impl_->Fail("exact reuse requires the candidate FidelityFX SDK patch");
+#endif
+#if !defined(FFX_DOF_WORLD_CACHE_VERSION)
+    if (FidelityFxDofUsesWorldCache(reuse))
+        return impl_->Fail("whole-world reuse requires the candidate FidelityFX SDK patch");
+#endif
+#if !defined(FFX_DOF_WORLD_MULTI_CACHE_VERSION)
+    if (reuse == FidelityFxDofReuseMode::WholeWorldMulti)
+        return impl_->Fail("multi-entry world reuse requires the candidate FidelityFX SDK patch");
+#endif
     D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_2};
     D3D12_FEATURE_DATA_D3D12_OPTIONS1 options{};
     if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ||
         model.HighestShaderModel < D3D_SHADER_MODEL_6_2 ||
         FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options, sizeof(options))) || !options.WaveOps)
         return impl_->Fail("FidelityFX requires Shader Model 6.2 and wave operations");
+    if (reuse != FidelityFxDofReuseMode::Disabled) {
+        // Histories use typed UAV loads; FP16 shader arithmetic support alone does not imply these formats.
+        constexpr DXGI_FORMAT history_formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_FLOAT,
+                                                   DXGI_FORMAT_R32_UINT};
+        for (DXGI_FORMAT format : history_formats) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+            constexpr auto required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+            if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+                (support.Support2 & required) != required)
+                return impl_->Fail("exact reuse requires typed UAV history format support");
+        }
+    }
     FfxDofContextDescription desc{};
     desc.resolution = {width, height};
     desc.quality = rings;
     desc.flags = disable_ring_merge ? FFX_DOF_DISABLE_RING_MERGE : 0;
+    if (mode != FidelityFxDofMode::Materialized) desc.flags |= FFX_DOF_VIRTUAL_INPUT_2X;
+    if (mode == FidelityFxDofMode::VirtualInputAndOutput) desc.flags |= FFX_DOF_NATIVE_OUTPUT_2X;
+    if (single_global_reset) desc.flags |= FFX_DOF_SINGLE_GLOBAL_RESET;
+#if defined(FFX_DOF_EXACT_REUSE_VERSION)
+    if (reuse == FidelityFxDofReuseMode::CompareOnly || reuse == FidelityFxDofReuseMode::Guarded)
+        desc.flags |= FFX_DOF_EXACT_REUSE_DIAGNOSTICS;
+    if (reuse == FidelityFxDofReuseMode::Guarded) desc.flags |= FFX_DOF_EXACT_REUSE_SKIP;
+#endif
+#if defined(FFX_DOF_WORLD_CACHE_VERSION)
+    if (FidelityFxDofUsesWorldCache(reuse)) desc.flags |= FFX_DOF_WORLD_CACHE;
+#endif
+#if defined(FFX_DOF_WORLD_MULTI_CACHE_VERSION)
+    if (reuse == FidelityFxDofReuseMode::WholeWorldMulti) desc.flags |= FFX_DOF_WORLD_CACHE_MULTI_ENTRY;
+#endif
     // UI limit: 30px at 1080p times 150% near/far strength. Actual radius/strength stays a dispatch input.
     desc.cocLimitFactor = 45.0f / 1080.0f;
     try { impl_->scratch.resize(ffxGetScratchMemorySizeDX12(1)); }
@@ -217,6 +442,12 @@ bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height
     impl_->Monitor(desc.backendInterface);
     Impl::Scope scope(impl_.get());
     result = impl_->Check("FidelityFX context creation failed", [&] { return ffxDofContextCreate(&impl_->context, &desc); });
+#if defined(FFX_DOF_WORLD_CACHE_VERSION)
+    if (result == FFX_OK && FidelityFxDofUsesWorldCache(reuse))
+        result = impl_->Check("FidelityFX predicate callback registration failed", [&] {
+            return ffxDofContextSetWorldCachePredicateCallback(&impl_->context, Impl::WorldPredicate, impl_.get());
+        });
+#endif
     if (result != FFX_OK || impl_->callback_error != FFX_OK) {
         // Version/interface errors occur before backend creation. Only a created backend is destroyable.
         if (impl_->backend_created) ffxDofContextDestroy(&impl_->context);
@@ -230,6 +461,10 @@ bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height
     impl_->height = height;
     impl_->rings = rings;
     impl_->disable_ring_merge = disable_ring_merge;
+    impl_->mode = mode;
+    impl_->single_global_reset = single_global_reset;
+    impl_->reuse = reuse;
+    impl_->requested_reuse = reuse;
     impl_->failure[0] = 0;
     return true;
 #else
@@ -239,22 +474,39 @@ bool FidelityFxDof::Create(ID3D12Device* device, uint32_t width, uint32_t height
 
 bool FidelityFxDof::Dispatch(ID3D12GraphicsCommandList* command_list, ID3D12Resource* color,
                             ID3D12Resource* encoded_depth, ID3D12Resource* output, float coc_bound,
-                            const FidelityFxDofTiming* timing) {
+                            const FidelityFxDofTiming* timing, const FidelityFxDofDispatchHistory* history) {
     if (!Ready() || !command_list || !color || !encoded_depth || !output || output == color ||
         output == encoded_depth || !std::isfinite(coc_bound) || coc_bound <= 0)
         return impl_->Fail("invalid FidelityFX dispatch");
     ID3D12Resource* inputs[] = {color, encoded_depth, output};
-    DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
+    const auto input_size = FidelityFxDofInputSize({impl_->width, impl_->height}, impl_->mode);
+    const auto output_size = FidelityFxDofOutputSize({impl_->width, impl_->height}, impl_->mode);
+    DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
+        impl_->mode == FidelityFxDofMode::VirtualInputAndOutput ?
+            DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT};
     for (uint32_t i = 0; i < 3; i++) {
         const auto desc = inputs[i]->GetDesc();
-        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != impl_->width ||
-            desc.Height != impl_->height || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 ||
+        const auto size = i == 2 ? output_size : input_size;
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != size.width ||
+            desc.Height != size.height || desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 ||
             desc.MipLevels != 1 || desc.Format != formats[i] ||
             (i == 2 && !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
             return impl_->Fail("incompatible FidelityFX input/output texture");
     }
 #if BLACK_FIDELITYFX_DOF
     if (impl_->poisoned) return impl_->Fail("FidelityFX context disabled after a failed dispatch");
+#if defined(FFX_DOF_WORLD_CACHE_VERSION)
+    if (FidelityFxDofUsesWorldCache(impl_->reuse))
+        command_list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    struct PredicateCleanup {
+        Impl* owner;
+        ID3D12GraphicsCommandList* commands;
+        ~PredicateCleanup() {
+            if (owner->predication_active)
+                Impl::WorldPredicate(ffxGetCommandListDX12(commands), {}, false, owner);
+        }
+    } cleanup{impl_.get(), command_list};
+#endif
     impl_->callback_error = FFX_OK;
     Impl::Scope scope(impl_.get());
     struct TimingScope {
@@ -275,6 +527,13 @@ bool FidelityFxDof::Dispatch(ID3D12GraphicsCommandList* command_list, ID3D12Reso
     // Normal depth ordering, near-positive CoC, in HALF-resolution pixels as required by the official kernels.
     desc.cocScale = -coc_bound;
     desc.cocBias = coc_bound * 0.5f;
+#if defined(FFX_DOF_WORLD_CACHE_VERSION)
+    if (history) {
+        desc.outputContentsPreserved = history->output_contents_preserved;
+        desc.outputContentGeneration = history->output_content_generation;
+        desc.orderedQueueIdentity = history->ordered_queue_identity;
+    }
+#endif
     FfxErrorCode result = ffxDofContextDispatch(&impl_->context, &desc);
     if (impl_->callback_error != FFX_OK || result != FFX_OK) {
         // Never execute stale queued jobs after a failure; retain the context until the caller's GPU fence.

@@ -2,7 +2,7 @@
 
 namespace gpu {
 
-// Input/output adapter only. Bokeh filtering is performed by the unmodified official FidelityFX kernels.
+// Input/output adapter. Optional SDK storage adaptations retain the official bokeh gather and reconstruction.
 inline constexpr char kFidelityFxDofHlsl[] = R"(
 cbuffer Dof : register(b1) { float4 zp; float4 vp; float4 tuning; };
 #ifdef FFX_DOF_PRESENT
@@ -24,12 +24,13 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
 
 #ifdef FFX_DOF_PRESENT
 float4 ffx_dof_present(float4 pos : SV_Position) : SV_Target {
-    int scale = tuning.w >= 1.5 ? 2 : 1;
-    int3 p = int3(int2(pos.xy) * scale, 0);
+    int inputScale = tuning.w >= 2.5 ? 1 : (tuning.w >= 1.5 ? 2 : 1);
+    int outputScale = tuning.w >= 3.5 ? 1 : (tuning.w >= 1.5 ? 2 : 1);
+    int3 p = int3(int2(pos.xy) * outputScale, 0);
     // Invalid original depth stays untouched. Destination alpha is protected by the RGB-only PSO mask.
-    if (prepared.Load(p).a <= 0) discard;
+    if (prepared.Load(int3(int2(pos.xy) * inputScale, 0)).a <= 0) discard;
     float3 rgb = image.Load(p).rgb;
-    if (scale == 2) {
+    if (outputScale == 2) {
         // A true area resolve preserves the native pixel footprint; point sampling would retain the fine-grid phase.
         rgb = (rgb + image.Load(p + int3(1, 0, 0)).rgb + image.Load(p + int3(0, 1, 0)).rgb +
             image.Load(p + int3(1, 1, 0)).rgb) * 0.25;
@@ -56,7 +57,7 @@ struct Prepared { float4 color : SV_Target0; float depth : SV_Target1; };
 Prepared ffx_dof_prepare(float4 pos : SV_Position) {
     // Exact 2x2 replication makes the SDK's half-resolution base image native-sized without smoothing focused
     // source detail. vp stays in native pixels; extend its edge over the full padded processing target.
-    float scale = tuning.w >= 1.5 ? 2 : 1;
+    float scale = tuning.w >= 2.5 ? 1 : (tuning.w >= 1.5 ? 2 : 1);
     int2 p = int2(clamp(pos.xy / scale, vp.xy, vp.xy + vp.zw - 1));
     float z = 1e7;
 #ifdef MS

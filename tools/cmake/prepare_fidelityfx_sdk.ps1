@@ -7,54 +7,55 @@ $Repository = 'https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git'
 $Tag = 'v1.1.4'
 $Commit = 'c6efa6bf7f2027b3ec94f28578bb5965eabb9e55'
 $PatchDirectory = Join-Path $PSScriptRoot '..\..\third_party\FidelityFX\patches'
-$PatchCmake = Join-Path $PatchDirectory '0001-fix-shader-output-list.patch'
-$PatchBit = Join-Path $PatchDirectory '0002-include-bit-for-popcount.patch'
-$PatchDofTiles = Join-Path $PatchDirectory '0003-fix-dof-tile-height.patch'
-$ExpectedPatchCmakeSha256 = 'C3CD383225C5E5FF2C0819A26388EA584B99A6039CAACF72F73424BFB0922250'
-$ExpectedPatchBitSha256 = 'C027744FC54453C31D0802AB5E9C669D302AB529EC883D061C296E5456395597'
-$ExpectedPatchDofTilesSha256 = 'AE28E56C63E34402855382B149A5EC2DF62CDE70EDBD5A102FB44863BFEB1861'
+$Patches = @(
+    @{ Name = '0001-fix-shader-output-list.patch'; Sha256 = 'C3CD383225C5E5FF2C0819A26388EA584B99A6039CAACF72F73424BFB0922250' },
+    @{ Name = '0002-include-bit-for-popcount.patch'; Sha256 = 'C027744FC54453C31D0802AB5E9C669D302AB529EC883D061C296E5456395597' },
+    @{ Name = '0003-fix-dof-tile-height.patch'; Sha256 = 'AE28E56C63E34402855382B149A5EC2DF62CDE70EDBD5A102FB44863BFEB1861' },
+    @{ Name = '0004-dof-virtual-input.patch'; Sha256 = '65979927648B8949D5705F0A22794B2ACF280052CB02CE537DB8FD7C62B67CA8' },
+    @{ Name = '0005-dof-fused-output.patch'; Sha256 = 'C60CE19CE963D12076D6BACEE38673DE75EC1CC210A90238992B753433DB61B9' },
+    @{ Name = '0006-dof-single-global-reset.patch'; Sha256 = '7877C9FB6EC53C4AF83A88B66C31DD49EA76CA27A4626BFE18DF3B2FCF215463' },
+    @{ Name = '0009-dof-exact-reuse-candidate.patch'; Sha256 = '25AD52424DA9A223B6850C27EBC7888EE1E6EF16E254FBBA0B66D0091231C1DA' },
+    @{ Name = '0012-dof-exact-world-cache.patch'; Sha256 = 'FE81D9A7BD265A51AB543ED20523F13E0F6268E21161CEA7FCA52384F3C263BF' },
+    @{ Name = '0014-dof-exact-world-multi-cache.patch'; Sha256 = '6B20BAC15A002E789019171461CE8785E0A735D486ECE915925428FEDF8FF727' }
+)
 $Destination = [System.IO.Path]::GetFullPath($Destination)
 $NewCheckout = $false
-$KnownPatchApplied = $false
 
 function Normalize-Text([string]$Text) {
     return $Text.Replace("`r`n", "`n").Replace("`r", "`n")
 }
 
-function Get-PinnedFileText([string]$Path) {
-    $GitSpec = "${Commit}:$Path"
-    $Blob = (git -C $Destination rev-parse $GitSpec).Trim()
+function Read-PinnedText([string]$GitDirectory, [string]$Tree, [string]$Path) {
+    $Blob = (git --git-dir=$GitDirectory rev-parse "${Tree}:$Path").Trim()
     if ($LASTEXITCODE -ne 0 -or $Blob -notmatch '^[0-9a-f]{40,64}$') {
-        throw "Could not resolve pinned SDK file $GitSpec."
+        throw "Could not resolve pinned SDK file ${Tree}:$Path."
     }
-
-    # Read the blob as one stream so PowerShell does not drop or invent a final
-    # newline while converting native command output into an array of lines.
-    $GitCommand = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    # Preserve the final newline when reading native output in PowerShell.
     $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $StartInfo.FileName = $GitCommand
-    $StartInfo.Arguments = '-C "' + $Destination + '" cat-file blob ' + $Blob
+    $StartInfo.FileName = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $StartInfo.Arguments = '--git-dir="' + $GitDirectory + '" cat-file blob ' + $Blob
     $StartInfo.UseShellExecute = $false
     $StartInfo.CreateNoWindow = $true
     $StartInfo.RedirectStandardOutput = $true
     $StartInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $Process = [System.Diagnostics.Process]::new()
     $Process.StartInfo = $StartInfo
-    if (-not $Process.Start()) { throw "Could not start Git to read $GitSpec." }
-    $PinnedText = $Process.StandardOutput.ReadToEnd()
-    $Process.WaitForExit()
-    if ($Process.ExitCode -ne 0) { throw "Could not read pinned SDK file $GitSpec." }
-    $Process.Dispose()
-    return $PinnedText
+    try {
+        if (-not $Process.Start()) { throw 'Could not start Git to read a pinned SDK file.' }
+        $Text = $Process.StandardOutput.ReadToEnd()
+        $Process.WaitForExit()
+        if ($Process.ExitCode -ne 0) { throw "Could not read pinned SDK file $Path." }
+        return $Text
+    } finally {
+        $Process.Dispose()
+    }
 }
 
-$ActualPatchCmakeSha256 = (Get-FileHash -LiteralPath $PatchCmake -Algorithm SHA256).Hash
-$ActualPatchBitSha256 = (Get-FileHash -LiteralPath $PatchBit -Algorithm SHA256).Hash
-$ActualPatchDofTilesSha256 = (Get-FileHash -LiteralPath $PatchDofTiles -Algorithm SHA256).Hash
-if ($ActualPatchCmakeSha256 -ne $ExpectedPatchCmakeSha256 -or
-    $ActualPatchBitSha256 -ne $ExpectedPatchBitSha256 -or
-    $ActualPatchDofTilesSha256 -ne $ExpectedPatchDofTilesSha256) {
-    throw 'Unexpected FidelityFX SDK build patch hash.'
+foreach ($Patch in $Patches) {
+    $Patch.Path = [System.IO.Path]::GetFullPath((Join-Path $PatchDirectory $Patch.Name))
+    if ((Get-FileHash -LiteralPath $Patch.Path -Algorithm SHA256).Hash -ne $Patch.Sha256) {
+        throw "Unexpected FidelityFX SDK patch hash: $($Patch.Name)."
+    }
 }
 
 if (-not (Test-Path (Join-Path $Destination '.git'))) {
@@ -71,60 +72,107 @@ $ActualOrigin = (git -C $Destination remote get-url origin).Trim()
 if ($LASTEXITCODE -ne 0 -or $ActualOrigin -ne $Repository) {
     throw "Unexpected FidelityFX remote at $Destination : $ActualOrigin"
 }
-
-if (-not $NewCheckout) {
-    $Status = @(git -C $Destination status --porcelain=v1)
-    if ($LASTEXITCODE -ne 0) { throw "Could not inspect the FidelityFX checkout at $Destination." }
-    if ($Status.Count -gt 0) {
-        $ChangedFiles = @(git -C $Destination diff --name-only)
-        if ($LASTEXITCODE -ne 0) { throw "Could not inspect FidelityFX worktree changes at $Destination." }
-        $StagedFiles = @(git -C $Destination diff --cached --name-only)
-        if ($LASTEXITCODE -ne 0) { throw "Could not inspect staged FidelityFX changes at $Destination." }
-        $UntrackedFiles = @(git -C $Destination ls-files --others --exclude-standard)
-        if ($LASTEXITCODE -ne 0) { throw "Could not inspect staged FidelityFX changes at $Destination." }
-        $ShaderCmake = Join-Path $Destination 'sdk\include\FidelityFX\gpu\CMakeCompileShaders.txt'
-        $ShaderText = [System.IO.File]::ReadAllText($ShaderCmake)
-        $UtilHeader = Join-Path $Destination 'sdk\include\FidelityFX\host\ffx_util.h'
-        $UtilText = [System.IO.File]::ReadAllText($UtilHeader)
-        $ShaderPath = 'sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt'
-        $UtilPath = 'sdk/include/FidelityFX/host/ffx_util.h'
-        $DofPath = 'sdk/src/components/dof/ffx_dof.cpp'
-        $PinnedShader = Get-PinnedFileText $ShaderPath
-        $PinnedUtil = Get-PinnedFileText $UtilPath
-        $PinnedDof = Get-PinnedFileText $DofPath
-        $DofSource = [System.IO.File]::ReadAllText((Join-Path $Destination 'sdk\src\components\dof\ffx_dof.cpp'))
-        $OriginalLine = 'set(${PERMUTATION_OUTPUTS} ${PERMUTATION_OUTPUTS} PARENT_SCOPE)'
-        $ExpectedLine = 'set(${PERMUTATION_OUTPUTS} ${${PERMUTATION_OUTPUTS}} PARENT_SCOPE)'
-        $UtilInclude = '#include <FidelityFX/host/ffx_types.h>'
-        if ([regex]::Matches($PinnedShader, [regex]::Escape($OriginalLine)).Count -eq 1 -and
-            [regex]::Matches($PinnedUtil, [regex]::Escape($UtilInclude)).Count -eq 1 -and
-            -not $PinnedUtil.Contains('#include <bit>') -and
-            [regex]::Matches($PinnedDof, [regex]::Escape('uint32_t tileHeight = (halfHeight + 4) / 4;')).Count -eq 1) {
-            $ExpectedShader = $PinnedShader.Replace($OriginalLine, $ExpectedLine)
-            $ExpectedUtil = $PinnedUtil.Replace($UtilInclude, '#include <bit>' + "`n" + $UtilInclude)
-            $ExpectedDof = $PinnedDof.Replace('uint32_t tileHeight = (halfHeight + 4) / 4;', 'uint32_t tileHeight = (halfHeight + 3) / 4;')
-        } else {
-            throw 'Pinned FidelityFX SDK files do not match the expected patch anchors.'
-        }
-        if ($ChangedFiles.Count -eq 3 -and
-            $ChangedFiles -contains $ShaderPath -and
-            $ChangedFiles -contains $UtilPath -and
-            $ChangedFiles -contains $DofPath -and
-            $StagedFiles.Count -eq 0 -and
-            $UntrackedFiles.Count -eq 0 -and
-            (Normalize-Text $ShaderText) -ceq $ExpectedShader -and
-            (Normalize-Text $UtilText) -ceq $ExpectedUtil -and
-            (Normalize-Text $DofSource) -ceq $ExpectedDof) {
-            $KnownPatchApplied = $true
-        } else {
-            throw "Refusing to change a modified FidelityFX checkout at $Destination."
-        }
-    }
-}
-
 $ActualHead = (git -C $Destination rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $ActualHead -ne $Commit) {
     throw "Expected an existing checkout at $Commit, got $ActualHead. Prepare a separate fresh dependency directory."
+}
+
+if (-not $NewCheckout) {
+    $StagedFiles = @(git -C $Destination diff --cached --name-only)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect staged FidelityFX changes.' }
+    $UntrackedFiles = @(git -C $Destination ls-files --others --exclude-standard)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect untracked FidelityFX files.' }
+    if ($StagedFiles.Count -gt 0) {
+        throw "Refusing to change a FidelityFX checkout with staged files at $Destination."
+    }
+}
+
+# Build expected states in an isolated object store and index. The dependency's
+# objects are read-only alternates; synthesis never writes its index or files.
+$ScratchRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+$Scratch = Join-Path $ScratchRoot ('black-fidelityfx-sdk-' + [guid]::NewGuid().ToString('N'))
+try {
+    git init --bare --quiet $Scratch
+    if ($LASTEXITCODE -ne 0) { throw 'Could not initialize temporary SDK patch index.' }
+    # A new filtered clone may lack blobs. Fetch them into scratch, never into
+    # the existing dependency while deciding whether its changes are trusted.
+    git --git-dir=$Scratch config remote.origin.url $Repository
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure temporary SDK origin.' }
+    git --git-dir=$Scratch config remote.origin.promisor true
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure temporary SDK blob fetching.' }
+    git --git-dir=$Scratch config remote.origin.partialclonefilter blob:none
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure temporary SDK blob filter.' }
+    $Objects = (git -C $Destination rev-parse --path-format=absolute --git-path objects).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Could not locate pinned SDK objects.' }
+    [System.IO.File]::WriteAllText((Join-Path $Scratch 'objects/info/alternates'),
+        $Objects.Replace('\', '/') + "`n", [System.Text.UTF8Encoding]::new($false))
+    git --git-dir=$Scratch read-tree $Commit
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read pinned SDK tree.' }
+    $KnownTrees = @($Commit)
+    for ($Index = 0; $Index -lt $Patches.Count; ++$Index) {
+        git --git-dir=$Scratch -c core.autocrlf=false apply --cached --unidiff-zero --whitespace=nowarn $Patches[$Index].Path
+        if ($LASTEXITCODE -ne 0) { throw "Could not synthesize SDK patch $($Patches[$Index].Name)." }
+        if ($Index -eq 2 -or $Index -eq 5 -or $Index -eq 6 -or $Index -eq 7 -or $Index -eq 8) {
+            $Tree = (git --git-dir=$Scratch write-tree --missing-ok).Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Could not write expected SDK tree.' }
+            $KnownTrees += $Tree
+        }
+    }
+    $FinalTree = $KnownTrees[-1]
+    $PatchPaths = @(git --git-dir=$Scratch diff-tree --no-commit-id --name-only -r $Commit $FinalTree)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate patched SDK files.' }
+    $FinalText = @{}
+    foreach ($Path in $PatchPaths) {
+        $FinalText[$Path] = Read-PinnedText $Scratch $FinalTree $Path
+    }
+
+    if (-not $NewCheckout) {
+        $ChangedFiles = @(git -C $Destination diff --name-only --no-renames)
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect FidelityFX worktree changes.' }
+        # New patch-owned files remain untracked in the SDK checkout. Accept
+        # only an exact known state's paths and full contents, including them.
+        $ChangedFiles = @(@($ChangedFiles) + @($UntrackedFiles) | Sort-Object -Unique -CaseSensitive)
+        $KnownState = $false
+        foreach ($Tree in $KnownTrees) {
+            $ExpectedPaths = @(git --git-dir=$Scratch diff-tree --no-commit-id --name-only -r $Commit $Tree)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect an expected SDK tree.' }
+            $ExpectedPaths = @($ExpectedPaths | Sort-Object -Unique -CaseSensitive)
+            if (($ChangedFiles -join "`n") -cne ($ExpectedPaths -join "`n")) { continue }
+            $TreePaths = @(git --git-dir=$Scratch ls-tree -r --name-only $Tree -- $PatchPaths)
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect expected SDK file presence.' }
+            $Matches = $true
+            foreach ($Path in $PatchPaths) {
+                $File = Join-Path $Destination $Path
+                if ($TreePaths -cnotcontains $Path) {
+                    if (Test-Path -LiteralPath $File) { $Matches = $false; break }
+                    continue
+                }
+                if (-not (Test-Path -LiteralPath $File -PathType Leaf) -or
+                    (Normalize-Text ([System.IO.File]::ReadAllText($File))) -cne
+                    (Read-PinnedText $Scratch $Tree $Path)) {
+                    $Matches = $false
+                    break
+                }
+            }
+            if ($Matches) {
+                $KnownState = $true
+                break
+            }
+        }
+        if (-not $KnownState) {
+            throw "Refusing to change a modified FidelityFX checkout at $Destination."
+        }
+    }
+} finally {
+    # Delete only the uniquely named directory created above, within OS temp.
+    $ResolvedScratch = [System.IO.Path]::GetFullPath($Scratch)
+    if (-not $ResolvedScratch.StartsWith($ScratchRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Leaf $ResolvedScratch) -notmatch '^black-fidelityfx-sdk-[0-9a-f]{32}$') {
+        throw 'Refusing to remove an unexpected SDK scratch path.'
+    }
+    if (Test-Path -LiteralPath $ResolvedScratch) {
+        Remove-Item -LiteralPath $ResolvedScratch -Recurse -Force
+    }
 }
 
 git -C $Destination sparse-checkout init --no-cone
@@ -167,32 +215,10 @@ if (-not (Test-Path (Join-Path $Destination 'sdk\src\backends\dx12\shaders\dof\f
     throw 'The sparse SDK checkout is missing DoF shaders.'
 }
 
-if (-not $KnownPatchApplied) {
-    $ShaderCmake = Join-Path $Destination 'sdk\include\FidelityFX\gpu\CMakeCompileShaders.txt'
-    $ShaderText = [System.IO.File]::ReadAllText($ShaderCmake)
-    $OriginalLine = 'set(${PERMUTATION_OUTPUTS} ${PERMUTATION_OUTPUTS} PARENT_SCOPE)'
-    $ExpectedLine = 'set(${PERMUTATION_OUTPUTS} ${${PERMUTATION_OUTPUTS}} PARENT_SCOPE)'
-    if (-not $ShaderText.Contains($OriginalLine)) { throw 'Unexpected upstream shader output CMake function.' }
-    [System.IO.File]::WriteAllText($ShaderCmake, $ShaderText.Replace($OriginalLine, $ExpectedLine),
-        [System.Text.UTF8Encoding]::new($false))
-
-    $UtilHeader = Join-Path $Destination 'sdk\include\FidelityFX\host\ffx_util.h'
-    $UtilText = [System.IO.File]::ReadAllText($UtilHeader)
-    $UtilInclude = '#include <FidelityFX/host/ffx_types.h>'
-    if (-not $UtilText.Contains($UtilInclude)) { throw 'Unexpected FidelityFX utility header.' }
-    [System.IO.File]::WriteAllText($UtilHeader,
-        $UtilText.Replace($UtilInclude, '#include <bit>' + "`r`n" + $UtilInclude),
-        [System.Text.UTF8Encoding]::new($false))
-
-    $DofSourcePath = Join-Path $Destination 'sdk\src\components\dof\ffx_dof.cpp'
-    $DofSource = [System.IO.File]::ReadAllText($DofSourcePath)
-    $OriginalTileHeight = 'uint32_t tileHeight = (halfHeight + 4) / 4;'
-    $ExpectedTileHeight = 'uint32_t tileHeight = (halfHeight + 3) / 4;'
-    if ([regex]::Matches($DofSource, [regex]::Escape($OriginalTileHeight)).Count -ne 1) {
-        throw 'Unexpected FidelityFX DoF tile-height expression.'
-    }
-    [System.IO.File]::WriteAllText($DofSourcePath, $DofSource.Replace($OriginalTileHeight, $ExpectedTileHeight),
+# All existing changes were verified before checkout or sparse configuration.
+foreach ($Path in $PatchPaths) {
+    [System.IO.File]::WriteAllText((Join-Path $Destination $Path), $FinalText[$Path],
         [System.Text.UTF8Encoding]::new($false))
 }
 
-Write-Output "FidelityFX SDK $Tag prepared at $Destination ($ActualCommit)."
+Write-Output "FidelityFX SDK $Tag prepared at $Destination ($ActualCommit; patches 0001-0006, 0009, 0012, 0014)."

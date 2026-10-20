@@ -1,0 +1,73 @@
+diff --git a/sdk/include/FidelityFX/gpu/dof/ffx_dof_composite.h b/sdk/include/FidelityFX/gpu/dof/ffx_dof_composite.h
+index c3402cc..530dde7 100644
+--- a/sdk/include/FidelityFX/gpu/dof/ffx_dof_composite.h
++++ b/sdk/include/FidelityFX/gpu/dof/ffx_dof_composite.h
+@@ -304,9 +304,40 @@ FfxFloat32x2 FfxDofGetTileRadius(FfxUInt32x2 group)
+ 	return FfxFloat32x2(near, far);
+ }
+ 
++#if FFX_HLSL
++void FfxDofStoreNativeOutputQuad(FfxUInt32x2 coord, FfxFloat32x4 colA, FfxFloat32x4 colB, FfxFloat32x4 colC, FfxFloat32x4 colD)
++{
++	// Match four RGBA16F UAV stores followed by BLACK's native area resolve.
++	// A/B/C/D are top-left/top-right/bottom-right/bottom-left before swizzling.
++	FfxFloat32x4 a = f16tof32(f32tof16(colA));
++	FfxFloat32x4 b = f16tof32(f32tof16(colB));
++	FfxFloat32x4 c = f16tof32(f32tof16(colC));
++	FfxFloat32x4 d = f16tof32(f32tof16(colD));
++	precise FfxFloat32x4 resolved = a + b;
++	resolved = resolved + d;
++	resolved = resolved + c;
++	// The native output UAV must be RGBA32F to avoid rounding the mean again.
++	FfxDofStoreOutput(coord / 2, resolved * 0.25f);
++}
++#endif
++
+ void FfxDofCombineSharpOnly(FfxUInt32x2 group, FfxUInt32x2 thread)
+ {
+ #if !defined(FFX_DOF_OPTION_COMBINE_IN_PLACE) || !FFX_DOF_OPTION_COMBINE_IN_PLACE
++#if FFX_HLSL
++	if (FfxDofNativeOutput2x())
++	{
++		// The original sharp path assigns scattered pixels to each lane.
++		// Instead assign the same contiguous virtual 2x2 as the blurred paths.
++		FfxUInt32x2 coord = 2 * (8 * group + thread);
++		FfxDofStoreNativeOutputQuad(coord,
++			FfxDofLoadFullInput(coord),
++			FfxDofLoadFullInput(coord + FfxUInt32x2(1, 0)),
++			FfxDofLoadFullInput(coord + FfxUInt32x2(1, 1)),
++			FfxDofLoadFullInput(coord + FfxUInt32x2(0, 1)));
++		return;
++	}
++#endif
+ 	FfxUInt32x2 base = 16 * group;
+ 	FfxDofStoreOutput(base + thread + FfxUInt32x2(0, 0), FfxDofLoadFullInput(base + thread + FfxUInt32x2(0, 0)));
+ 	FfxDofStoreOutput(base + thread + FfxUInt32x2(8, 0), FfxDofLoadFullInput(base + thread + FfxUInt32x2(8, 0)));
+@@ -489,6 +520,13 @@ void FfxDofCombineFarOnly(FfxUInt32x2 id, FfxUInt32x2 gtID, FfxUInt32x2 gid, Ffx
+ 	FfxUInt32x2 coordD = coord;
+ 	FfxHalfOpt4 colD = FfxDofFinalCombineColors(coord, relCoord, ffBL, FfxHalfOpt4(0, 0, 0, 0), FfxHalfOpt(0));
+ 
++#if FFX_HLSL
++	if (FfxDofNativeOutput2x())
++	{
++		FfxDofStoreNativeOutputQuad(coordA, colA, colB, colC, colD);
++		return;
++	}
++#endif
+     // TODO: Navi3 should make swizzling unnecessary because it supports write-combining clauses
+ 	FfxDofSwizQuad(colA, colB, colC, colD);
+ 	FfxDofSwizQuad(coordA, coordB, coordC, coordD);
+@@ -587,6 +625,13 @@ void FfxDofCombineAll(FfxUInt32x2 id, FfxUInt32x2 gtID, FfxUInt32x2 gid, FfxUInt
+ 	FfxUInt32x2 coordD = coord;
+ 	FfxHalfOpt4 colD = FfxDofFinalCombineColors(coord, relCoord, ffBL, nfBL, fgMinW);
+ 
++#if FFX_HLSL
++	if (FfxDofNativeOutput2x())
++	{
++		FfxDofStoreNativeOutputQuad(coordA, colA, colB, colC, colD);
++		return;
++	}
++#endif
+ 	FfxDofSwizQuad(colA, colB, colC, colD);
+ 	FfxDofSwizQuad(coordA, coordB, coordC, coordD);
+ 

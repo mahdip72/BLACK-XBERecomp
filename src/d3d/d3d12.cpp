@@ -1007,7 +1007,7 @@ private:
             kDofLevels * kDofTargets + kDofLayerViews + kDofTargets + 2 + index, rtv_inc_);
     }
     bool FidelityFxDepthOfField(Target& rt, Target& ds, const float c[12], const D3D12_RECT& rect, bool cinematic);
-    bool EnsureFidelityFxTargets(uint32_t w, uint32_t h);
+    bool EnsureFidelityFxTargets(uint32_t w, uint32_t h, FidelityFxDofMode mode);
     void FidelityFxViews(uint32_t slot, ID3D12Resource* first, DXGI_FORMAT first_format, bool first_ms,
                         ID3D12Resource* second, DXGI_FORMAT second_format);
     D3D12_CPU_DESCRIPTOR_HANDLE FidelityFxView(uint32_t target) {
@@ -1161,8 +1161,8 @@ private:
         uint32_t h;
         float mul = 1;
     };
-    void CapSave(const CapImage& img, const char* name);
-    void CapSave(Target& t, const char* name, float mul);
+    bool CapSave(const CapImage& img, const char* name);
+    bool CapSave(Target& t, const char* name, float mul);
     void CapStep(const Surface& rt);
     // Clear's arguments past the state
     struct ClearArgs {
@@ -1224,11 +1224,12 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
     std::unique_ptr<DofPipelineCache> dof_pipelines_;
     DofGpuTiming dof_timing_;
+    uint64_t ffx_dof_reuse_frame_ = UINT64_MAX;
+    uint64_t ffx_dof_output_generation_ = 0;
 #if defined(BLACK_MISSION_BENCHMARK)
     DofGpuTiming::Scope benchmark_gpu_scope_;
     bool benchmark_gpu_scope_open_ = false;
     bool benchmark_proof_saved_ = false;
-    uint32_t benchmark_scene_presents_ = 0;
     PerfClock::time_point benchmark_present_clock_ = PerfClock::now();
 #endif
     // At most one bounded report can be in flight. Disk work never blocks the render
@@ -2326,13 +2327,24 @@ D3D12Backend::~D3D12Backend() {
     if (ffx_dof_.Ready()) ffx_dof_.Reset();
 }
 
-bool D3D12Backend::EnsureFidelityFxTargets(uint32_t w, uint32_t h) {
-    if (ffx_dof_targets_[0] && ffx_dof_targets_[0]->GetDesc().Width == w &&
-        ffx_dof_targets_[0]->GetDesc().Height == h) return true;
+bool D3D12Backend::EnsureFidelityFxTargets(uint32_t w, uint32_t h, FidelityFxDofMode mode) {
+    const auto input_size = FidelityFxDofInputSize({w, h}, mode);
+    const auto output_size = FidelityFxDofOutputSize({w, h}, mode);
+    const DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
+        mode == FidelityFxDofMode::VirtualInputAndOutput ?
+            DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT};
+    bool matches = true;
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto size = i == 2 ? output_size : input_size;
+        const auto desc = ffx_dof_targets_[i] ? ffx_dof_targets_[i]->GetDesc() : D3D12_RESOURCE_DESC{};
+        matches &= desc.Width == size.width && desc.Height == size.height && desc.Format == formats[i];
+    }
+    if (matches) return true;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     ComPtr<ID3D12Resource> targets[3];
     for (uint32_t i = 0; i < 3; i++) {
-        auto td = Texture2DDesc(i == 1 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT, w, h);
+        const auto size = i == 2 ? output_size : input_size;
+        auto td = Texture2DDesc(formats[i], size.width, size.height);
         td.Flags = i == 2 ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         auto state = i == 2 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_RENDER_TARGET;
         if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, state, nullptr,
@@ -2344,6 +2356,7 @@ bool D3D12Backend::EnsureFidelityFxTargets(uint32_t w, uint32_t h) {
         ffx_dof_states_[i] = i == 2 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_RENDER_TARGET;
         if (i < 2) dev_->CreateRenderTargetView(ffx_dof_targets_[i].Get(), nullptr, FidelityFxView(i));
     }
+    ++ffx_dof_output_generation_;
     return true;
 }
 
@@ -2375,9 +2388,12 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     };
     const uint32_t scale = cinematic ? 2 : 1;
     const uint32_t rings = cinematic ? 8 : 4;
+    const auto mode = cinematic ? FidelityFxDofConfiguredMode() : FidelityFxDofMode::Materialized;
+    const auto reuse = cinematic ? FidelityFxDofConfiguredReuseMode() : FidelityFxDofReuseMode::Disabled;
     const auto processing = FidelityFxDofProcessingSize(rt.w, rt.h, scale);
     if (!processing.width || !processing.height) return fail("unsupported processing extent");
-    if (!ffx_dof_.Matches(processing.width, processing.height, rings, cinematic)) {
+    if (!ffx_dof_.Matches(processing.width, processing.height, rings, cinematic, mode,
+                          mode != FidelityFxDofMode::Materialized, reuse)) {
         // Rebuild cooperatively after the next native Present, never inside a scene draw.
         dof_prime_signature_ = 0;
         dof_prepared_ = false;
@@ -2389,7 +2405,7 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     // Unusual format/sample combinations are prepared asynchronously. Do not permanently disable
     // this profile while a pipeline is pending; the Balanced/native path can cover this frame.
     if (!prepare || !present) return false;
-    if (!EnsureFidelityFxTargets(processing.width, processing.height)) return fail("adapter target allocation failed");
+    if (!EnsureFidelityFxTargets(processing.width, processing.height, mode)) return fail("adapter target allocation failed");
     auto prepare_timing = dof_timing_.Measure(DofGpuTiming::Stage::ScenePrepare, cl_.Get());
     ID3D12Resource* source = Feedback(rt);
     if (!source) return fail("scene snapshot allocation failed");
@@ -2399,7 +2415,13 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     // viewport coordinates are unchanged, and the final 2x2 resolve returns the same visible blur radius.
     c[3] *= float(scale);
     c[10] = bound * float(scale);
-    c[11] = float(scale);
+    c[11] = FidelityFxDofAdapterLayout(scale, mode);
+    // Changes to upstream optics/projection are captured in the exact stored
+    // inputs and effective SDK constants. Only continuity breaks require a
+    // separate host invalidation; comparing upstream floats would reject safe hits.
+    if (reuse != FidelityFxDofReuseMode::Disabled &&
+        (ffx_dof_reuse_frame_ == UINT64_MAX || ffx_dof_reuse_frame_ + 1 != frame_))
+        ffx_dof_.InvalidateReuseHistory();
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, c, sizeof(c));
     bound_rt_ = bound_ds_ = nullptr;
@@ -2411,7 +2433,8 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     D3D12_CPU_DESCRIPTOR_HANDLE views[2] = {FidelityFxView(0), FidelityFxView(1)};
     cl_->OMSetRenderTargets(2, views, FALSE, nullptr);
     // The shader clamps to the logical viewport in c[4..7], extending its edge through all padding.
-    SetFullViewport(processing.width, processing.height);
+    const auto input_size = FidelityFxDofInputSize(processing, mode);
+    SetFullViewport(input_size.width, input_size.height);
     DrawFullScreen(prepare, cb.gpu, prepare_slot);
     Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     for (uint32_t i = 0; i < 2; i++)
@@ -2435,12 +2458,25 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
             case FidelityFxDofPass::Dilate: stage = DofGpuTiming::Stage::SdkDilate; break;
             case FidelityFxDofPass::Blur: stage = DofGpuTiming::Stage::SdkBlur; break;
             case FidelityFxDofPass::Composite: stage = DofGpuTiming::Stage::SdkComposite; break;
+            case FidelityFxDofPass::CompareHistory: stage = DofGpuTiming::Stage::SdkCompareHistory; break;
+            case FidelityFxDofPass::ReduceDirty: stage = DofGpuTiming::Stage::SdkReduceDirty; break;
+            case FidelityFxDofPass::WorldCompare: stage = DofGpuTiming::Stage::SdkWorldCompare; break;
             default: return;
             }
             current.pass = current.timer->Measure(stage, list);
         }};
+    // The engine retains this output allocation, reads it for composition, and
+    // never overwrites it between SDK dispatches. Replacement increments its epoch.
+    const FidelityFxDofDispatchHistory history{uint64_t(reinterpret_cast<uintptr_t>(queue_.Get())),
+                                               ffx_dof_output_generation_, true};
     bool dispatched = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
-        ffx_dof_targets_[2].Get(), c[10], dof_timing_.Recording() ? &sdk_marks : nullptr);
+        ffx_dof_targets_[2].Get(), c[10], dof_timing_.Recording() ? &sdk_marks : nullptr, &history);
+    if (dispatched) {
+        ffx_dof_reuse_frame_ = frame_;
+    } else {
+        ffx_dof_reuse_frame_ = UINT64_MAX;
+        ffx_dof_.InvalidateReuseHistory();
+    }
     sdk_pass.pass.End();
     sdk_timing.End();
     // The SDK switches descriptor heaps and compute root signatures. Its external textures return to their
@@ -2451,7 +2487,7 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(ffx_dof_targets_[0].Get(), ffx_dof_states_[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     uint32_t present_slot = AllocSrvSlots(4);
-    FidelityFxViews(present_slot, ffx_dof_targets_[2].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+    FidelityFxViews(present_slot, ffx_dof_targets_[2].Get(), ffx_dof_targets_[2]->GetDesc().Format, false,
                     ffx_dof_targets_[0].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT);
     Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     SetBlitTarget(Cpu(rtv_heap_.Get(), rt.view, rtv_inc_), rt.w, rt.h);
@@ -2460,10 +2496,13 @@ bool D3D12Backend::FidelityFxDepthOfField(Target& rt, Target& ds, const float co
     rt.drawn = true;
     if (!ffx_dof_reported_) {
         ffx_dof_reported_ = true;
+        const auto output_size = FidelityFxDofOutputSize(processing, mode);
         LOGR("Official FidelityFX SDK 1.1.4 DOF %s active: %ux%u, processing %ux%u (%ux), %ux MSAA, "
-             "focus %.2f world units, native radius %.3fpx, near %.2f far %.2f, rings %u, ring merge %s",
+             "focus %.2f world units, native radius %.3fpx, near %.2f far %.2f, rings %u, ring merge %s; "
+             "storage mode %u, input %ux%u, output %ux%u",
              cinematic ? "Cinematic" : "Standard", rt.w, rt.h, processing.width, processing.height, scale,
-             samples, c[2], constants[3], c[8], c[9], rings, cinematic ? "off" : "on");
+             samples, c[2], constants[3], c[8], c[9], rings, cinematic ? "off" : "on", uint32_t(mode),
+             input_size.width, input_size.height, output_size.width, output_size.height);
     }
     return true;
 }
@@ -3760,9 +3799,11 @@ void D3D12Backend::PrimeDepthOfField() {
     const auto& options = game::Opt();
     const bool enabled = options.reload_blur && options.modern_reload_dof;
     const uint32_t profile = options.fidelityfx_dof ? (options.dof_cinematic_quality ? 2u : 1u) : 0u;
+    const auto world_mode = profile == 2 ? FidelityFxDofConfiguredMode() : FidelityFxDofMode::Materialized;
+    const auto world_reuse = profile == 2 ? FidelityFxDofConfiguredReuseMode() : FidelityFxDofReuseMode::Disabled;
     const uint32_t width = std::max(1u, uint32_t(std::lround(guest_w_ * scale_)));
     const uint32_t height = std::max(1u, uint32_t(std::lround(guest_h_ * scale_)));
-    const uint32_t key[] = {width, height, msaa_, profile, uint32_t(enabled)};
+    const uint32_t key[] = {width, height, msaa_, profile, uint32_t(enabled), uint32_t(world_mode), uint32_t(world_reuse)};
     const uint64_t signature = Hash(key, sizeof(key));
     if (dof_prime_signature_ != signature) {
         dof_prime_signature_ = signature;
@@ -3805,12 +3846,13 @@ void D3D12Backend::PrimeDepthOfField() {
             const bool cinematic = profile == 2;
             const auto extent = FidelityFxDofProcessingSize(width, height, cinematic ? 2 : 1);
             dof_cpu_signature_ = signature;
-            dof_cpu_preparation_ = std::async(std::launch::async, [device, extent, profile, cinematic] {
+            dof_cpu_preparation_ = std::async(std::launch::async, [device, extent, profile, cinematic, world_mode, world_reuse] {
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                 DofPreparedCpu result;
                 if (profile && extent.width && extent.height) {
                     result.context = std::make_unique<FidelityFxDof>();
-                    result.context->Create(device.Get(), extent.width, extent.height, cinematic ? 8 : 4, cinematic);
+                    result.context->Create(device.Get(), extent.width, extent.height, cinematic ? 8 : 4, cinematic,
+                                           world_mode, world_mode != FidelityFxDofMode::Materialized, world_reuse);
                 }
                 return result;
             });
@@ -3821,7 +3863,12 @@ void D3D12Backend::PrimeDepthOfField() {
             if (dof_cpu_preparation_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
             auto result = dof_cpu_preparation_.get();
             if (dof_cpu_signature_ != signature) { dof_preparation_ = DofPreparation::Drain; return; }
-            if (result.context && result.context->Ready()) ffx_dof_.Swap(*result.context);
+            if (result.context && result.context->Ready()) {
+                if (result.context->EffectiveReuseMode() != world_reuse)
+                    LOGR("DOF native loading: cache unavailable; retaining uncached FidelityFX: %s",
+                         result.context->CacheFallbackReason());
+                ffx_dof_.Swap(*result.context);
+            }
             if (profile && !ffx_dof_.Ready()) {
                 ffx_dof_failed_ |= profile == 2 ? 2u : 1u;
                 LOGR("DOF native loading: FidelityFX unavailable; preparing Balanced fallback");
@@ -3833,7 +3880,7 @@ void D3D12Backend::PrimeDepthOfField() {
             bool world_ready = profile && ffx_dof_.Ready();
             if (world_ready) {
                 const auto extent = FidelityFxDofProcessingSize(width, height, profile == 2 ? 2 : 1);
-                world_ready = EnsureFidelityFxTargets(extent.width, extent.height);
+                world_ready = EnsureFidelityFxTargets(extent.width, extent.height, world_mode);
                 if (!world_ready) ffx_dof_failed_ |= profile == 2 ? 2u : 1u;
             }
             if (!PrepareDofResources(width, height, !world_ready)) { FinishDofPreparation(false); return; }
@@ -3857,6 +3904,8 @@ void D3D12Backend::PrimeDepthOfField() {
             Transition(ffx_dof_targets_[2].Get(), ffx_dof_states_[2], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             const bool warmed = ffx_dof_.Dispatch(cl_.Get(), ffx_dof_targets_[0].Get(), ffx_dof_targets_[1].Get(),
                                                  ffx_dof_targets_[2].Get(), 1.0f);
+            ffx_dof_.InvalidateReuseHistory();
+            ffx_dof_reuse_frame_ = UINT64_MAX;
             Begin(); // SDK work changes heaps/root bindings, including on a failed dispatch.
             if (!warmed) {
                 ffx_dof_failed_ |= profile == 2 ? 2u : 1u;
@@ -6275,19 +6324,43 @@ void D3D12Backend::Present(const Surface& front) {
     if (t) Resolve(*t);
 #if defined(BLACK_MISSION_BENCHMARK)
     bool benchmark_proof_this_frame = false;
-    if (game::bench::Enabled() && game::bench::SceneReady() && particle.previous_world)
-        ++benchmark_scene_presents_;
-    if (game::bench::Enabled() && game::bench::SceneReady() && !benchmark_proof_saved_ && t &&
-        benchmark_scene_presents_ >= 600) {
+    if (game::bench::ProofCaptureRequested() && !benchmark_proof_saved_ && t && particle.previous_world) {
         const auto previous_path = cap_dir_;
         cap_dir_ = app::ExeDir() / "logs" / "mission1-proof";
         std::error_code capture_error;
         std::filesystem::create_directories(cap_dir_, capture_error);
-        if (!capture_error) CapSave(*t, "opening-view", t->range);
+        const bool saved = !capture_error && CapSave(*t, "opening-view", t->range);
+        FidelityFxDofReuseDiagnostics reuse_diagnostics;
+        if (saved && ffx_dof_.GetReuseDiagnostics(reuse_diagnostics)) {
+            const auto save_words = [&](const FidelityFxDofDiagnosticResource& input, const char* name) {
+                auto state = D3D12_RESOURCE_STATES(input.state);
+                const auto original_state = state;
+                const auto desc = input.resource->GetDesc();
+                std::vector<uint8_t> words;
+                Transition(input.resource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                const bool copied = ReadBack(input.resource, uint32_t(desc.Width), desc.Height, words);
+                Transition(input.resource, state, original_state);
+                if (!copied) return;
+                std::ofstream output(cap_dir_ / name, std::ios::binary);
+                output.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size()));
+            };
+            save_words(reuse_diagnostics.dirtyHierarchy, "world-dirty-mip0.u32");
+            save_words(reuse_diagnostics.certificate, "world-certificate.u32");
+            const auto dirty_desc = reuse_diagnostics.dirtyHierarchy.resource->GetDesc();
+            const auto cert_desc = reuse_diagnostics.certificate.resource->GetDesc();
+            std::ofstream metadata(cap_dir_ / "world-reuse.json");
+            metadata << "{\"group_width\":" << reuse_diagnostics.groupWidth
+                     << ",\"group_height\":" << reuse_diagnostics.groupHeight
+                     << ",\"dirty_width\":" << dirty_desc.Width << ",\"dirty_height\":" << dirty_desc.Height
+                     << ",\"certificate_width\":" << cert_desc.Width << ",\"certificate_height\":" << cert_desc.Height
+                     << ",\"history_valid\":" << (reuse_diagnostics.historyValid ? "true" : "false") << "}\n";
+        }
         cap_dir_ = previous_path;
-        benchmark_proof_saved_ = true;
+        benchmark_proof_saved_ = saved;
         benchmark_proof_this_frame = true;
-        LOGR("Mission 1 benchmark: opening-view readback requested during excluded warmup");
+        game::bench::ProofCaptureCompleted(presents_ + 1, saved);
+        LOGR("Mission 1 benchmark: opening-view readback %s at warmup present %llu",
+             saved ? "saved" : "failed", (unsigned long long)(presents_ + 1));
     }
 #endif
     if (ramp_dirty_) UploadGammaRamp();
@@ -6572,12 +6645,12 @@ constexpr int kBmpBitCount = 28;
 constexpr int kBmpImageSize = 34;
 constexpr uint32_t kBmpInfoBytes = 40;
 
-void D3D12Backend::CapSave(const CapImage& img, const char* name) {
+bool D3D12Backend::CapSave(const CapImage& img, const char* name) {
     ComPtr<ID3D12Resource> down = Shrink(img.res, *img.state, img.fmt, img.w, img.h, {.mul = img.mul});
     std::vector<uint8_t> px;
-    if (!down || !ReadBack(down.Get(), img.w, img.h, px)) return;
+    if (!down || !ReadBack(down.Get(), img.w, img.h, px)) return false;
     FILE* f = _wfopen((cap_dir_ / (std::string(name) + ".bmp")).c_str(), L"wb");
-    if (!f) return;
+    if (!f) return false;
     uint8_t hd[kBmpHeaderBytes] = {'B', 'M'};  // BITMAPFILEHEADER and BITMAPINFOHEADER, top down 32 bit
     auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
     put(kBmpFileSize, kBmpHeaderBytes + uint32_t(px.size()));
@@ -6588,17 +6661,18 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     hd[kBmpPlanes] = 1;
     hd[kBmpBitCount] = 32;
     put(kBmpImageSize, uint32_t(px.size()));
-    fwrite(hd, 1, kBmpHeaderBytes, f);
-    fwrite(px.data(), 1, px.size(), f);
-    fclose(f);
+    const bool header_written = fwrite(hd, 1, kBmpHeaderBytes, f) == kBmpHeaderBytes;
+    const bool pixels_written = fwrite(px.data(), 1, px.size(), f) == px.size();
+    const bool closed = fclose(f) == 0;
+    return header_written && pixels_written && closed;
 }
 
-void D3D12Backend::CapSave(Target& t, const char* name, float mul) {
+bool D3D12Backend::CapSave(Target& t, const char* name, float mul) {
     D3D12_RESOURCE_STATES* st;
     ID3D12Resource* r = Flat(t, st);
-    if (!r) return;
+    if (!r) return false;
     DXGI_FORMAT fmt = t.depth ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : t.fmt;
-    CapSave({.res = r, .state = st, .fmt = fmt, .w = t.gw, .h = t.gh, .mul = mul}, name);
+    return CapSave({.res = r, .state = st, .fmt = fmt, .w = t.gw, .h = t.gh, .mul = mul}, name);
 }
 
 // the frame moves to another target: save the one it leaves
